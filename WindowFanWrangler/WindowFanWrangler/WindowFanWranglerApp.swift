@@ -38,7 +38,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let button = statusItem.button {
             // SF Symbol; isTemplate=true lets macOS recolor for light/dark menu bars.
             let icon = NSImage(systemSymbolName: "rectangle.stack",
-                               accessibilityDescription: "WindowFanWrangler")
+                               accessibilityDescription: "Window Wrangler")
             icon?.isTemplate = true
             button.image = icon
         }
@@ -66,7 +66,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
 
         // Quit: target=nil lets the responder chain route to NSApp.
-        menu.addItem(NSMenuItem(title: "Quit WindowFanWrangler",
+        menu.addItem(NSMenuItem(title: "Quit Window Wrangler",
                                 action: #selector(NSApplication.terminate(_:)),
                                 keyEquivalent: "q"))
 
@@ -76,10 +76,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Placeholder actions (real implementations land in later milestones)
 
     @objc private func fanWindows() {
-        NSLog("[WindowFanWrangler] Fan Windows clicked — not implemented yet")
+        NSLog("[Window Wrangler] Fan Windows clicked — not implemented yet")
     }
 
     @objc private func restoreLayout() {
-        NSLog("[WindowFanWrangler] Restore Previous Layout clicked — not implemented yet")
+        NSLog("[Window Wrangler] Restore Previous Layout clicked — not implemented yet")
     }
 }
