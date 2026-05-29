@@ -1,6 +1,6 @@
 //
-//  WindowFanWranglerApp.swift
-//  WindowFanWrangler
+//  WindowWranglerApp.swift
+//  Window Wrangler
 //
 //  Created by John Wilson on 5/26/26.
 //
