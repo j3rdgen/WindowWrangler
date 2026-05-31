@@ -64,11 +64,11 @@ private final class OnboardingViewController: NSViewController {
     override func loadView() {
         let container = NSView(frame: NSRect(x: 0, y: 0, width: 520, height: 360))
 
-        // Big SF Symbol "hero" icon mirroring the menu bar glyph
+        // Hero icon mirroring the menu bar glyph, scaled up
         let iconView = NSImageView()
-        iconView.image = NSImage(systemSymbolName: "rectangle.stack",
-                                 accessibilityDescription: AppInfo.displayName)
-        iconView.symbolConfiguration = .init(pointSize: 48, weight: .regular)
+        let heroIcon = MenuBarIcon.image(size: 56)
+        heroIcon.accessibilityDescription = AppInfo.displayName
+        iconView.image = heroIcon
         iconView.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(iconView)
 
