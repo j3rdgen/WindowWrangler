@@ -28,7 +28,7 @@ Accessibility permission onboarding
 Cascade frontmost app's windows in both directions (down-right and down-left)
 Lasso selection: hold Option+W and click-drag to rubber-band-select windows across apps. Selection persists. Visual highlights via transparent overlay window.
 Apply cascade to the lasso selection (Cascade Selected Down-Right / Down-Left)
-Multi-window group drag: dragging any selected window moves the whole group with a Finder-style cluster preview at the cursor; snap to final positions on release (within the current Space)
+Multi-window group drag: dragging any selected window moves the whole group with a Finder-style cluster preview at the cursor; snap to final positions on release. Works seamlessly across multiple displays (single extended coordinate space via AX). Limited to the current Space — see OUT scope.
 Keyboard shortcuts to cascade and to restore previous layout
 Adjustable header reveal and lateral reveal in preferences
 
