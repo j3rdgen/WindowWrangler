@@ -17,12 +17,12 @@ enum MenuBarIcon {
     /// rasterized to that exact dimension so NSStatusBar uses the
     /// concrete pixel size rather than the SVG's natural viewBox.
     ///
-    /// Default 28pt for the menu bar — empirically tuned over several
+    /// Default 31pt for the menu bar — empirically tuned over several
     /// iterations to match the visual weight of system menu bar icons
     /// despite the lassoed-cascade artwork's 2:1 aspect (which leaves
     /// the top/bottom of the square frame partially empty).
     /// 80pt for the onboarding hero.
-    static func image(size: CGFloat = 28) -> NSImage {
+    static func image(size: CGFloat = 31) -> NSImage {
         guard let source = NSImage(named: "WindowWranglerIcon") else {
             return fallbackImage(size: size)
         }
