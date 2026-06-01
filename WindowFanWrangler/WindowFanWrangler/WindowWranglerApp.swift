@@ -314,10 +314,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSLog("[\(AppInfo.displayName)] Cascade \(direction) on '\(targetAppName)' pass 1: " +
               "\(count1)/\(windows.count) windows moved")
 
-        // Two retries at progressively longer delays. Apps with settling
-        // logic (Chrome with DevTools, etc.) need time between attempts.
-        // Pass 2 at 120ms catches transient clamps quickly; pass 3 at
-        // 500ms catches slow settlers that need a full layout cycle.
+        // Three retries at progressively longer delays. Apps with
+        // settling logic (Chrome with DevTools, etc.) need time between
+        // attempts. Pass 2 at 120ms catches transient clamps quickly;
+        // pass 3 at 500ms catches slow settlers that need a full
+        // layout cycle; pass 4 at 1000ms catches the most stubborn
+        // (Chrome windows that incrementally accept resize across
+        // multiple attempts — observed ~200px progress per 400ms gap).
         scheduleCascadePass(after: 0.12, label: "pass 2",
                             app: targetApp, name: targetAppName,
                             screen: screen, targetSize: targetSize,
@@ -326,9 +329,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                             app: targetApp, name: targetAppName,
                             screen: screen, targetSize: targetSize,
                             direction: direction)
+        scheduleCascadePass(after: 1.00, label: "pass 4",
+                            app: targetApp, name: targetAppName,
+                            screen: screen, targetSize: targetSize,
+                            direction: direction)
 
-        // Diagnostic verification at +650ms — purely reads sizes.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.65) { [weak self] in
+        // Diagnostic verification at +1200ms — purely reads sizes.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.20) { [weak self] in
             guard self != nil else { return }
             let verification = AXWindowEnumerator.windows(of: targetApp)
             let wantedW = Int(targetSize.width.rounded())
