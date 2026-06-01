@@ -23,7 +23,7 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate {
 
     convenience init() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 520, height: 420),
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 540),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -62,7 +62,7 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate {
 private final class OnboardingViewController: NSViewController {
 
     override func loadView() {
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 520, height: 420))
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 520, height: 540))
 
         // Hero icon mirroring the menu bar glyph, scaled up large so
         // the lassoed-cascade artwork's detail (rope, knot) is readable.
@@ -75,7 +75,7 @@ private final class OnboardingViewController: NSViewController {
 
         // Title
         let title = NSTextField(labelWithString:
-            "\(AppInfo.displayName) needs Accessibility permission")
+            "\(AppInfo.displayName) needs \"Accessibility\" permission")
         title.font = .systemFont(ofSize: 17, weight: .semibold)
         title.alignment = .center
         title.translatesAutoresizingMaskIntoConstraints = false
@@ -83,10 +83,13 @@ private final class OnboardingViewController: NSViewController {
 
         // Body
         let bodyText = """
-        \(AppInfo.displayName) arranges windows into staggered fan layouts. \
-        To move other apps' windows, macOS requires you to grant the \
-        "Accessibility" permission — the same permission used by apps \
-        like Rectangle, Magnet, and BetterTouchTool.
+        \(AppInfo.displayName) arranges cluttered windows and tabs into staggered fan layouts. To enable, macOS requires you to grant the "Accessibility" permission.
+
+        Once enabled, you can:
+
+        • Fan windows into a visible stack so every window remains easy to identify
+        • Wrangle multiple windows into a single movable workspace
+        • Save and restore window groups and preferred working layouts with one click
 
         How to grant:
           1.  Click "Open Accessibility Settings" below.

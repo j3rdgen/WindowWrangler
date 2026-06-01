@@ -53,6 +53,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// "frontmost" via NSWorkspace.shared.frontmostApplication).
     private var lastUserApp: NSRunningApplication?
 
+    /// Global keyboard shortcuts (⌃⌥⇧+arrow keys for the cascade
+    /// actions, plus ⌃⌥⇧↩ for restore).
+    private let shortcuts = GlobalShortcuts()
+
     // MARK: - Cascade policy constants
     //
     // Buffer the cascade away from the screen edges so the layout has
@@ -80,6 +84,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupStatusItem()
         startPermissionMonitoring()
         startActiveAppTracking()
+        warmUpAccessibility()
+        setupGlobalShortcuts()
+    }
+
+    // MARK: - Global keyboard shortcuts
+
+    private func setupGlobalShortcuts() {
+        // Just register bindings. The monitor itself is started/stopped
+        // by the permission state handler — NSEvent's global monitor
+        // for keyDown requires Accessibility permission to actually
+        // receive events, and registering it before permission is
+        // granted leaves it permanently dead even after permission
+        // becomes available.
+        //
+        // ⌃⌥⌘+arrows: chord uses all four bottom-row modifiers (no Shift),
+        // and arrow keys with this exact modifier combo are not bound by
+        // macOS, browsers, IDEs, VoiceOver, or any common window manager.
+        let modifiers: NSEvent.ModifierFlags = [.control, .option, .command]
+        shortcuts.register(.init(
+            modifiers: modifiers,
+            keyCode: KeyCode.rightArrow,
+            action: { [weak self] in self?.cascadeDownRight() },
+            label: "Cascade Down-Right"
+        ))
+        shortcuts.register(.init(
+            modifiers: modifiers,
+            keyCode: KeyCode.leftArrow,
+            action: { [weak self] in self?.cascadeDownLeft() },
+            label: "Cascade Down-Left"
+        ))
+        shortcuts.register(.init(
+            modifiers: modifiers,
+            keyCode: KeyCode.upArrow,
+            action: { [weak self] in self?.restoreLayout() },
+            label: "Restore Previous Layout"
+        ))
+    }
+
+    /// Issues a throw-away AX enumeration shortly after launch so the
+    /// framework's cold-start latency happens BEFORE the user's first
+    /// cascade attempt. Without this, the first cascade tends to have
+    /// slight sizing inconsistencies because AX writes don't fully
+    /// settle within our pass windows on cold start. We delay 0.8s so
+    /// the user's foreground app at launch has time to be detected and
+    /// load its AX tree.
+    private func warmUpAccessibility() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+            guard let self else { return }
+            guard let app = self.resolveTargetApp() else { return }
+            // Just enumerate — don't mutate anything. This triggers the
+            // AX framework to fully initialize and the target app to
+            // build its accessibility tree.
+            _ = AXWindowEnumerator.windows(of: app)
+        }
     }
 
     // MARK: - Active app tracking
@@ -108,18 +166,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Returns the best guess at the user's current foreground app,
-    /// preferring (in order): the tracked last-active app, the menu
-    /// bar owner, the frontmost app. Falls back through these because
-    /// any one of them may briefly point at us during a click handler.
+    /// Returns the best guess at the user's current foreground app.
+    /// Order matters: the menu-bar-owning app is sampled at the moment
+    /// of resolution (real-time), so it reflects "what app the user
+    /// is actually in RIGHT NOW." The tracked last-active app is a
+    /// fallback for the rare cases where menuBarOwningApplication
+    /// returns nil. Frontmost is the last-resort fallback (it can
+    /// briefly return us during our own click handlers, hence why
+    /// it's last).
+    ///
+    /// Earlier ordering used `lastUserApp` first, which caused a
+    /// "warm-up bug": at launch, lastUserApp was seeded with whatever
+    /// was frontmost (often Xcode after a ⌘R build) and stuck there
+    /// until the workspace activation observer fired. The first
+    /// cascade would target the stale app.
     private func resolveTargetApp() -> NSRunningApplication? {
         let myBundle = Bundle.main.bundleIdentifier
-        if let tracked = lastUserApp, tracked.bundleIdentifier != myBundle {
-            return tracked
-        }
         if let menuBar = NSWorkspace.shared.menuBarOwningApplication,
            menuBar.bundleIdentifier != myBundle {
             return menuBar
+        }
+        if let tracked = lastUserApp, tracked.bundleIdentifier != myBundle {
+            return tracked
         }
         if let frontmost = NSWorkspace.shared.frontmostApplication,
            frontmost.bundleIdentifier != myBundle {
@@ -153,21 +221,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.isTrusted = granted
             self.rebuildMenu()
 
+            NSLog("[\(AppInfo.displayName)] Permission state: " +
+                  "wasTrusted=\(wasTrusted) granted=\(granted) " +
+                  "onboardingWindow=\(self.onboardingWindow == nil ? "nil" : "exists")")
+
             if !granted && self.onboardingWindow == nil {
+                NSLog("[\(AppInfo.displayName)] Triggering showOnboarding()")
                 self.showOnboarding()
+                self.shortcuts.stop()
+            } else if !granted && self.onboardingWindow != nil {
+                // Window already exists but maybe closed/hidden — re-present it.
+                NSLog("[\(AppInfo.displayName)] Onboarding window exists; re-presenting")
+                self.onboardingWindow?.presentOnboarding()
+                self.shortcuts.stop()
             } else if granted && !wasTrusted {
+                NSLog("[\(AppInfo.displayName)] Permission just granted; dismissing onboarding")
                 self.dismissOnboarding()
+                // Now that AX is authorized, start the global shortcut
+                // monitor (which requires it) and re-run the AX warmup
+                // (which failed earlier without permission).
+                self.shortcuts.start()
+                self.warmUpAccessibility()
+                NSLog("[\(AppInfo.displayName)] Global shortcuts monitor started")
             }
         }
     }
 
     private func showOnboarding() {
+        NSLog("[\(AppInfo.displayName)] showOnboarding: creating controller")
         let controller = OnboardingWindowController()
         controller.onWindowClosed = { [weak self] in
+            NSLog("[\(AppInfo.displayName)] Onboarding window closed by user (X button)")
             self?.onboardingWindow = nil
         }
         onboardingWindow = controller
         controller.presentOnboarding()
+        NSLog("[\(AppInfo.displayName)] showOnboarding: presentOnboarding() returned")
     }
 
     private func dismissOnboarding() {
@@ -193,12 +282,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(header)
         menu.addItem(.separator())
 
-        // Cascade actions — one per direction.
+        // Cascade actions — one per direction. The keyEquivalent here
+        // is purely for visual display in the menu; the actual firing
+        // is handled by GlobalShortcuts (since we're an accessory app
+        // and macOS won't fire menu shortcuts when we're not frontmost).
+        let shortcutModifiers: NSEvent.ModifierFlags = [.control, .option, .command]
+
         let cascadeRightItem = NSMenuItem(
             title: "Cascade Down-Right",
             action: #selector(cascadeDownRight),
-            keyEquivalent: ""
+            keyEquivalent: "\u{F703}"  // NSRightArrowFunctionKey
         )
+        cascadeRightItem.keyEquivalentModifierMask = shortcutModifiers
         cascadeRightItem.target = self
         cascadeRightItem.isEnabled = isTrusted
         menu.addItem(cascadeRightItem)
@@ -206,8 +301,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let cascadeLeftItem = NSMenuItem(
             title: "Cascade Down-Left",
             action: #selector(cascadeDownLeft),
-            keyEquivalent: ""
+            keyEquivalent: "\u{F702}"  // NSLeftArrowFunctionKey
         )
+        cascadeLeftItem.keyEquivalentModifierMask = shortcutModifiers
         cascadeLeftItem.target = self
         cascadeLeftItem.isEnabled = isTrusted
         menu.addItem(cascadeLeftItem)
@@ -215,8 +311,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let restoreItem = NSMenuItem(
             title: "Restore Previous Layout",
             action: #selector(restoreLayout),
-            keyEquivalent: ""
+            keyEquivalent: "\u{F700}"  // NSUpArrowFunctionKey
         )
+        restoreItem.keyEquivalentModifierMask = shortcutModifiers
         restoreItem.target = self
         // Only enabled if we have AX permission AND a snapshot to restore.
         restoreItem.isEnabled = isTrusted && lastSnapshot != nil
@@ -378,6 +475,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// the target app and applies the cascade again. Used to catch
     /// apps that need settling time between attempts (Chrome with
     /// DevTools, etc.).
+    ///
+    /// Early-exits if all windows are already at the target frame —
+    /// most apps and most cases accept the cascade fully on pass 1,
+    /// so re-poking them is wasteful and produces visible jitter.
     private func scheduleCascadePass(
         after delay: TimeInterval,
         label: String,
@@ -391,6 +492,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self else { return }
             let refreshed = AXWindowEnumerator.windows(of: app)
             guard refreshed.count > 1 else { return }
+
+            // Skip if everyone's already at target — this is the
+            // fast path for apps that accept cascade cleanly on pass 1.
+            if self.allWindowsAtTarget(refreshed, targetSize: targetSize) {
+                NSLog("[\(AppInfo.displayName)] Cascade \(direction) on '\(name)' \(label): " +
+                      "skipped — already converged")
+                return
+            }
+
             let count = self.applyCascadePass(
                 windows: refreshed,
                 screen: screen,
@@ -399,6 +509,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             )
             NSLog("[\(AppInfo.displayName)] Cascade \(direction) on '\(name)' \(label): " +
                   "\(count)/\(refreshed.count) windows moved")
+        }
+    }
+
+    /// True if every window's current frame matches `targetSize`
+    /// (within a 4pt tolerance for rounding noise).
+    private func allWindowsAtTarget(
+        _ windows: [EnumeratedWindow],
+        targetSize: CGSize
+    ) -> Bool {
+        let wantedW = Int(targetSize.width.rounded())
+        let wantedH = Int(targetSize.height.rounded())
+        return windows.allSatisfy { w in
+            let gotW = Int(w.frame.width.rounded())
+            let gotH = Int(w.frame.height.rounded())
+            return abs(gotW - wantedW) <= 4 && abs(gotH - wantedH) <= 4
         }
     }
 
