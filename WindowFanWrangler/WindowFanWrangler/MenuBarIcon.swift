@@ -2,79 +2,54 @@
 //  MenuBarIcon.swift
 //  Window Wrangler
 //
-//  Programmatic drawing of the app's "three staggered windows" icon.
-//  Used by the menu bar status item (small) and the onboarding window
-//  hero glyph (large). Drawn rather than shipped as an asset because:
-//   - It's vector, so it's crisp at any size
-//   - It's a template image (isTemplate = YES), so macOS auto-recolors
-//     for light/dark menu bars without us shipping multiple assets
-//   - One source of truth — changing the proportions is a code edit
+//  Loads the "lassoed cascade" SVG and rasterizes it at the requested
+//  size. The asset's viewBox has been cropped to a tight square around
+//  the artwork (with the natural 2:1 content centered vertically as a
+//  band), so a square output here yields a square icon that matches
+//  the visual footprint of other menu bar icons.
 //
 
 import AppKit
 
 enum MenuBarIcon {
 
-    /// Returns a template NSImage suitable for an NSStatusItem's button
-    /// or any other UI position. Default size (18 pt) matches the
-    /// macOS menu bar slot.
-    static func image(size: CGFloat = 18) -> NSImage {
-        let dimension = NSSize(width: size, height: size)
-        let image = NSImage(size: dimension, flipped: false) { _ in
-            guard let ctx = NSGraphicsContext.current?.cgContext else { return false }
-            draw(in: ctx, canvasSize: size)
+    /// Returns a template NSImage at the requested point size,
+    /// rasterized to that exact dimension so NSStatusBar uses the
+    /// concrete pixel size rather than the SVG's natural viewBox.
+    ///
+    /// Default 28pt for the menu bar — empirically tuned over several
+    /// iterations to match the visual weight of system menu bar icons
+    /// despite the lassoed-cascade artwork's 2:1 aspect (which leaves
+    /// the top/bottom of the square frame partially empty).
+    /// 80pt for the onboarding hero.
+    static func image(size: CGFloat = 28) -> NSImage {
+        guard let source = NSImage(named: "WindowWranglerIcon") else {
+            return fallbackImage(size: size)
+        }
+        let dim = NSSize(width: size, height: size)
+        let result = NSImage(size: dim, flipped: false) { rect in
+            source.draw(in: rect,
+                        from: .zero,
+                        operation: .sourceOver,
+                        fraction: 1.0)
+            return true
+        }
+        result.isTemplate = true
+        return result
+    }
+
+    /// Minimal placeholder shown if the asset somehow fails to load.
+    private static func fallbackImage(size: CGFloat) -> NSImage {
+        let dim = NSSize(width: size, height: size)
+        let image = NSImage(size: dim, flipped: false) { rect in
+            NSColor.black.setStroke()
+            let path = NSBezierPath(roundedRect: rect.insetBy(dx: 2, dy: 2),
+                                    xRadius: 2, yRadius: 2)
+            path.lineWidth = 1.5
+            path.stroke()
             return true
         }
         image.isTemplate = true
         return image
-    }
-
-    // MARK: - Drawing
-
-    /// All dimensions scale proportionally with `canvasSize` so the icon
-    /// renders correctly at 18 pt (menu bar) or 56 pt (onboarding hero).
-    private static func draw(in ctx: CGContext, canvasSize size: CGFloat) {
-        let scale = size / 18.0
-
-        // Single rectangle's dimensions (window aspect — wider than tall)
-        let rectW: CGFloat = 11 * scale
-        let rectH: CGFloat = 8  * scale
-        // How far each successive rectangle peeks out from behind the next
-        let offset: CGFloat = 2  * scale
-        // Frame padding (we have 3 rectangles overlapping with 2 offsets)
-        let marginX: CGFloat = 1.5 * scale
-        let marginY: CGFloat = 3   * scale
-        let strokeWidth: CGFloat = 1.25 * scale
-
-        // Cocoa coordinates: y-up. Cascade goes down-and-to-the-left:
-        // back is upper-right (highest y, highest x), front is lower-left
-        // (lowest y, lowest x). Front is drawn last so it sits on top.
-        let front  = CGRect(x: marginX, y: marginY,
-                            width: rectW, height: rectH)
-        let middle = CGRect(x: marginX + offset, y: marginY + offset,
-                            width: rectW, height: rectH)
-        let back   = CGRect(x: marginX + 2 * offset, y: marginY + 2 * offset,
-                            width: rectW, height: rectH)
-
-        ctx.setStrokeColor(NSColor.black.cgColor)
-        ctx.setLineWidth(strokeWidth)
-
-        // 1) Draw the back rectangle's outline first (it's the bottom layer).
-        ctx.stroke(back)
-
-        // 2) Before drawing the middle rectangle's outline, clear any pixels
-        //    inside its frame (plus a half-stroke margin so the outline edges
-        //    of the back rectangle don't peek through where they shouldn't).
-        //    Then stroke the middle outline cleanly on top.
-        ctx.setBlendMode(.clear)
-        ctx.fill(middle.insetBy(dx: -strokeWidth / 2, dy: -strokeWidth / 2))
-        ctx.setBlendMode(.normal)
-        ctx.stroke(middle)
-
-        // 3) Same pattern for the front rectangle.
-        ctx.setBlendMode(.clear)
-        ctx.fill(front.insetBy(dx: -strokeWidth / 2, dy: -strokeWidth / 2))
-        ctx.setBlendMode(.normal)
-        ctx.stroke(front)
     }
 }

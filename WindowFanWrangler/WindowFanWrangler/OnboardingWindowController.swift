@@ -23,7 +23,7 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate {
 
     convenience init() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 520, height: 360),
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 420),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -62,11 +62,12 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate {
 private final class OnboardingViewController: NSViewController {
 
     override func loadView() {
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 520, height: 360))
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 520, height: 420))
 
-        // Hero icon mirroring the menu bar glyph, scaled up
+        // Hero icon mirroring the menu bar glyph, scaled up large so
+        // the lassoed-cascade artwork's detail (rope, knot) is readable.
         let iconView = NSImageView()
-        let heroIcon = MenuBarIcon.image(size: 56)
+        let heroIcon = MenuBarIcon.image(size: 80)
         heroIcon.accessibilityDescription = AppInfo.displayName
         iconView.image = heroIcon
         iconView.translatesAutoresizingMaskIntoConstraints = false
@@ -120,8 +121,8 @@ private final class OnboardingViewController: NSViewController {
         NSLayoutConstraint.activate([
             iconView.topAnchor.constraint(equalTo: container.topAnchor, constant: 24),
             iconView.centerXAnchor.constraint(equalTo: container.centerXAnchor),
-            iconView.widthAnchor.constraint(equalToConstant: 56),
-            iconView.heightAnchor.constraint(equalToConstant: 56),
+            iconView.widthAnchor.constraint(equalToConstant: 80),
+            iconView.heightAnchor.constraint(equalToConstant: 80),
 
             title.topAnchor.constraint(equalTo: iconView.bottomAnchor, constant: 12),
             title.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 24),
@@ -130,6 +131,8 @@ private final class OnboardingViewController: NSViewController {
             body.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 16),
             body.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 32),
             body.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -32),
+            // Force body to stay above the buttons even if text wraps long.
+            body.bottomAnchor.constraint(lessThanOrEqualTo: openButton.topAnchor, constant: -20),
 
             openButton.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -24),
             openButton.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -24),
