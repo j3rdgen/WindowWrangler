@@ -53,9 +53,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// "frontmost" via NSWorkspace.shared.frontmostApplication).
     private var lastUserApp: NSRunningApplication?
 
-    /// Global keyboard shortcuts (⌃⌥⇧+arrow keys for the cascade
-    /// actions, plus ⌃⌥⇧↩ for restore).
+    /// Global keyboard shortcuts (⌃⌥⌘+arrow keys for the cascade
+    /// actions, plus ⌃⌥⌘↑ for restore).
     private let shortcuts = GlobalShortcuts()
+
+    /// Cross-app window selection produced by the M5 lasso flow.
+    private let windowSelection = WindowSelection()
+
+    /// Orchestrates the M5 lasso flow (input → hit-test → selection
+    /// → overlay rendering). Held strongly here so its monitors stay
+    /// alive for the app's lifetime.
+    private lazy var lassoCoordinator = LassoCoordinator(selection: windowSelection)
 
     // MARK: - Cascade policy constants
     //
@@ -82,10 +90,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.accessory)
 
         setupStatusItem()
+        // Force-init lassoCoordinator NOW (it's lazy var) so its
+        // selection.onChange handler is in place BEFORE we wrap it
+        // for the menu in setupSelectionObserver below.
+        _ = lassoCoordinator
         startPermissionMonitoring()
         startActiveAppTracking()
         warmUpAccessibility()
         setupGlobalShortcuts()
+        setupSelectionObserver()
+    }
+
+    /// LassoCoordinator already listens to selection changes for overlay
+    /// rendering. We need a separate observation hook for the menu to
+    /// show/hide the "Selection: N windows" header. To avoid stomping
+    /// each other's `onChange` closures, we wrap.
+    ///
+    /// MUST be called AFTER `lassoCoordinator` is initialized (which
+    /// happens in `applicationDidFinishLaunching` via a forced reference).
+    /// Otherwise lassoCoordinator's lazy init would overwrite our
+    /// wrapper.
+    private func setupSelectionObserver() {
+        let existing = windowSelection.onChange
+        windowSelection.onChange = { [weak self] in
+            existing?()
+            self?.rebuildMenu()
+        }
     }
 
     // MARK: - Global keyboard shortcuts
@@ -229,20 +259,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 NSLog("[\(AppInfo.displayName)] Triggering showOnboarding()")
                 self.showOnboarding()
                 self.shortcuts.stop()
+                self.lassoCoordinator.stop()
             } else if !granted && self.onboardingWindow != nil {
                 // Window already exists but maybe closed/hidden — re-present it.
                 NSLog("[\(AppInfo.displayName)] Onboarding window exists; re-presenting")
                 self.onboardingWindow?.presentOnboarding()
                 self.shortcuts.stop()
+                self.lassoCoordinator.stop()
             } else if granted && !wasTrusted {
                 NSLog("[\(AppInfo.displayName)] Permission just granted; dismissing onboarding")
                 self.dismissOnboarding()
                 // Now that AX is authorized, start the global shortcut
-                // monitor (which requires it) and re-run the AX warmup
-                // (which failed earlier without permission).
+                // monitor + lasso monitors (both require AX), and
+                // re-run the AX warmup (which failed earlier without
+                // permission).
                 self.shortcuts.start()
+                self.lassoCoordinator.start()
                 self.warmUpAccessibility()
-                NSLog("[\(AppInfo.displayName)] Global shortcuts monitor started")
+                NSLog("[\(AppInfo.displayName)] Global shortcuts + lasso started")
             }
         }
     }
@@ -281,6 +315,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         header.isEnabled = false
         menu.addItem(header)
         menu.addItem(.separator())
+
+        // Lasso selection state, if any.
+        if windowSelection.count > 0 {
+            let plural = windowSelection.count == 1 ? "" : "s"
+            let selectionHeader = NSMenuItem(
+                title: "Selection: \(windowSelection.count) window\(plural)",
+                action: nil,
+                keyEquivalent: ""
+            )
+            selectionHeader.isEnabled = false
+            menu.addItem(selectionHeader)
+
+            let clearItem = NSMenuItem(
+                title: "Clear Selection",
+                action: #selector(clearSelection),
+                keyEquivalent: ""
+            )
+            clearItem.target = self
+            clearItem.isEnabled = true
+            menu.addItem(clearItem)
+
+            menu.addItem(.separator())
+        }
 
         // Cascade actions — one per direction. The keyEquivalent here
         // is purely for visual display in the menu; the actual firing
@@ -557,5 +614,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             showOnboarding()
         }
+    }
+
+    @objc private func clearSelection() {
+        windowSelection.clear()
     }
 }
