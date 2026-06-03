@@ -302,18 +302,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
     // MARK: - WindowWranglerActions
 
     @objc func cascadeDownRight() {
-        cascadeOrchestrator.performCascade(direction: .downRight)
+        runAfterMenuDismiss { [weak self] in
+            self?.cascadeOrchestrator.performCascade(direction: .downRight)
+        }
     }
 
     @objc func cascadeDownLeft() {
-        cascadeOrchestrator.performCascade(direction: .downLeft)
+        runAfterMenuDismiss { [weak self] in
+            self?.cascadeOrchestrator.performCascade(direction: .downLeft)
+        }
     }
 
     @objc func restoreLayout() {
-        cascadeOrchestrator.restoreLayout()
+        runAfterMenuDismiss { [weak self] in
+            self?.cascadeOrchestrator.restoreLayout()
+        }
     }
 
     @objc func toggleLassoFromMenu() {
+        // Lasso toggle is safe to run synchronously — it doesn't touch
+        // AX, doesn't enumerate windows, and the user is comfortable
+        // with the click → response feeling immediate.
         lassoCoordinator.toggleLassoMode()
     }
 
@@ -327,5 +336,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
         } else {
             showOnboarding()
         }
+    }
+
+    // MARK: - Menu/shortcut timing
+
+    /// Defers AX-touching work to the next main-runloop tick.
+    ///
+    /// When the user clicks a status-item menu item, Window Wrangler
+    /// briefly owns the menu bar (the status item activated us). If we
+    /// run AX enumeration *during* the click handler, the target app's
+    /// accessibility tree can be in a transient state — some windows
+    /// aren't yet (or no longer) reported by `kAXWindowsAttribute`,
+    /// which produces a cascade that "misses some windows" and a
+    /// snapshot that's then incomplete for Restore.
+    ///
+    /// Deferring by a single runloop tick (≈ a millisecond) lets the
+    /// menu fully dismiss and the target app fully reactivate before
+    /// the AX query fires. Shortcut invocations route through the
+    /// same path; the extra tick is imperceptible for them and avoids
+    /// a class of "menu sometimes loses windows" bugs.
+    private func runAfterMenuDismiss(_ block: @escaping () -> Void) {
+        DispatchQueue.main.async(execute: block)
     }
 }

@@ -298,7 +298,12 @@ final class CascadeOrchestrator {
             let refreshed = AXWindowEnumerator.windows(of: app)
             guard refreshed.count > 1 else { return }
 
-            if self.allWindowsAtTarget(refreshed, targetSize: targetSize) {
+            if self.allWindowsAtExpectedFrames(
+                refreshed,
+                screen: screen,
+                targetSize: targetSize,
+                direction: direction
+            ) {
                 Log.cascade.info(
                     "\(String(describing: direction), privacy: .public) on '\(name, privacy: .public)' \(label, privacy: .public): skipped — already converged"
                 )
@@ -334,17 +339,36 @@ final class CascadeOrchestrator {
         direction: CascadeDirection
     ) {
         let verification = AXWindowEnumerator.windows(of: app)
+        // Compute the FULL expected target frame per window (position
+        // + size), not just the size. Earlier convergence check only
+        // compared sizes — a window that came out at the right size
+        // but wrong position was being marked "stuck" and silently
+        // excluded from the rescue. Real bug: lasso-tested cascade
+        // would sometimes finish with windows scattered to the wrong
+        // positions while reporting "✓ stuck" in the logs.
+        let allFrames = verification.map(\.frame)
+        let targetFrames = FanGeometry.computeCascade(
+            windows: allFrames,
+            screen: screen,
+            targetSize: targetSize,
+            direction: direction
+        )
         let wantedW = Int(targetSize.width.rounded())
         let wantedH = Int(targetSize.height.rounded())
         Log.cascade.info("Verify: target size \(wantedW, privacy: .public)×\(wantedH, privacy: .public)")
 
         var laggardIndices: [Int] = []
         for (i, w) in verification.enumerated() {
+            let target = targetFrames[i]
+            let stuck = frameMatches(w.frame, target: target)
             let gotW = Int(w.frame.width.rounded())
             let gotH = Int(w.frame.height.rounded())
-            let stuck = abs(gotW - wantedW) <= 4 && abs(gotH - wantedH) <= 4
+            let gotX = Int(w.frame.minX.rounded())
+            let gotY = Int(w.frame.minY.rounded())
+            let wantedX = Int(target.minX.rounded())
+            let wantedY = Int(target.minY.rounded())
             Log.cascade.info(
-                "Verify[\(i, privacy: .public)]: \(gotW, privacy: .public)×\(gotH, privacy: .public)  \(stuck ? "✓ stuck" : "✗ REVERTED", privacy: .public)"
+                "Verify[\(i, privacy: .public)]: @(\(gotX, privacy: .public),\(gotY, privacy: .public)) \(gotW, privacy: .public)×\(gotH, privacy: .public) vs target @(\(wantedX, privacy: .public),\(wantedY, privacy: .public))  \(stuck ? "✓ stuck" : "✗ REVERTED", privacy: .public)"
             )
             if !stuck { laggardIndices.append(i) }
         }
@@ -355,13 +379,6 @@ final class CascadeOrchestrator {
             "Rescue on '\(name, privacy: .public)': re-poking \(laggardIndices.count, privacy: .public) laggard window(s)"
         )
 
-        let allFrames = verification.map(\.frame)
-        let targetFrames = FanGeometry.computeCascade(
-            windows: allFrames,
-            screen: screen,
-            targetSize: targetSize,
-            direction: direction
-        )
         let rescueMoves: [(axWindow: AXUIElement, target: CGRect)] = laggardIndices.map { i in
             (axWindow: verification[i].axElement, target: targetFrames[i])
         }
@@ -375,11 +392,15 @@ final class CascadeOrchestrator {
             guard self.cascadeGeneration == generation else { return }
             guard self.isTrusted() else { return }
             let post = AXWindowEnumerator.windows(of: app)
+            let postTargets = FanGeometry.computeCascade(
+                windows: post.map(\.frame),
+                screen: screen,
+                targetSize: targetSize,
+                direction: direction
+            )
             var stillFailing = 0
-            for w in post {
-                let gotW = Int(w.frame.width.rounded())
-                let gotH = Int(w.frame.height.rounded())
-                if abs(gotW - wantedW) > 4 || abs(gotH - wantedH) > 4 {
+            for (i, w) in post.enumerated() where i < postTargets.count {
+                if !self.frameMatches(w.frame, target: postTargets[i]) {
                     stillFailing += 1
                 }
             }
@@ -393,18 +414,42 @@ final class CascadeOrchestrator {
         }
     }
 
-    /// True if every window's current frame matches `targetSize` (within
-    /// a 4pt tolerance for rounding noise).
-    private func allWindowsAtTarget(
+    /// True if every window's current frame matches its expected
+    /// cascade target frame — POSITION and SIZE both — within a 4pt
+    /// tolerance for rounding noise.
+    ///
+    /// Replaces the earlier size-only check. The size-only version had
+    /// a real bug: a window that came out at the right size but the
+    /// wrong position was being marked as "at target," causing the
+    /// retry passes to skip and the verify+rescue to mark it as stuck.
+    /// User-visible symptom: cascade would finish with some windows at
+    /// the correct dimensions but scattered to wrong positions.
+    private func allWindowsAtExpectedFrames(
         _ windows: [EnumeratedWindow],
-        targetSize: CGSize
+        screen: CGRect,
+        targetSize: CGSize,
+        direction: CascadeDirection
     ) -> Bool {
-        let wantedW = Int(targetSize.width.rounded())
-        let wantedH = Int(targetSize.height.rounded())
-        return windows.allSatisfy { w in
-            let gotW = Int(w.frame.width.rounded())
-            let gotH = Int(w.frame.height.rounded())
-            return abs(gotW - wantedW) <= 4 && abs(gotH - wantedH) <= 4
+        let allFrames = windows.map(\.frame)
+        let targetFrames = FanGeometry.computeCascade(
+            windows: allFrames,
+            screen: screen,
+            targetSize: targetSize,
+            direction: direction
+        )
+        return zip(windows, targetFrames).allSatisfy { w, target in
+            frameMatches(w.frame, target: target)
         }
+    }
+
+    /// True if `actual` matches `target` within ±4pt on each of x, y,
+    /// width, height. 4pt absorbs the rounding and sub-pixel noise we
+    /// see from AX readback.
+    private func frameMatches(_ actual: CGRect, target: CGRect) -> Bool {
+        let xOff = abs(actual.minX - target.minX)
+        let yOff = abs(actual.minY - target.minY)
+        let wOff = abs(actual.width  - target.width)
+        let hOff = abs(actual.height - target.height)
+        return xOff <= 4 && yOff <= 4 && wOff <= 4 && hOff <= 4
     }
 }
