@@ -50,3 +50,16 @@ Pause and confirm at each milestone before moving on
 When I report a bug, ask for specifics rather than guessing
 Prefer fewer, focused changes over big sweeping rewrites
 Commit to git at each milestone with a clear message
+
+Parking lot (deferred — revisit later, not blocking current milestones)
+
+Source-control / project hygiene items I want to handle later, not now:
+- Push the repo to a private GitHub remote so the code is backed up off this Mac (currently the repo only exists locally; if the SSD dies, everything is lost). One-time auth setup needed.
+- Tag completed milestones in git (e.g., `git tag M4`, `M5`) so they're navigable by name instead of commit SHA.
+- Add a README.md at the project root summarizing what the app is, how to build it, and prerequisites — first file a handoff developer would look for.
+- Add a LICENSE file (default "all rights reserved" is fine for prototype but should be explicit).
+- Audit `.gitignore` to confirm no build artifacts / DerivedData / sensitive files are tracked.
+- Adopt a feature-branch + PR workflow (currently committing straight to `main`). Not needed for solo work; matters at handoff.
+- Set up release builds with semantic versioning (e.g., `0.1.0`). Relevant when we move toward distribution, not before.
+
+When ready to revisit, raise it explicitly ("let's clear the parking lot" or call out a specific item). Don't surface these as nags during normal development.
