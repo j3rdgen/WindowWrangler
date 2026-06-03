@@ -18,14 +18,37 @@ final class LassoCoordinator {
 
     private let eventMonitor = GlobalEventMonitor()
     private let overlay = SelectionOverlay()
+    private let modeHint = LassoModeHint()
     let selection: WindowSelection
 
     /// Origin point of the current drag, set on mouseDown.
     private var dragAnchor: CGPoint?
 
+    /// True when the user has toggled lasso mode on via the global
+    /// shortcut. Plain click-and-drag now produces a lasso; otherwise
+    /// mouse events are ignored.
+    private(set) var isLassoModeActive: Bool = false
+
+    /// Fires whenever lasso mode is toggled. Caller (AppDelegate) uses
+    /// this to refresh the menu's "Lasso mode: ON/OFF" indicator.
+    var onLassoModeChanged: ((Bool) -> Void)?
+
     init(selection: WindowSelection) {
         self.selection = selection
         wireEvents()
+    }
+
+    /// Toggles lasso mode on/off — bound to the ⌃⌥⌘C global shortcut.
+    func toggleLassoMode() {
+        isLassoModeActive.toggle()
+        eventMonitor.isLassoModeActive = isLassoModeActive
+        if isLassoModeActive {
+            modeHint.show()
+        } else {
+            modeHint.hide()
+        }
+        NSLog("[\(AppInfo.displayName)] Lasso mode: \(isLassoModeActive ? "ON" : "OFF")")
+        onLassoModeChanged?(isLassoModeActive)
     }
 
     /// Starts observing global events. Should be called only after
@@ -43,29 +66,13 @@ final class LassoCoordinator {
         overlay.hideLassoRect()
         overlay.setSelectionFrames([])
         overlay.hideIfEmpty()
+        modeHint.hide()
         dragAnchor = nil
     }
 
     // MARK: - Wiring
 
     private func wireEvents() {
-        eventMonitor.onLassoModeEntered = { [weak self] in
-            NSLog("[\(AppInfo.displayName)] Lasso mode: ARMED (Option+W held)")
-            // Just bring the overlay window up; rectangle appears only
-            // once the user actually begins a drag.
-            self?.overlay.ensureWindow()
-        }
-
-        eventMonitor.onLassoModeExited = { [weak self] in
-            NSLog("[\(AppInfo.displayName)] Lasso mode: released")
-            // If no drag was in progress, clear the rubber-band
-            // visualization. Existing selection persists.
-            if self?.dragAnchor == nil {
-                self?.overlay.hideLassoRect()
-                self?.overlay.hideIfEmpty()
-            }
-        }
-
         eventMonitor.onLassoDragBegan = { [weak self] point in
             guard let self else { return }
             self.dragAnchor = point
@@ -93,11 +100,18 @@ final class LassoCoordinator {
 
         eventMonitor.onEscapePressed = { [weak self] in
             guard let self else { return }
-            if !self.selection.isEmpty || self.dragAnchor != nil {
-                NSLog("[\(AppInfo.displayName)] Escape pressed — clearing selection")
+            let wasActive = self.isLassoModeActive
+            if !self.selection.isEmpty || self.dragAnchor != nil || wasActive {
+                NSLog("[\(AppInfo.displayName)] Escape pressed — exiting lasso, clearing selection")
                 self.selection.clear()
                 self.dragAnchor = nil
                 self.overlay.hideLassoRect()
+                if wasActive {
+                    self.isLassoModeActive = false
+                    self.eventMonitor.isLassoModeActive = false
+                    self.modeHint.hide()
+                    self.onLassoModeChanged?(false)
+                }
             }
         }
 

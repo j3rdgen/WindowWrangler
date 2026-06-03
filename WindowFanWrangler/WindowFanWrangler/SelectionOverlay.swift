@@ -146,22 +146,65 @@ private final class OverlayView: NSView {
 
     override var isFlipped: Bool { false }
 
-    override func draw(_ dirtyRect: NSRect) {
-        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+    /// Approximate corner radius of macOS system windows (Big Sur+).
+    /// Browser and most native app windows use ~10pt; matching this
+    /// makes the highlight feel native rather than mechanical.
+    private let windowCornerRadius: CGFloat = 10.0
 
+    override func draw(_ dirtyRect: NSRect) {
         let accent = NSColor.controlAccentColor
 
-        // Highlights first so the lasso rect (if any) layers on top.
+        // Highlight borders, drawn first so the lasso rectangle (if
+        // any) layers on top. Rounded-rect bezier paths so the outlines
+        // match the actual window chrome. Dashed stroke (matching the
+        // lasso rubber-band's dash pattern) reinforces the "lasso
+        // capture" feel — these are selected windows, not permanent
+        // chrome. Very subtle fill so overlapping selections don't
+        // accumulate into dense blue regions.
+        let strokeColor = accent.withAlphaComponent(0.57)
+        let fillColor = accent.withAlphaComponent(0.0308)  // barely there
+        // Dash pattern: 6pt on, 4pt off — slightly chunkier than the
+        // lasso rubber-band so it reads at a different scale on larger
+        // window outlines.
+        let dashPattern: [CGFloat] = [6, 4]
+        let strokeWidth: CGFloat = 3.0
+        let halfStroke = strokeWidth / 2
+        // Total inset of the path from the reported window frame.
+        // Greater than halfStroke (1.5pt) so the OUTER edge of the
+        // stroke sits clearly INSIDE the window border rather than
+        // straddling or extending past it. The extra `insidePadding`
+        // is the visible gap between the window edge and the dashed
+        // line.
+        let insidePadding: CGFloat = 0.5
+        let totalInset = halfStroke + insidePadding  // 2pt
         for globalFrame in selectionFrames {
             let local = globalFrame.offsetBy(
                 dx: -windowOriginInScreenCoords.x,
                 dy: -windowOriginInScreenCoords.y
             )
-            ctx.setFillColor(accent.withAlphaComponent(0.10).cgColor)
-            ctx.fill(local)
-            ctx.setStrokeColor(accent.withAlphaComponent(0.85).cgColor)
-            ctx.setLineWidth(2.0)
-            ctx.stroke(local.insetBy(dx: 1, dy: 1))
+            // Symmetric inset on all four sides. Result: the dashed
+            // outline is fully inside the visible window border with
+            // a uniform ~0.5pt gap to the edge on every side.
+            let strokeRect = local.insetBy(dx: totalInset, dy: totalInset)
+            // Path corner radius reduced by halfStroke (not by
+            // totalInset) so that the OUTER edge of the stroke traces
+            // an arc of exactly `windowCornerRadius` (10pt) — the
+            // native macOS window corner radius. This means the
+            // visible curvature of the highlight corner matches the
+            // window's own corner curvature exactly; the inset just
+            // shifts that curve inward by `insidePadding`.
+            let cornerRadius = max(0, windowCornerRadius - halfStroke)
+            let path = NSBezierPath(
+                roundedRect: strokeRect,
+                xRadius: cornerRadius,
+                yRadius: cornerRadius
+            )
+            fillColor.setFill()
+            path.fill()
+            strokeColor.setStroke()
+            path.lineWidth = strokeWidth
+            path.setLineDash(dashPattern, count: dashPattern.count, phase: 0)
+            path.stroke()
         }
 
         if let global = lassoRect {
@@ -169,7 +212,11 @@ private final class OverlayView: NSView {
                 dx: -windowOriginInScreenCoords.x,
                 dy: -windowOriginInScreenCoords.y
             )
-            ctx.setFillColor(accent.withAlphaComponent(0.15).cgColor)
+            // The lasso rubber-band stays square-cornered to read as a
+            // selection gesture (matches Finder's lasso) rather than a
+            // window highlight.
+            guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+            ctx.setFillColor(accent.withAlphaComponent(0.12).cgColor)
             ctx.fill(local)
             ctx.setStrokeColor(accent.cgColor)
             ctx.setLineWidth(1.5)

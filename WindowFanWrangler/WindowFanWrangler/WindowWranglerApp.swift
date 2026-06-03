@@ -116,6 +116,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             existing?()
             self?.rebuildMenu()
         }
+        // Also rebuild when lasso mode itself toggles, so the menu's
+        // "Lasso Mode: ON/Off" indicator stays accurate.
+        lassoCoordinator.onLassoModeChanged = { [weak self] _ in
+            self?.rebuildMenu()
+        }
     }
 
     // MARK: - Global keyboard shortcuts
@@ -128,19 +133,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // granted leaves it permanently dead even after permission
         // becomes available.
         //
-        // ⌃⌥⌘+arrows: chord uses all four bottom-row modifiers (no Shift),
-        // and arrow keys with this exact modifier combo are not bound by
-        // macOS, browsers, IDEs, VoiceOver, or any common window manager.
+        // Cascade Right/Left moved off ⌃⌥⌘→ / ⌃⌥⌘← because macOS Tahoe
+        // claims those chords for system window-tiling and consumes
+        // them before our NSEvent global monitor can see them. Period
+        // (right of comma on the keyboard) maps to Cascade Down-Right;
+        // comma maps to Cascade Down-Left. Restore keeps ⌃⌥⌘↑ since
+        // that chord is unclaimed by macOS.
         let modifiers: NSEvent.ModifierFlags = [.control, .option, .command]
         shortcuts.register(.init(
             modifiers: modifiers,
-            keyCode: KeyCode.rightArrow,
+            keyCode: KeyCode.period,
             action: { [weak self] in self?.cascadeDownRight() },
             label: "Cascade Down-Right"
         ))
         shortcuts.register(.init(
             modifiers: modifiers,
-            keyCode: KeyCode.leftArrow,
+            keyCode: KeyCode.comma,
             action: { [weak self] in self?.cascadeDownLeft() },
             label: "Cascade Down-Left"
         ))
@@ -149,6 +157,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             keyCode: KeyCode.upArrow,
             action: { [weak self] in self?.restoreLayout() },
             label: "Restore Previous Layout"
+        ))
+        // ⌃⌥⌘C: toggle lasso mode on/off. Replaces the old "hold ⌥W
+        // and drag" UX, which triggered macOS's Option-click "switch
+        // and hide" gesture and caused windows to vanish.
+        shortcuts.register(.init(
+            modifiers: modifiers,
+            keyCode: KeyCode.c,
+            action: { [weak self] in self?.lassoCoordinator.toggleLassoMode() },
+            label: "Toggle Lasso Mode"
         ))
     }
 
@@ -304,6 +321,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
         menu.autoenablesItems = false
 
+        // Shared modifier mask for all our shortcut hints in this menu.
+        let shortcutModifiers: NSEvent.ModifierFlags = [.control, .option, .command]
+
         // Permission status header — read-only indicator
         let header = NSMenuItem(
             title: isTrusted
@@ -316,7 +336,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(header)
         menu.addItem(.separator())
 
-        // Lasso selection state, if any.
+        // Lasso mode indicator + toggle.
+        let lassoActive = lassoCoordinator.isLassoModeActive
+        let lassoStateItem = NSMenuItem(
+            title: lassoActive
+                ? "Lasso Mode: ● ON  — click-drag to select"
+                : "Lasso Mode: Off",
+            action: nil,
+            keyEquivalent: ""
+        )
+        lassoStateItem.isEnabled = false
+        menu.addItem(lassoStateItem)
+
+        let lassoToggleItem = NSMenuItem(
+            title: lassoActive ? "Turn Off Lasso Mode" : "Turn On Lasso Mode",
+            action: #selector(toggleLassoFromMenu),
+            keyEquivalent: "c"
+        )
+        lassoToggleItem.keyEquivalentModifierMask = shortcutModifiers
+        lassoToggleItem.target = self
+        lassoToggleItem.isEnabled = isTrusted
+        menu.addItem(lassoToggleItem)
+
+        // Selection state, if any.
         if windowSelection.count > 0 {
             let plural = windowSelection.count == 1 ? "" : "s"
             let selectionHeader = NSMenuItem(
@@ -335,20 +377,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             clearItem.target = self
             clearItem.isEnabled = true
             menu.addItem(clearItem)
-
-            menu.addItem(.separator())
         }
+
+        menu.addItem(.separator())
 
         // Cascade actions — one per direction. The keyEquivalent here
         // is purely for visual display in the menu; the actual firing
         // is handled by GlobalShortcuts (since we're an accessory app
         // and macOS won't fire menu shortcuts when we're not frontmost).
-        let shortcutModifiers: NSEvent.ModifierFlags = [.control, .option, .command]
 
         let cascadeRightItem = NSMenuItem(
             title: "Cascade Down-Right",
             action: #selector(cascadeDownRight),
-            keyEquivalent: "\u{F703}"  // NSRightArrowFunctionKey
+            keyEquivalent: "."  // ⌃⌥⌘. — see setupGlobalShortcuts for why
         )
         cascadeRightItem.keyEquivalentModifierMask = shortcutModifiers
         cascadeRightItem.target = self
@@ -358,7 +399,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let cascadeLeftItem = NSMenuItem(
             title: "Cascade Down-Left",
             action: #selector(cascadeDownLeft),
-            keyEquivalent: "\u{F702}"  // NSLeftArrowFunctionKey
+            keyEquivalent: ","  // ⌃⌥⌘,
         )
         cascadeLeftItem.keyEquivalentModifierMask = shortcutModifiers
         cascadeLeftItem.target = self
@@ -618,5 +659,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func clearSelection() {
         windowSelection.clear()
+    }
+
+    @objc private func toggleLassoFromMenu() {
+        lassoCoordinator.toggleLassoMode()
     }
 }

@@ -93,4 +93,7 @@ enum KeyCode {
     static let `return`:   UInt16 = 0x24
     static let escape:     UInt16 = 0x35
     static let space:      UInt16 = 0x31
+    static let c:          UInt16 = 0x08  // kVK_ANSI_C
+    static let comma:      UInt16 = 0x2B  // kVK_ANSI_Comma
+    static let period:     UInt16 = 0x2F  // kVK_ANSI_Period
 }
