@@ -43,8 +43,17 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate {
 
     /// Brings the window to the front. Since we're an .accessory app
     /// (no Dock icon), we have to explicitly activate to get focus.
+    ///
+    /// Picks the modern `NSApp.activate()` API on macOS 14+ where
+    /// available; falls back to the older `activate(ignoringOtherApps:)`
+    /// on macOS 13 (Ventura). The older call is deprecated on newer
+    /// systems but is the only option pre-14.
     func presentOnboarding() {
-        NSApp.activate(ignoringOtherApps: true)
+        if #available(macOS 14.0, *) {
+            NSApp.activate()
+        } else {
+            NSApp.activate(ignoringOtherApps: true)
+        }
         showWindow(nil)
         window?.makeKeyAndOrderFront(nil)
     }

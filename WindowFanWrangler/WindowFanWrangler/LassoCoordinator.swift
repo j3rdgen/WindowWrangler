@@ -12,6 +12,7 @@
 //
 
 import AppKit
+import os
 
 @MainActor
 final class LassoCoordinator {
@@ -47,7 +48,7 @@ final class LassoCoordinator {
         } else {
             modeHint.hide()
         }
-        NSLog("[\(AppInfo.displayName)] Lasso mode: \(isLassoModeActive ? "ON" : "OFF")")
+        Log.lasso.notice("Lasso mode: \(self.isLassoModeActive ? "ON" : "OFF", privacy: .public)")
         onLassoModeChanged?(isLassoModeActive)
     }
 
@@ -61,6 +62,11 @@ final class LassoCoordinator {
     }
 
     /// Stops the global monitors. Call when permission is revoked.
+    ///
+    /// Resets `isLassoModeActive` to false AND notifies subscribers, so
+    /// the menu doesn't keep showing "Lasso Mode: ON" after the lasso
+    /// has actually been torn down. Without this notification the menu
+    /// state can drift from the truth.
     func stop() {
         eventMonitor.stop()
         overlay.hideLassoRect()
@@ -68,6 +74,10 @@ final class LassoCoordinator {
         overlay.hideIfEmpty()
         modeHint.hide()
         dragAnchor = nil
+        if isLassoModeActive {
+            isLassoModeActive = false
+            onLassoModeChanged?(false)
+        }
     }
 
     // MARK: - Wiring
@@ -79,7 +89,7 @@ final class LassoCoordinator {
             let rect = CGRect(origin: point, size: .zero)
             self.overlay.showLassoRect(rect)
             self.updateSelection(forLassoRect: rect)
-            NSLog("[\(AppInfo.displayName)] Lasso drag began at \(Int(point.x)),\(Int(point.y))")
+            Log.lasso.info("Drag began at \(Int(point.x), privacy: .public),\(Int(point.y), privacy: .public)")
         }
 
         eventMonitor.onLassoDragUpdated = { [weak self] point in
@@ -95,17 +105,27 @@ final class LassoCoordinator {
             self.updateSelection(forLassoRect: rect)
             self.overlay.hideLassoRect()
             self.dragAnchor = nil
-            NSLog("[\(AppInfo.displayName)] Lasso drag ended; selection has \(self.selection.count) window(s)")
+            Log.lasso.info("Drag ended; selection has \(self.selection.count, privacy: .public) window(s)")
         }
 
         eventMonitor.onEscapePressed = { [weak self] in
             guard let self else { return }
             let wasActive = self.isLassoModeActive
-            if !self.selection.isEmpty || self.dragAnchor != nil || wasActive {
-                NSLog("[\(AppInfo.displayName)] Escape pressed — exiting lasso, clearing selection")
+            let wasDragging = self.dragAnchor != nil
+            if !self.selection.isEmpty || wasDragging || wasActive {
+                Log.lasso.notice("Escape pressed — exiting lasso, clearing selection")
                 self.selection.clear()
                 self.dragAnchor = nil
                 self.overlay.hideLassoRect()
+                // Cancel the eventMonitor's in-flight drag so the next
+                // mouseUp doesn't get silently consumed (it would fire
+                // onLassoDragEnded with a nil anchor and the event
+                // would still be eaten by the tap, swallowing the
+                // user's mouse release with nothing visible to show
+                // for it).
+                if wasDragging {
+                    self.eventMonitor.cancelDrag()
+                }
                 if wasActive {
                     self.isLassoModeActive = false
                     self.eventMonitor.isLassoModeActive = false

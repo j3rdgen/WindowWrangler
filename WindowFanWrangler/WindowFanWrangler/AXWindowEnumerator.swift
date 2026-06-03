@@ -12,6 +12,7 @@
 
 import AppKit
 import ApplicationServices
+import os
 
 /// A reference to one window plus its current frame in Cocoa coords.
 struct EnumeratedWindow {
@@ -25,11 +26,12 @@ enum AXWindowEnumerator {
     /// (z-order) per macOS. Filters out non-cascadable AX elements
     /// that the OS reports as "windows" but aren't standard user windows
     /// (popovers, PiP, notification banners, minimized windows, etc.).
-    /// Logs diagnostics at each pipeline step.
+    ///
+    /// Logs a single summary line per call. Cascade calls this up to
+    /// 8 times per invocation, so per-step logging was producing >30
+    /// console lines per cascade and burying real signal.
     static func windows(of app: NSRunningApplication) -> [EnumeratedWindow] {
         let appName = app.localizedName ?? "?"
-        NSLog("[\(AppInfo.displayName)] AX: querying windows of '\(appName)' pid=\(app.processIdentifier)")
-
         let appElement = AXUIElementCreateApplication(app.processIdentifier)
 
         var windowsValue: CFTypeRef?
@@ -40,34 +42,35 @@ enum AXWindowEnumerator {
         )
 
         guard result == .success else {
-            NSLog("[\(AppInfo.displayName)] AX: kAXWindowsAttribute query failed " +
-                  "(code \(result.rawValue))")
+            Log.ax.error(
+                "'\(appName, privacy: .public)' pid=\(app.processIdentifier, privacy: .public) kAXWindows query failed (code \(result.rawValue, privacy: .public))"
+            )
             return []
         }
 
         guard let windows = windowsValue as? [AXUIElement] else {
-            NSLog("[\(AppInfo.displayName)] AX: query succeeded but value isn't [AXUIElement]")
+            Log.ax.error(
+                "'\(appName, privacy: .public)' pid=\(app.processIdentifier, privacy: .public) kAXWindows returned a non-array value"
+            )
             return []
         }
-
-        NSLog("[\(AppInfo.displayName)] AX: '\(appName)' reported \(windows.count) raw window(s)")
 
         var filteredCount = 0
         let enumerated = windows.compactMap { element -> EnumeratedWindow? in
             // Subrole filter: only standard windows (skip popovers, dialogs,
             // system panels, floating windows, etc.).
-            if let subrole = stringAttribute(.subrole, of: element),
+            if let subrole = stringAttribute(kAXSubroleAttribute, of: element),
                subrole != kAXStandardWindowSubrole as String {
                 filteredCount += 1
                 return nil
             }
             // Minimized windows aren't visible to the user.
-            if let minimized = boolAttribute(.minimized, of: element), minimized {
+            if let minimized = boolAttribute(kAXMinimizedAttribute, of: element), minimized {
                 filteredCount += 1
                 return nil
             }
             guard let frameAX = currentFrame(of: element) else {
-                NSLog("[\(AppInfo.displayName)] AX: skipping window with no readable frame")
+                filteredCount += 1
                 return nil
             }
             // Size heuristic: anything smaller than 200×100 is almost
@@ -80,35 +83,23 @@ enum AXWindowEnumerator {
             return EnumeratedWindow(axElement: element, frame: frameCocoa)
         }
 
-        if filteredCount > 0 {
-            NSLog("[\(AppInfo.displayName)] AX: filtered out \(filteredCount) non-cascadable element(s)")
-        }
-        NSLog("[\(AppInfo.displayName)] AX: returning \(enumerated.count) enumerated window(s)")
+        Log.ax.info(
+            "'\(appName, privacy: .public)' pid=\(app.processIdentifier, privacy: .public) → \(enumerated.count, privacy: .public) window(s) (\(filteredCount, privacy: .public) filtered, \(windows.count, privacy: .public) raw)"
+        )
         return enumerated
     }
 
     // MARK: - AX attribute helpers
 
-    private enum Attribute {
-        case subrole, minimized
-
-        var key: CFString {
-            switch self {
-            case .subrole:   return kAXSubroleAttribute as CFString
-            case .minimized: return kAXMinimizedAttribute as CFString
-            }
-        }
-    }
-
-    private static func stringAttribute(_ attr: Attribute, of element: AXUIElement) -> String? {
+    private static func stringAttribute(_ key: String, of element: AXUIElement) -> String? {
         var value: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, attr.key, &value) == .success else { return nil }
+        guard AXUIElementCopyAttributeValue(element, key as CFString, &value) == .success else { return nil }
         return value as? String
     }
 
-    private static func boolAttribute(_ attr: Attribute, of element: AXUIElement) -> Bool? {
+    private static func boolAttribute(_ key: String, of element: AXUIElement) -> Bool? {
         var value: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, attr.key, &value) == .success else { return nil }
+        guard AXUIElementCopyAttributeValue(element, key as CFString, &value) == .success else { return nil }
         return value as? Bool
     }
 

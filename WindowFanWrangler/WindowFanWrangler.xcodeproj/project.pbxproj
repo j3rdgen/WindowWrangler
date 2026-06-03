@@ -6,8 +6,19 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXContainerItemProxy section */
+		5E437FA52FD0B9A600F0B093 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 5E437F0B2FC604C500F0B093 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 5E437F122FC604C500F0B093;
+			remoteInfo = WindowFanWrangler;
+		};
+/* End PBXContainerItemProxy section */
+
 /* Begin PBXFileReference section */
 		5E437F132FC604C500F0B093 /* WindowFanWrangler.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; name = WindowFanWrangler.app; path = "Window Wrangler.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		5E437FA12FD0B9A600F0B093 /* Window WranglerTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "Window WranglerTests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -16,10 +27,22 @@
 			path = WindowFanWrangler;
 			sourceTree = "<group>";
 		};
+		5E437FA22FD0B9A600F0B093 /* Window WranglerTests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = "Window WranglerTests";
+			sourceTree = "<group>";
+		};
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
 		5E437F102FC604C500F0B093 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		5E437F9E2FD0B9A600F0B093 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -33,6 +56,7 @@
 			isa = PBXGroup;
 			children = (
 				5E437F152FC604C500F0B093 /* WindowFanWrangler */,
+				5E437FA22FD0B9A600F0B093 /* Window WranglerTests */,
 				5E437F142FC604C500F0B093 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -41,6 +65,7 @@
 			isa = PBXGroup;
 			children = (
 				5E437F132FC604C500F0B093 /* WindowFanWrangler.app */,
+				5E437FA12FD0B9A600F0B093 /* Window WranglerTests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -70,6 +95,29 @@
 			productReference = 5E437F132FC604C500F0B093 /* WindowFanWrangler.app */;
 			productType = "com.apple.product-type.application";
 		};
+		5E437FA02FD0B9A600F0B093 /* Window WranglerTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 5E437FA72FD0B9A600F0B093 /* Build configuration list for PBXNativeTarget "Window WranglerTests" */;
+			buildPhases = (
+				5E437F9D2FD0B9A600F0B093 /* Sources */,
+				5E437F9E2FD0B9A600F0B093 /* Frameworks */,
+				5E437F9F2FD0B9A600F0B093 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				5E437FA62FD0B9A600F0B093 /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				5E437FA22FD0B9A600F0B093 /* Window WranglerTests */,
+			);
+			name = "Window WranglerTests";
+			packageProductDependencies = (
+			);
+			productName = "Window WranglerTests";
+			productReference = 5E437FA12FD0B9A600F0B093 /* Window WranglerTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -82,6 +130,10 @@
 				TargetAttributes = {
 					5E437F122FC604C500F0B093 = {
 						CreatedOnToolsVersion = 26.5;
+					};
+					5E437FA02FD0B9A600F0B093 = {
+						CreatedOnToolsVersion = 26.5;
+						TestTargetID = 5E437F122FC604C500F0B093;
 					};
 				};
 			};
@@ -100,12 +152,20 @@
 			projectRoot = "";
 			targets = (
 				5E437F122FC604C500F0B093 /* WindowFanWrangler */,
+				5E437FA02FD0B9A600F0B093 /* Window WranglerTests */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
 		5E437F112FC604C500F0B093 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		5E437F9F2FD0B9A600F0B093 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -122,7 +182,22 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		5E437F9D2FD0B9A600F0B093 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		5E437FA62FD0B9A600F0B093 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 5E437F122FC604C500F0B093 /* WindowFanWrangler */;
+			targetProxy = 5E437FA52FD0B9A600F0B093 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		5E437F1C2FC604C600F0B093 /* Debug */ = {
@@ -178,7 +253,7 @@
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
 				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
-				MACOSX_DEPLOYMENT_TARGET = 26.5;
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;
@@ -235,7 +310,7 @@
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
 				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
-				MACOSX_DEPLOYMENT_TARGET = 26.5;
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
 				SDKROOT = macosx;
@@ -307,6 +382,46 @@
 			};
 			name = Release;
 		};
+		5E437FA82FD0B9A600F0B093 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.5;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.jmw3.Window-WranglerTests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				STRING_CATALOG_GENERATE_SYMBOLS = NO;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Window Wrangler.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Window Wrangler";
+			};
+			name = Debug;
+		};
+		5E437FA92FD0B9A600F0B093 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.5;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.jmw3.Window-WranglerTests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				STRING_CATALOG_GENERATE_SYMBOLS = NO;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Window Wrangler.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Window Wrangler";
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -324,6 +439,15 @@
 			buildConfigurations = (
 				5E437F1F2FC604C600F0B093 /* Debug */,
 				5E437F202FC604C600F0B093 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		5E437FA72FD0B9A600F0B093 /* Build configuration list for PBXNativeTarget "Window WranglerTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				5E437FA82FD0B9A600F0B093 /* Debug */,
+				5E437FA92FD0B9A600F0B093 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

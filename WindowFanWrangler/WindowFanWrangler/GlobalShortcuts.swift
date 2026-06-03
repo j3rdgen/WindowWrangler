@@ -18,6 +18,7 @@
 //
 
 import AppKit
+import os
 
 @MainActor
 final class GlobalShortcuts {
@@ -73,7 +74,7 @@ final class GlobalShortcuts {
 
         for binding in bindings {
             if event.keyCode == binding.keyCode && eventMods == binding.modifiers {
-                NSLog("[\(AppInfo.displayName)] Shortcut fired: \(binding.label)")
+                Log.shortcuts.notice("Shortcut fired: \(binding.label, privacy: .public)")
                 binding.action()
                 return
             }

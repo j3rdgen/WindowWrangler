@@ -21,6 +21,7 @@
 
 import AppKit
 import CoreGraphics
+import os
 
 @MainActor
 final class GlobalEventMonitor {
@@ -69,8 +70,6 @@ final class GlobalEventMonitor {
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
 
-    private let kVK_Escape: UInt16 = 0x35
-
     // MARK: - Lifecycle
 
     /// Begins observing global events. Idempotent.
@@ -90,8 +89,9 @@ final class GlobalEventMonitor {
         // is active.
         setupMouseEventTap()
 
-        NSLog("[\(AppInfo.displayName)] GlobalEventMonitor: started " +
-              "(CGEventTap mouse=\(eventTap != nil ? "ok" : "FAILED"), NSEvent escape)")
+        Log.lasso.notice(
+            "GlobalEventMonitor: started (CGEventTap mouse=\(self.eventTap != nil ? "ok" : "FAILED", privacy: .public), NSEvent escape)"
+        )
     }
 
     func stop() {
@@ -131,8 +131,9 @@ final class GlobalEventMonitor {
             callback: GlobalEventMonitor.cgEventTapCallback,
             userInfo: selfPtr
         ) else {
-            NSLog("[\(AppInfo.displayName)] CGEventTap creation FAILED — " +
-                  "lasso mouse won't fire. Check Accessibility permission.")
+            Log.lasso.error(
+                "CGEventTap creation FAILED — lasso mouse won't fire. Check Accessibility permission."
+            )
             return
         }
 
@@ -146,6 +147,15 @@ final class GlobalEventMonitor {
 
     /// C-style callback. Bridges into our @MainActor instance method
     /// via the `userInfo` pointer we passed at tap creation.
+    ///
+    /// IMPORTANT: this callback runs on the main run loop and macOS
+    /// will disable the tap if it doesn't return within ~75ms. Any work
+    /// chained off the drag callbacks (overlay redraw, hit-test, menu
+    /// rebuild) must stay well under that budget. In particular: do
+    /// NOT add expensive NSLog formatting, heavy CG queries, or
+    /// dispatch-sync calls here — they can blow the timeout under load
+    /// and silently disable mouse handling until macOS re-enables us
+    /// via `.tapDisabledByTimeout` (handled below).
     private static let cgEventTapCallback: CGEventTapCallBack = { _, type, event, refcon in
         guard let refcon = refcon else {
             return Unmanaged.passUnretained(event)
@@ -207,9 +217,18 @@ final class GlobalEventMonitor {
     }
 
     private func handleKey(_ event: NSEvent) {
-        if event.keyCode == kVK_Escape {
+        if event.keyCode == KeyCode.escape {
             onEscapePressed?()
         }
+    }
+
+    /// Cancels any in-flight drag without firing the drag-ended callback.
+    /// Called by LassoCoordinator when Escape is pressed mid-drag — the
+    /// matching mouseUp will still be observed (and consumed) by the
+    /// tap, but it won't trigger a stale `onLassoDragEnded` and won't
+    /// be silently eaten with no record.
+    func cancelDrag() {
+        dragInProgress = false
     }
 
     // MARK: - Helpers

@@ -18,6 +18,7 @@
 
 import AppKit
 import CoreGraphics
+import os
 
 /// A window owned by some app, suitable for hit-testing and selection.
 struct VisibleWindow {
@@ -174,78 +175,49 @@ enum CrossAppWindowEnumerator {
 
     // MARK: - Diagnostics
 
-    /// Logs every layer-0 window CGWindowList returns, along with the
-    /// reference frames we compare against. Called once per lasso
-    /// drag-start so you can see exactly what's being captured and
-    /// why the filter is letting it through.
-    ///
-    /// Writes to BOTH NSLog (for Console.app) and a plain text file at
-    /// `~/Desktop/wrangler-lasso-diagnostic.txt` so you can just open
-    /// the file in TextEdit if Console filtering is fighting you.
+    /// Logs every layer-0 window CGWindowList returns, alongside the
+    /// reference frames we compare against. Not wired to any caller in
+    /// the current build — kept as an ad-hoc tool to drop into a lasso
+    /// or cascade flow when the filter needs investigation. To use it,
+    /// add a single `CrossAppWindowEnumerator.diagnosticDump()` line at
+    /// the point of interest and read the Console output.
     static func diagnosticDump() {
-        var lines: [String] = []
-        let tag = "[\(AppInfo.displayName)]"
-
-        lines.append("=== Lasso candidate dump  (\(Date())) ===")
+        Log.lasso.debug("=== CrossApp candidate dump (\(Date(), privacy: .public)) ===")
 
         for (i, screen) in NSScreen.screens.enumerated() {
             let f = screen.frame
-            let vf = screen.visibleFrame
             let axf = CoordinateSpace.axRect(fromCocoa: f)
-            let axvf = CoordinateSpace.axRect(fromCocoa: vf)
-            lines.append(
-                "Display[\(i)] " +
-                "cocoa.frame=(\(Int(f.minX)),\(Int(f.minY)) \(Int(f.width))×\(Int(f.height))) " +
-                "ax.frame=(\(Int(axf.minX)),\(Int(axf.minY)) \(Int(axf.width))×\(Int(axf.height))) " +
-                "ax.visible=(\(Int(axvf.minX)),\(Int(axvf.minY)) \(Int(axvf.width))×\(Int(axvf.height)))"
-            )
+            let cocoaStr = "(\(Int(f.minX)),\(Int(f.minY)) \(Int(f.width))×\(Int(f.height)))"
+            let axStr = "(\(Int(axf.minX)),\(Int(axf.minY)) \(Int(axf.width))×\(Int(axf.height)))"
+            Log.lasso.debug("Display[\(i, privacy: .public)] cocoa=\(cocoaStr, privacy: .public) ax=\(axStr, privacy: .public)")
         }
 
-        if let raw = CGWindowListCopyWindowInfo(
+        guard let raw = CGWindowListCopyWindowInfo(
             [.optionOnScreenOnly, .excludeDesktopElements],
             kCGNullWindowID
-        ) as? [[String: Any]] {
-            let ourPID = ProcessInfo.processInfo.processIdentifier
-            for dict in raw {
-                let layer = dict[kCGWindowLayer as String] as? Int ?? -999
-                let owner = dict[kCGWindowOwnerName as String] as? String ?? "?"
-                let pid = dict[kCGWindowOwnerPID as String] as? pid_t ?? -1
-                let alpha = (dict[kCGWindowAlpha as String] as? CGFloat) ?? -1
-                let winID = dict[kCGWindowNumber as String] as? CGWindowID ?? 0
-                var boundsStr = "?"
-                if let boundsDict = dict[kCGWindowBounds as String] as? [String: Any],
-                   let rect = CGRect(dictionaryRepresentation: boundsDict as CFDictionary) {
-                    boundsStr = "(\(Int(rect.minX)),\(Int(rect.minY)) \(Int(rect.width))×\(Int(rect.height)))"
-                }
-                let me = (pid == ourPID) ? " [OURS]" : ""
-                lines.append(
-                    "  L\(layer) #\(winID) α\(String(format: "%.2f", alpha)) " +
-                    "[\(owner)] \(boundsStr)\(me)"
-                )
-            }
-        }
-        lines.append("=== end dump ===")
-
-        // 1. Stream to Console via NSLog (one prefix per line).
-        for line in lines {
-            NSLog("\(tag) \(line)")
+        ) as? [[String: Any]] else {
+            Log.lasso.debug("=== end dump (no window info available) ===")
+            return
         }
 
-        // 2. Also write to ~/Desktop/wrangler-lasso-diagnostic.txt
-        //    — every drag-start APPENDS a new block, so multiple
-        //    attempts in one session are all preserved.
-        let body = lines.joined(separator: "\n") + "\n\n"
-        let url = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Desktop/wrangler-lasso-diagnostic.txt")
-        let fm = FileManager.default
-        if fm.fileExists(atPath: url.path) {
-            if let handle = try? FileHandle(forWritingTo: url) {
-                handle.seekToEndOfFile()
-                if let data = body.data(using: .utf8) { handle.write(data) }
-                try? handle.close()
+        let ourPID = ProcessInfo.processInfo.processIdentifier
+        for dict in raw {
+            let layer = dict[kCGWindowLayer as String] as? Int ?? -999
+            let owner = dict[kCGWindowOwnerName as String] as? String ?? "?"
+            let pid = dict[kCGWindowOwnerPID as String] as? pid_t ?? -1
+            let alpha = (dict[kCGWindowAlpha as String] as? CGFloat) ?? -1
+            let winID = dict[kCGWindowNumber as String] as? CGWindowID ?? 0
+            var boundsStr = "?"
+            if let boundsDict = dict[kCGWindowBounds as String] as? [String: Any],
+               let rect = CGRect(dictionaryRepresentation: boundsDict as CFDictionary) {
+                boundsStr = "(\(Int(rect.minX)),\(Int(rect.minY)) \(Int(rect.width))×\(Int(rect.height)))"
             }
-        } else {
-            try? body.write(to: url, atomically: true, encoding: .utf8)
+            let me = (pid == ourPID) ? " [OURS]" : ""
+            let alphaStr = String(format: "%.2f", alpha)
+            Log.lasso.debug(
+                "  L\(layer, privacy: .public) #\(winID, privacy: .public) α\(alphaStr, privacy: .public) [\(owner, privacy: .public)] \(boundsStr, privacy: .public)\(me, privacy: .public)"
+            )
         }
+        Log.lasso.debug("=== end dump ===")
     }
 }

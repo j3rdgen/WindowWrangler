@@ -12,6 +12,7 @@
 
 import AppKit
 import ApplicationServices
+import os
 
 enum WindowMutator {
 
@@ -56,8 +57,9 @@ enum WindowMutator {
             let gotW = Int(actual.width.rounded())
             let gotH = Int(actual.height.rounded())
             if abs(gotW - wantedW) > 4 || abs(gotH - wantedH) > 4 {
-                NSLog("[\(AppInfo.displayName)] Mutator: app refused resize — " +
-                      "asked \(wantedW)×\(wantedH), got \(gotW)×\(gotH)")
+                Log.mutator.notice(
+                    "App refused resize — asked \(wantedW, privacy: .public)×\(wantedH, privacy: .public), got \(gotW, privacy: .public)×\(gotH, privacy: .public)"
+                )
             }
         }
 
