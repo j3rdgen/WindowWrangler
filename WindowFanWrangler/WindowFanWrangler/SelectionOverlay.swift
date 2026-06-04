@@ -115,10 +115,23 @@ final class SelectionOverlay {
         newPanel.ignoresMouseEvents = true
         newPanel.level = .floating
         newPanel.hidesOnDeactivate = false
-        // Stationary so the panel doesn't slide between Spaces; ignoresCycle
-        // so it doesn't show up in Cmd-Tab; fullScreenAuxiliary lets it
-        // coexist with full-screen apps without forcing a Space change.
-        newPanel.collectionBehavior = [.stationary, .ignoresCycle, .fullScreenAuxiliary]
+        // canJoinAllSpaces: the overlay must appear on whichever Space the
+        // user is currently viewing — without this the panel stays pinned
+        // to the Space it was first created on, so any lasso drag on a
+        // different Space produces no visible rubber-band / selection
+        // borders (the LassoModeHint already had this; SelectionOverlay
+        // was missing it, which is why lasso "didn't work" anywhere
+        // except Desktop where the panel was first instantiated).
+        // stationary: don't slide during Mission Control transitions.
+        // ignoresCycle: don't show up in Cmd-Tab.
+        // fullScreenAuxiliary: coexist with full-screen apps without
+        // forcing a Space change.
+        newPanel.collectionBehavior = [
+            .canJoinAllSpaces,
+            .stationary,
+            .ignoresCycle,
+            .fullScreenAuxiliary,
+        ]
         newPanel.sharingType = .none
 
         let newView = OverlayView(
