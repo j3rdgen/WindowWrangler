@@ -134,17 +134,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
         // Cascade Right/Left use ⌃⌥⌘. / ⌃⌥⌘, because macOS Tahoe claims
         // ⌃⌥⌘→ / ⌃⌥⌘← for system window-tiling and consumes them
         // before our global monitor can see them.
+        //
+        // Shortcut-triggered cascade routes through a separate path
+        // from menu-triggered cascade so we can use the mouse-cursor's
+        // display as the cascade target (most-recent attention signal).
+        // Menu-triggered actions use the @objc methods at the bottom
+        // of this file, which fall back to the front window's display.
         let modifiers: NSEvent.ModifierFlags = [.control, .option, .command]
         shortcuts.register(.init(
             modifiers: modifiers,
             keyCode: KeyCode.period,
-            action: { [weak self] in self?.cascadeDownRight() },
+            action: { [weak self] in self?.shortcutCascade(direction: .downRight) },
             label: "Cascade Down-Right"
         ))
         shortcuts.register(.init(
             modifiers: modifiers,
             keyCode: KeyCode.comma,
-            action: { [weak self] in self?.cascadeDownLeft() },
+            action: { [weak self] in self?.shortcutCascade(direction: .downLeft) },
             label: "Cascade Down-Left"
         ))
         shortcuts.register(.init(
@@ -159,6 +165,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
             action: { [weak self] in self?.toggleLassoFromMenu() },
             label: "Toggle Lasso Mode"
         ))
+    }
+
+    /// Shortcut-triggered cascade. Captures the mouse cursor's location
+    /// *now* (before any deferral), looks up the corresponding display,
+    /// and passes it to the orchestrator so the cascade operates only
+    /// on the windows of the display the user is currently looking at
+    /// — even when other displays are connected and have windows from
+    /// the same app.
+    ///
+    /// The mouse-cursor lookup is done synchronously at trigger time
+    /// so the cursor's position at the moment the user pressed the
+    /// shortcut is what wins. Deferring the actual cascade work by one
+    /// runloop tick keeps the timing consistent with the menu path
+    /// (harmless ~1ms wait, helps if anything else is in flight).
+    private func shortcutCascade(direction: CascadeDirection) {
+        let mouseDisplay = CoordinateSpace.screen(containing: NSEvent.mouseLocation)
+        runAfterMenuDismiss { [weak self] in
+            self?.cascadeOrchestrator.performCascade(
+                direction: direction,
+                targetScreen: mouseDisplay
+            )
+        }
     }
 
     // MARK: - Active app tracking
@@ -184,6 +212,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
             // Skip ourselves — never want to operate on our own (zero) windows.
             if app.bundleIdentifier == Bundle.main.bundleIdentifier { return }
             self.lastUserApp = app
+
+            // If the onboarding window is open, an app activation is
+            // very likely the user switching BACK from System Settings
+            // after toggling our permission. Force an immediate
+            // permission re-check so the onboarding window can dismiss
+            // without waiting for the next poll tick — keeps the
+            // "closes automatically" promise honest.
+            if self.onboardingWindow != nil {
+                self.permission.forceRecheck()
+            }
         }
     }
 
@@ -283,6 +321,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
     }
 
     private func dismissOnboarding() {
+        // Belt-and-suspenders: orderOut first (immediate hide from
+        // screen) AND close (invokes windowWillClose for cleanup).
+        // close() alone is normally enough, but on some macOS releases
+        // it's been observed to delay the actual hide by a frame; the
+        // explicit orderOut guarantees the window is off-screen right
+        // now so the user sees an instant response to the permission
+        // grant.
+        onboardingWindow?.window?.orderOut(nil)
         onboardingWindow?.close()
         onboardingWindow = nil
     }

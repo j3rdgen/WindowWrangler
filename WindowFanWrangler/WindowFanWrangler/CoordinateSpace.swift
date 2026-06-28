@@ -63,4 +63,29 @@ enum CoordinateSpace {
         }
         return NSScreen.screens.first?.visibleFrame ?? .zero
     }
+
+    /// The `NSScreen` containing the given Cocoa-coordinate point,
+    /// falling back to the primary display if no screen contains it
+    /// (e.g., point off the edge of every connected display).
+    ///
+    /// Returns nil only if no displays are connected at all, which is
+    /// impossible in practice but worth handling cleanly.
+    static func screen(containing point: CGPoint) -> NSScreen? {
+        for screen in NSScreen.screens {
+            if screen.frame.contains(point) {
+                return screen
+            }
+        }
+        return NSScreen.screens.first
+    }
+
+    /// The `NSScreen` a rect primarily occupies — defined as the display
+    /// containing the rect's center point. A window straddling two
+    /// displays gets assigned to whichever one its midpoint lands on,
+    /// which is the simplest unambiguous rule and matches how macOS
+    /// itself handles "which display is this window on" for traffic-
+    /// light buttons and similar UI placement.
+    static func screen(containing rect: CGRect) -> NSScreen? {
+        screen(containing: CGPoint(x: rect.midX, y: rect.midY))
+    }
 }

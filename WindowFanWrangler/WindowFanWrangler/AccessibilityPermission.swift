@@ -29,10 +29,17 @@ final class AccessibilityPermission {
     }
 
     /// Opens System Settings directly to Privacy & Security > Accessibility.
-    /// The user still has to manually toggle the switch for our app.
+    /// The user toggles Window Wrangler ON there to grant permission.
+    ///
+    /// Earlier iteration of this method also called
+    /// AXIsProcessTrustedWithOptions(prompt: true) to refresh a stale
+    /// TCC entry, but that has the side effect of showing macOS's own
+    /// native permission dialog — which then duplicates the messaging
+    /// from our own onboarding window. The TCC stale-entry case is a
+    /// one-time development quirk; once cleaned up manually it doesn't
+    /// recur, so we don't need the system prompt in the steady-state
+    /// flow.
     static func openSystemSettings() {
-        // This URL scheme is supported on macOS 13+ and jumps to the
-        // exact pane we need.
         let url = URL(string:
             "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
         )!
@@ -44,15 +51,19 @@ final class AccessibilityPermission {
     /// Adaptive polling intervals.
     ///
     /// During onboarding (state == NOT trusted), we want the toggle in
-    /// System Settings to be reflected within ~1s so the user gets a
-    /// snappy "permission detected → onboarding dismisses" experience.
+    /// System Settings to be reflected within ~500ms so the user gets
+    /// a snappy "permission detected → onboarding dismisses" experience.
+    /// The onboarding window's body promises automatic closure; making
+    /// good on that promise means polling fast enough that the user
+    /// doesn't have time to wonder whether it worked.
     ///
     /// Once permission has been granted and is the steady state, the
     /// app shouldn't be hitting an OS-level entitlement check every
-    /// second forever. We slow the cadence down to keep CPU/battery
-    /// cost negligible while still picking up a revocation within a
-    /// few seconds (rare event, doesn't need sub-second latency).
-    private static let pollIntervalNotTrusted: TimeInterval = 1.0
+    /// half-second forever. We slow the cadence down to keep CPU /
+    /// battery cost negligible while still picking up a revocation
+    /// within a few seconds (rare event, doesn't need sub-second
+    /// latency).
+    private static let pollIntervalNotTrusted: TimeInterval = 0.5
     private static let pollIntervalTrusted:    TimeInterval = 3.0
 
     private var pollTimer: Timer?
@@ -76,6 +87,24 @@ final class AccessibilityPermission {
         pollTimer?.invalidate()
         pollTimer = nil
         changeCallback = nil
+    }
+
+    /// Forces an immediate permission re-check outside the timer cycle.
+    ///
+    /// Use this when an external event (e.g., another app activating)
+    /// suggests the user may have just toggled our permission in
+    /// System Settings — checking now gives sub-100ms responsiveness
+    /// instead of waiting up to `pollIntervalNotTrusted` for the next
+    /// timer fire. If the state hasn't changed, no callback fires
+    /// (same contract as the regular poll).
+    func forceRecheck() {
+        let current = Self.isTrusted()
+        guard current != lastKnownState else { return }
+        lastKnownState = current
+        changeCallback?(current)
+        // Cadence depends on the new state — reschedule the timer to
+        // match (faster while not trusted, slower once trusted).
+        scheduleTimer(interval: intervalFor(current))
     }
 
     // MARK: - Internal

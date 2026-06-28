@@ -80,9 +80,24 @@ final class CascadeOrchestrator {
 
     // MARK: - Public API
 
-    /// Cascades the resolved target app's windows in the given direction.
+    /// Cascades the resolved target app's windows in the given direction
+    /// on the given display.
+    ///
+    /// `targetScreen` decides which display the cascade operates on.
+    /// When provided (typically the mouse-cursor's display for a
+    /// shortcut-triggered cascade), the cascade only touches windows
+    /// whose midpoint is on that display — windows on other displays
+    /// are left untouched. When nil (typically a menu trigger, where
+    /// the mouse is over our menu and not a useful intent signal), the
+    /// cascade falls back to the display containing the app's front
+    /// window's midpoint.
+    ///
+    /// On a single-display setup the filter collapses to "all windows"
+    /// (every window's midpoint is on the only display), so behavior
+    /// is unchanged from before.
+    ///
     /// See file-level doc comment for the reliability stack.
-    func performCascade(direction: CascadeDirection) {
+    func performCascade(direction: CascadeDirection, targetScreen: NSScreen? = nil) {
         guard isTrusted() else {
             Log.cascade.error("Aborted: AX permission not granted")
             return
@@ -101,14 +116,37 @@ final class CascadeOrchestrator {
         // accessibility tree can go cold; first read has higher latency.
         _ = AXWindowEnumerator.windows(of: targetApp)
 
-        let windows = AXWindowEnumerator.windows(of: targetApp)
+        let allWindows = AXWindowEnumerator.windows(of: targetApp)
 
-        guard !windows.isEmpty else {
+        guard !allWindows.isEmpty else {
             Log.cascade.notice("No-op: no windows found in '\(targetAppName, privacy: .public)'")
             return
         }
+
+        // Pick the display the cascade operates on. Caller-provided
+        // wins; otherwise default to the front window's display.
+        guard let chosenScreen = targetScreen
+                ?? CoordinateSpace.screen(containing: allWindows[0].frame) else {
+            Log.cascade.error("Aborted: no display available")
+            return
+        }
+        let screenLabel = chosenScreen.localizedName
+
+        // Filter to only the windows whose midpoint is on the chosen
+        // display. On a single-display setup this is a no-op; on
+        // multi-display setups it prevents cascade from "pulling"
+        // windows from the other display into this one.
+        let windows = allWindows.filter { window in
+            CoordinateSpace.screen(containing: window.frame)?.frame == chosenScreen.frame
+        }
+        Log.cascade.info(
+            "Target display: '\(screenLabel, privacy: .public)' — \(windows.count, privacy: .public)/\(allWindows.count, privacy: .public) windows on this display"
+        )
+
         guard windows.count > 1 else {
-            Log.cascade.notice("No-op: only 1 window in '\(targetAppName, privacy: .public)'")
+            Log.cascade.notice(
+                "No-op: \(windows.count, privacy: .public) cascadable window(s) on target display '\(screenLabel, privacy: .public)'"
+            )
             return
         }
 
@@ -118,9 +156,11 @@ final class CascadeOrchestrator {
         let myGen = cascadeGeneration
 
         // Snapshot current state BEFORE moving anything, so Restore works.
+        // Only includes windows on the target display — windows on other
+        // displays weren't touched and don't need to be restored.
         lastSnapshot = LayoutSnapshot(from: windows)
 
-        let screen = computeScreenFrame(anchoredOn: windows[0].frame)
+        let screen = computeScreenFrame(visibleFrame: chosenScreen.visibleFrame)
         let targetSize = CGSize(
             width: screen.width * cascadeWindowSizeFraction,
             height: screen.height * cascadeWindowSizeFraction
@@ -224,17 +264,17 @@ final class CascadeOrchestrator {
 
     // MARK: - Internal
 
-    /// Computes the cascade's available frame on whichever display
-    /// contains the anchor window's center, then applies the configured
-    /// margins so the layout has breathing room from the edges.
-    private func computeScreenFrame(anchoredOn anchorFrame: CGRect) -> CGRect {
-        let anchorCenter = CGPoint(x: anchorFrame.midX, y: anchorFrame.midY)
-        let rawScreen = CoordinateSpace.visibleScreenFrame(containing: anchorCenter)
-        return CGRect(
-            x: rawScreen.minX + cascadeMarginLeft,
-            y: rawScreen.minY + cascadeMarginBottom,
-            width: rawScreen.width - cascadeMarginLeft - cascadeMarginRight,
-            height: rawScreen.height - cascadeMarginTop - cascadeMarginBottom
+    /// Applies the configured margins to an `NSScreen.visibleFrame`,
+    /// producing the cascade's available area on that display.
+    /// Visible frame already excludes menu bar + Dock; we add a little
+    /// extra padding on the sides + bottom so the layout has breathing
+    /// room from the screen edges.
+    private func computeScreenFrame(visibleFrame: CGRect) -> CGRect {
+        CGRect(
+            x: visibleFrame.minX + cascadeMarginLeft,
+            y: visibleFrame.minY + cascadeMarginBottom,
+            width: visibleFrame.width - cascadeMarginLeft - cascadeMarginRight,
+            height: visibleFrame.height - cascadeMarginTop - cascadeMarginBottom
         )
     }
 
@@ -323,9 +363,19 @@ final class CascadeOrchestrator {
     }
 
     /// Reads each window's frame, identifies any that didn't reach the
-    /// target size (a "laggard"), and re-applies the cascade only to
-    /// those windows. Then schedules a post-rescue verification at
-    /// +0.4s purely for diagnostic logging.
+    /// target size + position (a "laggard"), re-applies the cascade only
+    /// to those windows, then waits +0.4s and re-checks. If laggards
+    /// remain AND we haven't exhausted the rescue budget, it recurses
+    /// for another rescue round. After the final round it logs a
+    /// "still failing" diagnostic so failures are visible in Console.
+    ///
+    /// Why multiple rounds: in a real failure case captured from logs,
+    /// Chrome refused multiple windows' resize/move writes during the
+    /// first rescue. A single rescue round got 5 of 8 laggards; 3 were
+    /// still off. With one extra round most of those 3 take, because
+    /// whatever transient state was blocking Chrome (a layout pass, a
+    /// devtools constraint settling, etc.) has cleared by then. Up to
+    /// `maxRescueRounds` rounds, ~400ms between each.
     ///
     /// Important: we re-pose only the laggards (not every window) so
     /// already-converged windows don't get a redundant size-position-
@@ -336,16 +386,14 @@ final class CascadeOrchestrator {
         name: String,
         screen: CGRect,
         targetSize: CGSize,
-        direction: CascadeDirection
+        direction: CascadeDirection,
+        rescueRound: Int = 1
     ) {
+        let maxRescueRounds = 2
+
         let verification = AXWindowEnumerator.windows(of: app)
         // Compute the FULL expected target frame per window (position
-        // + size), not just the size. Earlier convergence check only
-        // compared sizes — a window that came out at the right size
-        // but wrong position was being marked "stuck" and silently
-        // excluded from the rescue. Real bug: lasso-tested cascade
-        // would sometimes finish with windows scattered to the wrong
-        // positions while reporting "✓ stuck" in the logs.
+        // + size), not just the size.
         let allFrames = verification.map(\.frame)
         let targetFrames = FanGeometry.computeCascade(
             windows: allFrames,
@@ -353,30 +401,45 @@ final class CascadeOrchestrator {
             targetSize: targetSize,
             direction: direction
         )
-        let wantedW = Int(targetSize.width.rounded())
-        let wantedH = Int(targetSize.height.rounded())
-        Log.cascade.info("Verify: target size \(wantedW, privacy: .public)×\(wantedH, privacy: .public)")
+
+        // Verbose per-window verify lines only on the first round,
+        // to keep Console output readable. Later rounds log only a
+        // summary count.
+        if rescueRound == 1 {
+            let wantedW = Int(targetSize.width.rounded())
+            let wantedH = Int(targetSize.height.rounded())
+            Log.cascade.info("Verify: target size \(wantedW, privacy: .public)×\(wantedH, privacy: .public)")
+        }
 
         var laggardIndices: [Int] = []
         for (i, w) in verification.enumerated() {
             let target = targetFrames[i]
             let stuck = frameMatches(w.frame, target: target)
-            let gotW = Int(w.frame.width.rounded())
-            let gotH = Int(w.frame.height.rounded())
-            let gotX = Int(w.frame.minX.rounded())
-            let gotY = Int(w.frame.minY.rounded())
-            let wantedX = Int(target.minX.rounded())
-            let wantedY = Int(target.minY.rounded())
-            Log.cascade.info(
-                "Verify[\(i, privacy: .public)]: @(\(gotX, privacy: .public),\(gotY, privacy: .public)) \(gotW, privacy: .public)×\(gotH, privacy: .public) vs target @(\(wantedX, privacy: .public),\(wantedY, privacy: .public))  \(stuck ? "✓ stuck" : "✗ REVERTED", privacy: .public)"
-            )
+            if rescueRound == 1 {
+                let gotW = Int(w.frame.width.rounded())
+                let gotH = Int(w.frame.height.rounded())
+                let gotX = Int(w.frame.minX.rounded())
+                let gotY = Int(w.frame.minY.rounded())
+                let wantedX = Int(target.minX.rounded())
+                let wantedY = Int(target.minY.rounded())
+                Log.cascade.info(
+                    "Verify[\(i, privacy: .public)]: @(\(gotX, privacy: .public),\(gotY, privacy: .public)) \(gotW, privacy: .public)×\(gotH, privacy: .public) vs target @(\(wantedX, privacy: .public),\(wantedY, privacy: .public))  \(stuck ? "✓ stuck" : "✗ REVERTED", privacy: .public)"
+                )
+            }
             if !stuck { laggardIndices.append(i) }
         }
 
-        guard !laggardIndices.isEmpty else { return }
+        guard !laggardIndices.isEmpty else {
+            if rescueRound > 1 {
+                Log.cascade.info(
+                    "Rescue round \(rescueRound, privacy: .public): no laggards remain ✓"
+                )
+            }
+            return
+        }
 
         Log.cascade.notice(
-            "Rescue on '\(name, privacy: .public)': re-poking \(laggardIndices.count, privacy: .public) laggard window(s)"
+            "Rescue round \(rescueRound, privacy: .public) on '\(name, privacy: .public)': re-poking \(laggardIndices.count, privacy: .public) laggard window(s)"
         )
 
         let rescueMoves: [(axWindow: AXUIElement, target: CGRect)] = laggardIndices.map { i in
@@ -384,33 +447,78 @@ final class CascadeOrchestrator {
         }
         let count = WindowMutator.applyBatch(rescueMoves)
         Log.cascade.info(
-            "Rescue: \(count, privacy: .public)/\(rescueMoves.count, privacy: .public) laggards nudged"
+            "Rescue round \(rescueRound, privacy: .public): \(count, privacy: .public)/\(rescueMoves.count, privacy: .public) laggards nudged"
         )
 
+        // After this round's rescue: wait 0.4s, then either start
+        // another rescue round (if budget remains) or log the final
+        // diagnostic.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
             guard let self else { return }
             guard self.cascadeGeneration == generation else { return }
             guard self.isTrusted() else { return }
-            let post = AXWindowEnumerator.windows(of: app)
-            let postTargets = FanGeometry.computeCascade(
-                windows: post.map(\.frame),
-                screen: screen,
-                targetSize: targetSize,
-                direction: direction
-            )
-            var stillFailing = 0
-            for (i, w) in post.enumerated() where i < postTargets.count {
-                if !self.frameMatches(w.frame, target: postTargets[i]) {
-                    stillFailing += 1
-                }
-            }
-            if stillFailing > 0 {
-                Log.cascade.error(
-                    "Post-rescue: \(stillFailing, privacy: .public) window(s) STILL not at target on '\(name, privacy: .public)'"
+
+            if rescueRound < maxRescueRounds {
+                // Recurse for another rescue. The recursive call's
+                // verify step will both detect any remaining laggards
+                // AND act as the "post-rescue" check for this round.
+                self.verifyAndRescueIfNeeded(
+                    generation: generation,
+                    app: app,
+                    name: name,
+                    screen: screen,
+                    targetSize: targetSize,
+                    direction: direction,
+                    rescueRound: rescueRound + 1
                 )
             } else {
-                Log.cascade.info("Post-rescue: all windows at target ✓")
+                // Final round — log the surviving failures (or success).
+                self.logFinalRescueOutcome(
+                    app: app,
+                    name: name,
+                    screen: screen,
+                    targetSize: targetSize,
+                    direction: direction,
+                    totalRounds: rescueRound
+                )
             }
+        }
+    }
+
+    /// Read-only final diagnostic after the last rescue round. Logs
+    /// whether the cascade fully converged. If anything is still off
+    /// after all rescues, the user can re-cascade — we don't loop
+    /// indefinitely (could be a window with a hard minimum-size
+    /// constraint that genuinely can't shrink to the cascade target).
+    private func logFinalRescueOutcome(
+        app: NSRunningApplication,
+        name: String,
+        screen: CGRect,
+        targetSize: CGSize,
+        direction: CascadeDirection,
+        totalRounds: Int
+    ) {
+        let post = AXWindowEnumerator.windows(of: app)
+        let postTargets = FanGeometry.computeCascade(
+            windows: post.map(\.frame),
+            screen: screen,
+            targetSize: targetSize,
+            direction: direction
+        )
+        var stillFailing = 0
+        for (i, w) in post.enumerated() where i < postTargets.count {
+            if !self.frameMatches(w.frame, target: postTargets[i]) {
+                stillFailing += 1
+            }
+        }
+        if stillFailing > 0 {
+            Log.cascade.error(
+                "Post-all-rescues (\(totalRounds, privacy: .public) round(s)): \(stillFailing, privacy: .public) window(s) STILL not at target on '\(name, privacy: .public)'"
+            )
+        } else {
+            Log.cascade.info(
+                "Post-all-rescues (\(totalRounds, privacy: .public) round(s)): all windows at target ✓"
+            )
         }
     }
 

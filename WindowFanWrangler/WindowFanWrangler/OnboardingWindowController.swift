@@ -32,9 +32,15 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate {
         window.center()
         // Controller owns the window's lifetime; close just hides it.
         window.isReleasedWhenClosed = false
-        // Float above other windows so the user sees it as the foreground
-        // task even though the app is an .accessory (no Dock icon).
-        window.level = .floating
+        // Normal window level (not .floating) so System Settings — which
+        // the user has to interact with to grant permission — can come
+        // to the front when they switch to it. Earlier .floating level
+        // kept us above everything including System Settings, which made
+        // the Accessibility toggle unreachable. Onboarding is still
+        // brought to the front explicitly in `presentOnboarding()`, so
+        // the user sees it on launch; it just doesn't block other apps
+        // once they're activated.
+        window.level = .normal
 
         self.init(window: window)
         window.delegate = self

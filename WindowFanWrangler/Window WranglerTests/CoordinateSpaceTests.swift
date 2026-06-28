@@ -90,4 +90,42 @@ final class CoordinateSpaceTests: XCTestCase {
         let farAway = CGPoint(x: -1_000_000, y: -1_000_000)
         XCTAssertEqual(CoordinateSpace.screenFrame(containing: farAway), primary.frame)
     }
+
+    // MARK: - NSScreen lookups (new for per-display cascade)
+
+    func test_screenContaining_point_returnsContainingScreen() {
+        guard let primary = NSScreen.screens.first else {
+            XCTFail("test environment has no screens"); return
+        }
+        // Center of primary should resolve to primary.
+        let center = CGPoint(x: primary.frame.midX, y: primary.frame.midY)
+        let resolved = CoordinateSpace.screen(containing: center)
+        XCTAssertEqual(resolved?.frame, primary.frame)
+    }
+
+    func test_screenContaining_point_fallsBackToPrimary_whenPointOffAllDisplays() {
+        guard let primary = NSScreen.screens.first else {
+            XCTFail("test environment has no screens"); return
+        }
+        let farAway = CGPoint(x: -1_000_000, y: -1_000_000)
+        let resolved = CoordinateSpace.screen(containing: farAway)
+        // With no screens containing the point we get primary back.
+        XCTAssertEqual(resolved?.frame, primary.frame)
+    }
+
+    func test_screenContaining_rect_usesMidpoint() {
+        guard let primary = NSScreen.screens.first else {
+            XCTFail("test environment has no screens"); return
+        }
+        // A rect whose midpoint is on primary resolves to primary,
+        // regardless of where its edges extend.
+        let rect = CGRect(
+            x: primary.frame.midX - 100,
+            y: primary.frame.midY - 50,
+            width: 200,
+            height: 100
+        )
+        let resolved = CoordinateSpace.screen(containing: rect)
+        XCTAssertEqual(resolved?.frame, primary.frame)
+    }
 }
