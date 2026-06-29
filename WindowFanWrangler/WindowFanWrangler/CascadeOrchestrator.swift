@@ -178,14 +178,17 @@ final class CascadeOrchestrator {
 
         scheduleCascadePass(generation: myGen, after: 0.12, label: "pass 2",
                             app: targetApp, name: targetAppName,
+                            display: chosenScreen,
                             screen: screen, targetSize: targetSize,
                             direction: direction)
         scheduleCascadePass(generation: myGen, after: 0.50, label: "pass 3",
                             app: targetApp, name: targetAppName,
+                            display: chosenScreen,
                             screen: screen, targetSize: targetSize,
                             direction: direction)
         scheduleCascadePass(generation: myGen, after: 1.00, label: "pass 4",
                             app: targetApp, name: targetAppName,
+                            display: chosenScreen,
                             screen: screen, targetSize: targetSize,
                             direction: direction)
 
@@ -203,6 +206,7 @@ final class CascadeOrchestrator {
                 generation: myGen,
                 app: targetApp,
                 name: targetAppName,
+                display: chosenScreen,
                 screen: screen,
                 targetSize: targetSize,
                 direction: direction
@@ -304,9 +308,18 @@ final class CascadeOrchestrator {
     /// apps that need settling time between attempts (Chrome with
     /// DevTools, etc.).
     ///
-    /// Early-exits if all windows are already at the target frame —
-    /// most apps accept the cascade fully on pass 1, so re-poking them
-    /// is wasteful and produces visible jitter.
+    /// Critically, the re-enumeration is filtered to the SAME display
+    /// `performCascade` selected at cascade start. Without this, the
+    /// retry would pull in windows from other displays — the app's
+    /// full window set is enumerated each pass, so a cascade targeting
+    /// "extended display only" would still drag in windows from
+    /// the built-in display once the retry's recomputed targets
+    /// included them.
+    ///
+    /// Early-exits if all (display-filtered) windows are already at
+    /// their target frames — most apps accept the cascade fully on
+    /// pass 1, so re-poking them is wasteful and produces visible
+    /// jitter.
     ///
     /// Also bails if `cascadeGeneration` has advanced past `generation`
     /// — meaning a Restore or a follow-up Cascade has superseded the
@@ -317,6 +330,7 @@ final class CascadeOrchestrator {
         label: String,
         app: NSRunningApplication,
         name: String,
+        display: NSScreen,
         screen: CGRect,
         targetSize: CGSize,
         direction: CascadeDirection
@@ -335,7 +349,8 @@ final class CascadeOrchestrator {
                 )
                 return
             }
-            let refreshed = AXWindowEnumerator.windows(of: app)
+            let refreshedAll = AXWindowEnumerator.windows(of: app)
+            let refreshed = self.windowsOnDisplay(refreshedAll, display: display)
             guard refreshed.count > 1 else { return }
 
             if self.allWindowsAtExpectedFrames(
@@ -384,6 +399,7 @@ final class CascadeOrchestrator {
         generation: UInt64,
         app: NSRunningApplication,
         name: String,
+        display: NSScreen,
         screen: CGRect,
         targetSize: CGSize,
         direction: CascadeDirection,
@@ -391,7 +407,13 @@ final class CascadeOrchestrator {
     ) {
         let maxRescueRounds = 2
 
-        let verification = AXWindowEnumerator.windows(of: app)
+        // Re-enumerate AND filter to the cascade's target display, same
+        // contract as scheduleCascadePass. Without the display filter
+        // the verify step would consider all of the app's windows
+        // (including ones on other displays) as cascade laggards, and
+        // the rescue would drag them in to fill the recomputed targets.
+        let verificationAll = AXWindowEnumerator.windows(of: app)
+        let verification = windowsOnDisplay(verificationAll, display: display)
         // Compute the FULL expected target frame per window (position
         // + size), not just the size.
         let allFrames = verification.map(\.frame)
@@ -466,6 +488,7 @@ final class CascadeOrchestrator {
                     generation: generation,
                     app: app,
                     name: name,
+                    display: display,
                     screen: screen,
                     targetSize: targetSize,
                     direction: direction,
@@ -476,6 +499,7 @@ final class CascadeOrchestrator {
                 self.logFinalRescueOutcome(
                     app: app,
                     name: name,
+                    display: display,
                     screen: screen,
                     targetSize: targetSize,
                     direction: direction,
@@ -493,12 +517,14 @@ final class CascadeOrchestrator {
     private func logFinalRescueOutcome(
         app: NSRunningApplication,
         name: String,
+        display: NSScreen,
         screen: CGRect,
         targetSize: CGSize,
         direction: CascadeDirection,
         totalRounds: Int
     ) {
-        let post = AXWindowEnumerator.windows(of: app)
+        let postAll = AXWindowEnumerator.windows(of: app)
+        let post = windowsOnDisplay(postAll, display: display)
         let postTargets = FanGeometry.computeCascade(
             windows: post.map(\.frame),
             screen: screen,
@@ -547,6 +573,20 @@ final class CascadeOrchestrator {
         )
         return zip(windows, targetFrames).allSatisfy { w, target in
             frameMatches(w.frame, target: target)
+        }
+    }
+
+    /// Filters a list of enumerated windows down to just the ones whose
+    /// midpoint is on the given display. The same rule used at cascade
+    /// initiation in `performCascade` — applied here so retry passes
+    /// and the verify/rescue cycle keep the cascade scoped to the
+    /// chosen display for the full duration, not just on pass 1.
+    private func windowsOnDisplay(
+        _ windows: [EnumeratedWindow],
+        display: NSScreen
+    ) -> [EnumeratedWindow] {
+        windows.filter { window in
+            CoordinateSpace.screen(containing: window.frame)?.frame == display.frame
         }
     }
 
