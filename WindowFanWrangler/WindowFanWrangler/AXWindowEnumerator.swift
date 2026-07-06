@@ -55,12 +55,37 @@ enum AXWindowEnumerator {
             return []
         }
 
+        // Allowed subroles. We include the three subroles that macOS
+        // apps use for their main user-facing windows:
+        //
+        //   AXStandardWindow  — normal titled app windows (default)
+        //   AXDialog          — Zoom login, some music/podcast apps'
+        //                       main window, IDE splash screens, native
+        //                       "About This Mac"-style panels, etc.
+        //   AXFloatingWindow  — Zoom's floating meeting window, some
+        //                       music/media control windows, etc.
+        //
+        // We DELIBERATELY exclude AXSystemDialog and
+        // AXSystemFloatingWindow: those are system-owned overlays
+        // (permission prompts, spotlight-adjacent UI) not user windows.
+        //
+        // The size filter below (200×100 minimum) still rejects tiny
+        // alerts and popup dialogs, so allowing AXDialog/AXFloatingWindow
+        // here doesn't sweep in every "Are you sure?" prompt.
+        let allowedSubroles: Set<String> = [
+            kAXStandardWindowSubrole as String,
+            kAXDialogSubrole as String,
+            kAXFloatingWindowSubrole as String,
+        ]
+
         var filteredCount = 0
         let enumerated = windows.compactMap { element -> EnumeratedWindow? in
-            // Subrole filter: only standard windows (skip popovers, dialogs,
-            // system panels, floating windows, etc.).
+            // Subrole filter: allow standard/dialog/floating windows.
+            // If the element doesn't report a subrole, INCLUDE it —
+            // some apps' main windows return nil for AXSubrole, and
+            // filtering those out was excluding real windows.
             if let subrole = stringAttribute(kAXSubroleAttribute, of: element),
-               subrole != kAXStandardWindowSubrole as String {
+               !allowedSubroles.contains(subrole) {
                 filteredCount += 1
                 return nil
             }
@@ -74,8 +99,22 @@ enum AXWindowEnumerator {
                 return nil
             }
             // Size heuristic: anything smaller than 200×100 is almost
-            // certainly a system overlay, not a real window.
+            // certainly a system overlay or a small alert dialog, not
+            // a real user-facing window.
             if frameAX.width < 200 || frameAX.height < 100 {
+                filteredCount += 1
+                return nil
+            }
+            // Backdrop / pseudo-window filter. macOS's Finder Desktop
+            // is an invisible full-display-sized window that reports
+            // as a normal AXWindow but shouldn't participate in any
+            // cascade — if it did, the auto-anchor rule would promote
+            // Finder to the anchor slot and its 1728×1117 backdrop
+            // would hijack the layout. Same for fullscreen-mode
+            // windows (green-button fullscreen), which can't be moved
+            // or resized anyway. Signature: matches a display's full
+            // frame size AND reports non-resizable.
+            if isBackdropOrFullscreen(frameAX: frameAX, element: element) {
                 filteredCount += 1
                 return nil
             }
@@ -87,6 +126,31 @@ enum AXWindowEnumerator {
             "'\(appName, privacy: .public)' pid=\(app.processIdentifier, privacy: .public) → \(enumerated.count, privacy: .public) window(s) (\(filteredCount, privacy: .public) filtered, \(windows.count, privacy: .public) raw)"
         )
         return enumerated
+    }
+
+    /// True if this window is a display-spanning backdrop or fullscreen
+    /// mode window. Signature: size matches a connected display's full
+    /// frame within a 5pt tolerance AND `kAXSizeAttribute` is
+    /// non-settable. Both are needed because a user could legitimately
+    /// resize a normal window to exactly display size — but that
+    /// window would still report settable=true.
+    private static func isBackdropOrFullscreen(
+        frameAX: CGRect,
+        element: AXUIElement
+    ) -> Bool {
+        let matchesADisplay = NSScreen.screens.contains { screen in
+            let sf = screen.frame
+            return abs(frameAX.width - sf.width) < 5 &&
+                   abs(frameAX.height - sf.height) < 5
+        }
+        guard matchesADisplay else { return false }
+        // Only skip if it's also non-resizable — user-resized normal
+        // windows that happen to match display size stay in the cascade.
+        var settable: DarwinBoolean = false
+        let result = AXUIElementIsAttributeSettable(
+            element, kAXSizeAttribute as CFString, &settable
+        )
+        return result == .success && !settable.boolValue
     }
 
     // MARK: - AX attribute helpers
