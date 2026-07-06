@@ -165,6 +165,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
             action: { [weak self] in self?.toggleLassoFromMenu() },
             label: "Toggle Lasso Mode"
         ))
+
+        // All-apps cascade — uses `⌃⌥⌘[` / `⌃⌥⌘]` instead of the
+        // single-app `⌃⌥⌘,` / `⌃⌥⌘.`. The bracket characters are a
+        // natural mnemonic for direction ([ → left, ] → right) and
+        // the three-modifier chord on brackets is unclaimed by macOS
+        // (Tahoe window-tiling only takes the arrow-key variants).
+        shortcuts.register(.init(
+            modifiers: modifiers,
+            keyCode: KeyCode.rightBracket,
+            action: { [weak self] in self?.shortcutCascadeAllApps(direction: .downRight) },
+            label: "Cascade All Apps Down-Right"
+        ))
+        shortcuts.register(.init(
+            modifiers: modifiers,
+            keyCode: KeyCode.leftBracket,
+            action: { [weak self] in self?.shortcutCascadeAllApps(direction: .downLeft) },
+            label: "Cascade All Apps Down-Left"
+        ))
     }
 
     /// Shortcut-triggered cascade. Captures the mouse cursor's location
@@ -183,6 +201,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
         let mouseDisplay = CoordinateSpace.screen(containing: NSEvent.mouseLocation)
         runAfterMenuDismiss { [weak self] in
             self?.cascadeOrchestrator.performCascade(
+                direction: direction,
+                targetScreen: mouseDisplay
+            )
+        }
+    }
+
+    /// Shortcut-triggered all-apps cascade. Same mouse-display capture
+    /// + defer pattern as `shortcutCascade`. Routes to the orchestrator's
+    /// all-apps method, which cascades every visible app's windows on
+    /// the mouse-cursor's display.
+    private func shortcutCascadeAllApps(direction: CascadeDirection) {
+        let mouseDisplay = CoordinateSpace.screen(containing: NSEvent.mouseLocation)
+        runAfterMenuDismiss { [weak self] in
+            self?.cascadeOrchestrator.performCascadeAllApps(
                 direction: direction,
                 targetScreen: mouseDisplay
             )
@@ -356,6 +388,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
     @objc func cascadeDownLeft() {
         runAfterMenuDismiss { [weak self] in
             self?.cascadeOrchestrator.performCascade(direction: .downLeft)
+        }
+    }
+
+    @objc func cascadeAllAppsDownRight() {
+        runAfterMenuDismiss { [weak self] in
+            self?.cascadeOrchestrator.performCascadeAllApps(direction: .downRight)
+        }
+    }
+
+    @objc func cascadeAllAppsDownLeft() {
+        runAfterMenuDismiss { [weak self] in
+            self?.cascadeOrchestrator.performCascadeAllApps(direction: .downLeft)
         }
     }
 

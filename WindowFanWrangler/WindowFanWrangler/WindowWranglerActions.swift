@@ -19,6 +19,8 @@ import AppKit
 @objc protocol WindowWranglerActions: AnyObject {
     @objc func cascadeDownRight()
     @objc func cascadeDownLeft()
+    @objc func cascadeAllAppsDownRight()
+    @objc func cascadeAllAppsDownLeft()
     @objc func restoreLayout()
     @objc func toggleLassoFromMenu()
     @objc func clearSelection()

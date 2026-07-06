@@ -16,15 +16,35 @@ import os
 
 enum WindowMutator {
 
+    /// True if AX reports the window's size attribute as writable.
+    /// Some windows are non-resizable (Zoom pre-login, fullscreen,
+    /// small fixed-size dialogs) and vend `kAXSizeAttribute` as
+    /// non-settable. Callers use this to keep those windows at their
+    /// natural size instead of trying to force them to the cascade's
+    /// target size.
+    static func isSizeSettable(_ axWindow: AXUIElement) -> Bool {
+        var settable: DarwinBoolean = false
+        let result = AXUIElementIsAttributeSettable(
+            axWindow, kAXSizeAttribute as CFString, &settable
+        )
+        return result == .success && settable.boolValue
+    }
+
     /// Moves the given window to the given Cocoa-coordinate frame.
-    /// Both position and size are set. Returns true on full success.
+    /// Both position and size are set when possible. Returns true on
+    /// full success.
     ///
-    /// Some apps (Chrome notably) clamp or partially refuse AX size
-    /// changes. The fix used by Rectangle/Magnet/yabai is: set size,
-    /// set position, set size again. The second size call overrides
-    /// any clamping the app applied during the position update. We
-    /// follow that pattern and log a warning if the final readback
-    /// doesn't match the requested size.
+    /// Resizable windows: some apps (Chrome notably) clamp or partially
+    /// refuse AX size changes. The fix used by Rectangle/Magnet/yabai
+    /// is: set size, set position, set size again. The second size
+    /// call overrides any clamping the app applied during the position
+    /// update. We follow that pattern and log a warning if the final
+    /// readback doesn't match the requested size.
+    ///
+    /// Non-resizable windows (Zoom pre-login etc.): the size dance is
+    /// skipped — the app would refuse it. Only position is written.
+    /// The caller (cascade orchestrator) is responsible for choosing a
+    /// position that keeps the window on screen at its natural size.
     @discardableResult
     static func setFrame(_ frame: CGRect, of axWindow: AXUIElement) -> Bool {
         let axFrame = CoordinateSpace.axRect(fromCocoa: frame)
@@ -35,6 +55,14 @@ enum WindowMutator {
         guard let posValue = AXValueCreate(.cgPoint, &position),
               let sizeValue = AXValueCreate(.cgSize, &size) else {
             return false
+        }
+
+        // Non-resizable window: skip the size dance entirely.
+        guard isSizeSettable(axWindow) else {
+            let p = AXUIElementSetAttributeValue(
+                axWindow, kAXPositionAttribute as CFString, posValue
+            )
+            return p == .success
         }
 
         // Size → Position → Size again. The double-size dance defeats

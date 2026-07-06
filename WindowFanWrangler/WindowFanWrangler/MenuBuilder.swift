@@ -178,6 +178,30 @@ enum MenuBuilder {
         cascadeLeft.isEnabled = isTrusted
         menu.addItem(cascadeLeft)
 
+        // All-apps cascade — uses the same modifier chord as single-app
+        // (⌃⌥⌘) but with bracket keys. Bracket direction matches the
+        // cascade direction visually: `[` → Down-Left, `]` → Down-Right.
+        // Three-modifier brackets is unclaimed by macOS Tahoe.
+        let cascadeAllAppsRight = NSMenuItem(
+            title: "Cascade All Apps Down-Right",
+            action: #selector(WindowWranglerActions.cascadeAllAppsDownRight),
+            keyEquivalent: "]"  // ⌃⌥⌘]
+        )
+        cascadeAllAppsRight.keyEquivalentModifierMask = modifiers
+        cascadeAllAppsRight.target = target
+        cascadeAllAppsRight.isEnabled = isTrusted
+        menu.addItem(cascadeAllAppsRight)
+
+        let cascadeAllAppsLeft = NSMenuItem(
+            title: "Cascade All Apps Down-Left",
+            action: #selector(WindowWranglerActions.cascadeAllAppsDownLeft),
+            keyEquivalent: "["  // ⌃⌥⌘[
+        )
+        cascadeAllAppsLeft.keyEquivalentModifierMask = modifiers
+        cascadeAllAppsLeft.target = target
+        cascadeAllAppsLeft.isEnabled = isTrusted
+        menu.addItem(cascadeAllAppsLeft)
+
         let restore = NSMenuItem(
             title: "Restore Previous Layout",
             action: #selector(WindowWranglerActions.restoreLayout),

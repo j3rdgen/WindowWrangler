@@ -177,6 +177,41 @@ final class FanGeometryTests: XCTestCase {
 
     // MARK: - Anchor position preservation
 
+    // MARK: - anchorOrigin override (multi-app cascade)
+
+    func test_anchorOriginOverride_replacesWindowZeroOrigin() {
+        // With an explicit anchor, the front window lands at that anchor
+        // (no shift needed because the bounding box still fits in screen).
+        let windows = [
+            CGRect(x: 0, y: 0, width: 100, height: 100),
+            CGRect(x: 0, y: 0, width: 100, height: 100),
+            CGRect(x: 0, y: 0, width: 100, height: 100),
+        ]
+        let anchor = CGPoint(x: 500, y: 500)
+        let result = FanGeometry.computeCascade(
+            windows: windows,
+            screen: CGRect(x: 0, y: 0, width: 3000, height: 2000),
+            targetSize: CGSize(width: 400, height: 300),
+            direction: .downLeft,
+            anchorOrigin: anchor
+        )
+        XCTAssertEqual(result[0].origin, anchor, "front window should land at explicit anchor")
+    }
+
+    func test_anchorOriginOverride_singleWindowAlsoRespectsAnchor() {
+        let win = CGRect(x: 100, y: 100, width: 300, height: 300)
+        let anchor = CGPoint(x: 800, y: 200)
+        let result = FanGeometry.computeCascade(
+            windows: [win],
+            screen: CGRect(x: 0, y: 0, width: 2000, height: 1500),
+            targetSize: CGSize(width: 500, height: 400),
+            direction: .downRight,
+            anchorOrigin: anchor
+        )
+        XCTAssertEqual(result.count, 1)
+        XCTAssertEqual(result[0].origin, anchor)
+    }
+
     func test_anchorIndexZero_seedsCascadeOrigin_whenFits() {
         // When natural cascade fits, windows[0]'s origin should remain
         // unchanged after shiftToFit (since shift is zero).

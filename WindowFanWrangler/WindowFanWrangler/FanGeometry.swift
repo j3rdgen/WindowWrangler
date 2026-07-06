@@ -64,19 +64,28 @@ enum FanGeometry {
         targetSize: CGSize,
         headerReveal: CGFloat = 28,
         lateralReveal: CGFloat = 60,
-        direction: CascadeDirection
+        direction: CascadeDirection,
+        anchorOrigin: CGPoint? = nil
     ) -> [CGRect] {
         guard !windows.isEmpty else { return [] }
         guard windows.count > 1 else {
-            // Single window: just resize at current position.
-            return [CGRect(origin: windows[0].origin, size: targetSize)]
+            // Single window: just resize at current position (or at the
+            // explicit anchor when provided).
+            return [CGRect(origin: anchorOrigin ?? windows[0].origin, size: targetSize)]
         }
 
+        // The cascade anchor is normally the front window's current
+        // origin (single-app cascade behavior). A caller can override
+        // it via `anchorOrigin` — this is how the multi-app "cascade all
+        // apps" mode positions each app's pile relative to a shared
+        // origin instead of each app's own front window.
+        let anchor = anchorOrigin ?? windows[0].origin
+
         // Step 1: compute targets with natural offsets, all at targetSize,
-        // anchored on the front window's original position.
+        // anchored on `anchor`.
         let initialTargets = naturalCascade(
             windows: windows,
-            anchorOrigin: windows[0].origin,
+            anchorOrigin: anchor,
             targetSize: targetSize,
             headerReveal: headerReveal,
             lateralReveal: lateralReveal,
@@ -106,7 +115,7 @@ enum FanGeometry {
 
         let reducedTargets = naturalCascade(
             windows: windows,
-            anchorOrigin: windows[0].origin,
+            anchorOrigin: anchor,
             targetSize: targetSize,
             headerReveal: clampedHeader,
             lateralReveal: clampedLateral,
