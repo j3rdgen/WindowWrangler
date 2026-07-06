@@ -34,9 +34,21 @@ final class LassoCoordinator {
     /// this to refresh the menu's "Lasso mode: ON/OFF" indicator.
     var onLassoModeChanged: ((Bool) -> Void)?
 
+    /// Retained observer token for the Space-change notification, so
+    /// `deinit` can remove it. Selection highlights are Space-scoped —
+    /// we redraw whenever the active Space changes so stale outlines
+    /// don't linger on a Space where the underlying windows don't live.
+    private var activeSpaceObserver: NSObjectProtocol?
+
     init(selection: WindowSelection) {
         self.selection = selection
         wireEvents()
+    }
+
+    deinit {
+        if let token = activeSpaceObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(token)
+        }
     }
 
     /// Toggles lasso mode on/off — bound to the ⌃⌥⌘C global shortcut.
@@ -58,7 +70,7 @@ final class LassoCoordinator {
     func start() {
         eventMonitor.start()
         // Render any pre-existing selection (e.g., on permission re-grant).
-        overlay.setSelectionFrames(selection.frames)
+        overlay.setSelectionFrames(visibleSelectionFrames())
     }
 
     /// Stops the global monitors. Call when permission is revoked.
@@ -136,12 +148,51 @@ final class LassoCoordinator {
         }
 
         // Whenever the selection changes (lasso updates it, or other
-        // future paths add to/remove from it), redraw the overlay.
+        // future paths add to/remove from it), redraw the overlay
+        // filtered to windows currently visible on the active Space.
         selection.onChange = { [weak self] in
             guard let self else { return }
-            self.overlay.setSelectionFrames(self.selection.frames)
+            self.overlay.setSelectionFrames(self.visibleSelectionFrames())
             self.overlay.hideIfEmpty()
         }
+
+        // Redraw when the active Space changes. Selection state is
+        // preserved; we just re-filter what the overlay draws. When
+        // the user swipes to a Space that contains none of the
+        // selected windows, the overlay hides itself (empty frames);
+        // when they swipe back, it reappears.
+        activeSpaceObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.activeSpaceDidChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                // Destroy the old overlay panel (it's pinned to the
+                // previous Space and already animated off). The next
+                // frame-setting call recreates a fresh panel on the
+                // now-active Space.
+                self.overlay.spaceDidChange()
+                self.overlay.setSelectionFrames(self.visibleSelectionFrames())
+                self.overlay.hideIfEmpty()
+            }
+        }
+    }
+
+    /// Frames of the currently-selected windows that are actually
+    /// visible on the active Space (per each display, when displays
+    /// have separate Spaces). Filters by `windowID` against the
+    /// system's `optionOnScreenOnly` window list — this is what keeps
+    /// stale selection outlines from lingering on Spaces where the
+    /// underlying windows don't exist. Selection state itself is
+    /// unchanged; when the user swipes back to a Space that contains
+    /// the selected windows, this returns their frames again and the
+    /// overlay reappears.
+    private func visibleSelectionFrames() -> [CGRect] {
+        let visibleIDs = Set(CrossAppWindowEnumerator.allVisibleWindows().map(\.windowID))
+        return selection.ordered
+            .filter { visibleIDs.contains($0.windowID) }
+            .map(\.frame)
     }
 
     // MARK: - Hit-testing

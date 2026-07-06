@@ -65,6 +65,20 @@ final class SelectionOverlay {
     /// hiding internally when content is empty.
     func hideIfEmpty() { }
 
+    /// Tear down the underlying `NSPanel` so the next `updateWindow()`
+    /// creates a fresh one on whatever Space is currently active.
+    /// Called by the coordinator whenever the active Space changes —
+    /// the panel is intentionally NOT flagged `canJoinAllSpaces`, so
+    /// it lives on the Space it was created on and animates off with
+    /// that Space during a swipe. Once the swipe completes on a new
+    /// Space, we destroy the old panel and let the next action
+    /// recreate a fresh one there.
+    func spaceDidChange() {
+        panel?.orderOut(nil)
+        panel = nil
+        view = nil
+    }
+
     // MARK: - Window lifecycle
 
     /// Recomputes the bounding box of all visible content, resizes the
@@ -115,19 +129,19 @@ final class SelectionOverlay {
         newPanel.ignoresMouseEvents = true
         newPanel.level = .floating
         newPanel.hidesOnDeactivate = false
-        // canJoinAllSpaces: the overlay must appear on whichever Space the
-        // user is currently viewing — without this the panel stays pinned
-        // to the Space it was first created on, so any lasso drag on a
-        // different Space produces no visible rubber-band / selection
-        // borders (the LassoModeHint already had this; SelectionOverlay
-        // was missing it, which is why lasso "didn't work" anywhere
-        // except Desktop where the panel was first instantiated).
+        // Deliberately NOT `canJoinAllSpaces`: the panel is pinned to
+        // the Space it's created on. That's what we want — when the
+        // user swipes to a different Space, the overlay animates off
+        // with the Space (no lingering outlines on the new Space, no
+        // catch-up delay from waiting for a Space-change notification).
+        // The coordinator calls `spaceDidChange()` on Space change to
+        // destroy this panel; the next lasso or selection action
+        // creates a fresh panel on the now-active Space.
         // stationary: don't slide during Mission Control transitions.
         // ignoresCycle: don't show up in Cmd-Tab.
         // fullScreenAuxiliary: coexist with full-screen apps without
         // forcing a Space change.
         newPanel.collectionBehavior = [
-            .canJoinAllSpaces,
             .stationary,
             .ignoresCycle,
             .fullScreenAuxiliary,
