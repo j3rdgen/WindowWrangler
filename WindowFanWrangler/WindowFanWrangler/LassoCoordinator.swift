@@ -115,7 +115,6 @@ final class LassoCoordinator {
         overlay.hideLassoRect()
         overlay.setSelectionFrames([])
         overlay.endGroupDrag()
-        overlay.hideIfEmpty()
         modeHint.hide()
         currentDrag = nil
         if isLassoModeActive {
@@ -297,7 +296,6 @@ final class LassoCoordinator {
         selection.onChange = { [weak self] in
             guard let self else { return }
             self.overlay.setSelectionFrames(self.visibleSelectionFrames())
-            self.overlay.hideIfEmpty()
         }
 
         // Redraw when the active Space changes. Selection state is
@@ -318,7 +316,6 @@ final class LassoCoordinator {
                 // now-active Space.
                 self.overlay.spaceDidChange()
                 self.overlay.setSelectionFrames(self.visibleSelectionFrames())
-                self.overlay.hideIfEmpty()
             }
         }
     }

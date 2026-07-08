@@ -54,11 +54,6 @@ final class SelectionOverlay {
 
     // MARK: - Public API
 
-    /// No-op (kept for source compatibility with LassoCoordinator).
-    /// The panel is created lazily by `updateWindow()` when there is
-    /// actual content to show.
-    func ensureWindow() { }
-
     func showLassoRect(_ rect: CGRect) {
         currentLassoRect = rect
         updateWindow()
@@ -141,10 +136,6 @@ final class SelectionOverlay {
     func endGroupDrag() {
         groupDragBase = nil
     }
-
-    /// No-op (kept for source compatibility). `updateWindow()` handles
-    /// hiding internally when content is empty.
-    func hideIfEmpty() { }
 
     /// Tear down the underlying `NSPanel` so the next `updateWindow()`
     /// creates a fresh one on whatever Space is currently active.
