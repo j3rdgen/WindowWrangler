@@ -39,6 +39,19 @@ final class SelectionOverlay {
     /// Frames of currently-selected windows in Cocoa global coordinates.
     private var selectionFrames: [CGRect] = []
 
+    /// Cached state at the start of an M6 group drag. While non-nil,
+    /// `updateGroupDrag(offset:)` moves the panel via `setFrameOrigin`
+    /// instead of going through `updateWindow()` — no redraw, just a
+    /// compositor pan. This is what keeps outlines locked to the moving
+    /// windows during a fast drag (see `updateGroupDrag` for the
+    /// rationale in detail).
+    private struct GroupDragBase {
+        let panelOrigin: CGPoint
+        let windowOriginInScreenCoords: CGPoint
+        let selectionFrames: [CGRect]
+    }
+    private var groupDragBase: GroupDragBase?
+
     // MARK: - Public API
 
     /// No-op (kept for source compatibility with LassoCoordinator).
@@ -59,6 +72,74 @@ final class SelectionOverlay {
     func setSelectionFrames(_ frames: [CGRect]) {
         selectionFrames = frames
         updateWindow()
+    }
+
+    /// Snapshots the panel + view state so subsequent `updateGroupDrag`
+    /// calls can shift the panel via `setFrameOrigin` relative to a
+    /// stable base. Call once at the start of an M6 group drag; pair
+    /// with `endGroupDrag()` at drag end / cancel.
+    ///
+    /// If the panel doesn't exist yet (no selection was drawn before
+    /// the drag started — shouldn't happen in the current flow, but
+    /// belt-and-suspenders), this is a no-op and updateGroupDrag falls
+    /// back to the normal `updateWindow` path.
+    func beginGroupDrag() {
+        guard let panel = panel, let view = view else { return }
+        groupDragBase = GroupDragBase(
+            panelOrigin: panel.frame.origin,
+            windowOriginInScreenCoords: view.windowOriginInScreenCoords,
+            selectionFrames: selectionFrames
+        )
+    }
+
+    /// Pans the overlay panel by `offset` from the group-drag base
+    /// captured in `beginGroupDrag`. No view redraw is performed — the
+    /// panel's cached backing store is blitted at the new origin by
+    /// the compositor, which is a single VSync operation vs. the full
+    /// AppKit redraw path (`needsDisplay = true` + next-runloop draw +
+    /// orderFrontRegardless composite).
+    ///
+    /// The draw path CAN'T keep up with a fast drag: mouse events
+    /// arrive at 100–240Hz and each one only marks the view dirty; the
+    /// actual draw runs once per runloop cycle. When the event tap
+    /// callback saturates the main runloop, draws get starved and the
+    /// outlines visibly lag behind the moving windows.
+    ///
+    /// This fast path avoids the problem entirely: the view is never
+    /// re-drawn during the drag, its previously-rendered surface just
+    /// gets translated. Because every selected window moves by the
+    /// same delta (whole selection is dragged as one) and the panel
+    /// also moves by that delta, each rectangle's screen position
+    /// matches its owning window with zero drawing work.
+    ///
+    /// We keep `windowOriginInScreenCoords` and the stored
+    /// `selectionFrames` in sync with the pan so any future redraw
+    /// (post-drag) produces correct output.
+    func updateGroupDrag(offset: CGPoint) {
+        guard let base = groupDragBase,
+              let panel = panel,
+              let view = view else { return }
+        let newPanelOrigin = CGPoint(
+            x: base.panelOrigin.x + offset.x,
+            y: base.panelOrigin.y + offset.y
+        )
+        panel.setFrameOrigin(newPanelOrigin)
+        view.windowOriginInScreenCoords = CGPoint(
+            x: base.windowOriginInScreenCoords.x + offset.x,
+            y: base.windowOriginInScreenCoords.y + offset.y
+        )
+        selectionFrames = base.selectionFrames.map {
+            $0.offsetBy(dx: offset.x, dy: offset.y)
+        }
+        // Deliberately NO needsDisplay, NO orderFrontRegardless — the
+        // whole point is to skip redraw during the drag.
+    }
+
+    /// Exits group-drag fast-path mode. The next `setSelectionFrames`
+    /// call will go through the normal `updateWindow` flow and redraw
+    /// the panel at fresh, accurate frames.
+    func endGroupDrag() {
+        groupDragBase = nil
     }
 
     /// No-op (kept for source compatibility). `updateWindow()` handles

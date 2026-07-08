@@ -106,4 +106,21 @@ enum WindowMutator {
         }
         return successes
     }
+
+    /// Writes ONLY the window's position — no size dance. Faster than
+    /// `setFrame` (single AX write vs. three) so it's suitable for
+    /// per-frame calls during an interactive drag. `cocoaFrame` is the
+    /// full target frame in Cocoa coordinates; only the origin is
+    /// written, but the size is needed to perform the Y-axis flip
+    /// correctly (AX uses top-left origin, Cocoa uses bottom-left).
+    @discardableResult
+    static func setPosition(of axWindow: AXUIElement, cocoaFrame: CGRect) -> Bool {
+        let axFrame = CoordinateSpace.axRect(fromCocoa: cocoaFrame)
+        var position = axFrame.origin
+        guard let posValue = AXValueCreate(.cgPoint, &position) else { return false }
+        let result = AXUIElementSetAttributeValue(
+            axWindow, kAXPositionAttribute as CFString, posValue
+        )
+        return result == .success
+    }
 }

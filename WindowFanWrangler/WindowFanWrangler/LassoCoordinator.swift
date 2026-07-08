@@ -22,8 +22,39 @@ final class LassoCoordinator {
     private let modeHint = LassoModeHint()
     let selection: WindowSelection
 
-    /// Origin point of the current drag, set on mouseDown.
-    private var dragAnchor: CGPoint?
+    /// State of the current mouse drag while lasso mode is on.
+    /// Populated on mouseDown, mutated on mouseDragged, cleared on
+    /// mouseUp / Escape / stop.
+    private var currentDrag: DragState?
+
+    /// Kind of drag currently in progress and its bookkeeping.
+    private enum DragState {
+        /// Existing rubber-band lasso — creates/replaces the selection
+        /// as the mouse moves.
+        case rubberBand(anchor: CGPoint)
+        /// M6 group drag — the mouse-down hit a currently-selected
+        /// window. `primaryWindowID` is the window the user actually
+        /// grabbed; its read-back position paces the overlay so the
+        /// outlines track the ACTUAL windows (which may lag the cursor
+        /// due to target-app AX latency) instead of racing ahead to the
+        /// target position.
+        case groupDrag(
+            anchor: CGPoint,
+            primaryWindowID: CGWindowID,
+            snapshots: [GroupDragSnapshot]
+        )
+    }
+
+    /// Per-window state captured at group-drag start. AX element is
+    /// resolved eagerly here so the per-frame drag update can call
+    /// `WindowMutator.setPosition` directly without re-enumerating
+    /// each app's window list every mouse move.
+    private struct GroupDragSnapshot {
+        let windowID: CGWindowID
+        let ownerPID: pid_t
+        let originalFrame: CGRect
+        let axElement: AXUIElement
+    }
 
     /// True when the user has toggled lasso mode on via the global
     /// shortcut. Plain click-and-drag now produces a lasso; otherwise
@@ -83,9 +114,10 @@ final class LassoCoordinator {
         eventMonitor.stop()
         overlay.hideLassoRect()
         overlay.setSelectionFrames([])
+        overlay.endGroupDrag()
         overlay.hideIfEmpty()
         modeHint.hide()
-        dragAnchor = nil
+        currentDrag = nil
         if isLassoModeActive {
             isLassoModeActive = false
             onLassoModeChanged?(false)
@@ -97,44 +129,156 @@ final class LassoCoordinator {
     private func wireEvents() {
         eventMonitor.onLassoDragBegan = { [weak self] point in
             guard let self else { return }
-            self.dragAnchor = point
-            let rect = CGRect(origin: point, size: .zero)
-            self.overlay.showLassoRect(rect)
-            self.updateSelection(forLassoRect: rect)
-            Log.lasso.info("Drag began at \(Int(point.x), privacy: .public),\(Int(point.y), privacy: .public)")
+            // Hit-test: is the mouse-down over a currently-selected
+            // window? If yes → M6 group drag; if no → existing
+            // rubber-band lasso.
+            let vis = self.visibleSelectionWindows()
+            if let hit = vis.reversed().first(where: { $0.frame.contains(point) }) {
+                let snapshots = self.resolveSnapshots(from: vis)
+                self.currentDrag = .groupDrag(
+                    anchor: point,
+                    primaryWindowID: hit.windowID,
+                    snapshots: snapshots
+                )
+                // Snapshot the panel + view state now so `updateGroupDrag`
+                // can pan the panel via `setFrameOrigin` on every mouse
+                // event instead of going through the full redraw path.
+                // The panel already exists because a selection was drawn
+                // before the drag started.
+                self.overlay.beginGroupDrag()
+                Log.lasso.info(
+                    "Group drag began on window \(hit.windowID, privacy: .public) ('\(hit.ownerName, privacy: .public)') — \(snapshots.count, privacy: .public) window(s) will move"
+                )
+            } else {
+                self.currentDrag = .rubberBand(anchor: point)
+                let rect = CGRect(origin: point, size: .zero)
+                self.overlay.showLassoRect(rect)
+                self.updateSelection(forLassoRect: rect)
+                Log.lasso.info(
+                    "Rubber-band began at \(Int(point.x), privacy: .public),\(Int(point.y), privacy: .public)"
+                )
+            }
         }
 
         eventMonitor.onLassoDragUpdated = { [weak self] point in
-            guard let self, let anchor = self.dragAnchor else { return }
-            let rect = Self.rectBetween(anchor, point)
-            self.overlay.showLassoRect(rect)
-            self.updateSelection(forLassoRect: rect)
+            guard let self, let drag = self.currentDrag else { return }
+            switch drag {
+            case .rubberBand(let anchor):
+                let rect = Self.rectBetween(anchor, point)
+                self.overlay.showLassoRect(rect)
+                self.updateSelection(forLassoRect: rect)
+            case .groupDrag(let anchor, let primaryID, let snapshots):
+                // Read the primary window's actual position BEFORE
+                // issuing this event's write. The read reflects the
+                // effect of the PREVIOUS event's write, which had a
+                // full inter-event interval to propagate through the
+                // target app's runloop and reach WindowServer. That's
+                // as close to "where the pixels actually are right
+                // now" as we can get without a display link.
+                //
+                // Pacing the overlay by this read keeps the outlines
+                // pinned to the real windows even when target apps
+                // (Chrome, Zoom) are slow to process AX writes. The
+                // outlines and windows may both trail the cursor
+                // slightly on a fast drag — that's inherent to AX —
+                // but they trail together, so the outlines stay
+                // attached.
+                let paceOffset: CGPoint
+                if let primary = snapshots.first(where: { $0.windowID == primaryID }),
+                   let actualAX = AXWindowEnumerator.currentFrame(of: primary.axElement) {
+                    let actual = CoordinateSpace.cocoaRect(fromAX: actualAX)
+                    paceOffset = CGPoint(
+                        x: actual.origin.x - primary.originalFrame.origin.x,
+                        y: actual.origin.y - primary.originalFrame.origin.y
+                    )
+                } else {
+                    paceOffset = CGPoint(x: point.x - anchor.x, y: point.y - anchor.y)
+                }
+                self.overlay.updateGroupDrag(offset: paceOffset)
+
+                // Now issue this event's write — LIVE movement of the
+                // real windows to the cursor's current target. Next
+                // event's read will reflect where these writes land.
+                let targetDelta = CGPoint(x: point.x - anchor.x, y: point.y - anchor.y)
+                for snap in snapshots {
+                    let newFrame = snap.originalFrame.offsetBy(
+                        dx: targetDelta.x, dy: targetDelta.y
+                    )
+                    WindowMutator.setPosition(of: snap.axElement, cocoaFrame: newFrame)
+                }
+            }
         }
 
         eventMonitor.onLassoDragEnded = { [weak self] point in
-            guard let self, let anchor = self.dragAnchor else { return }
-            let rect = Self.rectBetween(anchor, point)
-            self.updateSelection(forLassoRect: rect)
-            self.overlay.hideLassoRect()
-            self.dragAnchor = nil
-            Log.lasso.info("Drag ended; selection has \(self.selection.count, privacy: .public) window(s)")
+            guard let self, let drag = self.currentDrag else { return }
+            switch drag {
+            case .rubberBand(let anchor):
+                let rect = Self.rectBetween(anchor, point)
+                if rect.isEmpty {
+                    // Click without any drag — treat as a single click.
+                    // On a window: replace selection with just that
+                    // window. On empty space: clear selection.
+                    self.applyClick(at: anchor)
+                } else {
+                    self.updateSelection(forLassoRect: rect)
+                }
+                self.overlay.hideLassoRect()
+                Log.lasso.info(
+                    "Rubber-band ended; selection has \(self.selection.count, privacy: .public) window(s)"
+                )
+            case .groupDrag(let anchor, _, let snapshots):
+                let delta = CGPoint(x: point.x - anchor.x, y: point.y - anchor.y)
+                // Exit the fast-path pan mode before refreshing frames —
+                // the next `setSelectionFrames` call needs to go through
+                // the normal redraw path so the panel resizes to the
+                // (possibly new) union bounds.
+                self.overlay.endGroupDrag()
+                if delta == .zero {
+                    // Click without any drag on a selected window —
+                    // per the same rule, replace selection with just
+                    // that window. Real windows never moved.
+                    self.applyClick(at: anchor)
+                    self.overlay.setSelectionFrames(self.visibleSelectionFrames())
+                } else {
+                    // Windows already moved live during onDragUpdated
+                    // via setPosition. Nothing further to write here;
+                    // just refresh the overlay from the system's fresh
+                    // frames so a subsequent redraw (e.g. Space change)
+                    // finds the up-to-date positions.
+                    self.overlay.setSelectionFrames(self.visibleSelectionFrames())
+                }
+                Log.lasso.info(
+                    "Group drag ended; moved \(snapshots.count, privacy: .public) window(s) by (\(Int(delta.x), privacy: .public),\(Int(delta.y), privacy: .public))"
+                )
+            }
+            self.currentDrag = nil
         }
 
         eventMonitor.onEscapePressed = { [weak self] in
             guard let self else { return }
             let wasActive = self.isLassoModeActive
-            let wasDragging = self.dragAnchor != nil
+            let wasDragging = self.currentDrag != nil
             if !self.selection.isEmpty || wasDragging || wasActive {
                 Log.lasso.notice("Escape pressed — exiting lasso, clearing selection")
                 self.selection.clear()
-                self.dragAnchor = nil
+                self.currentDrag = nil
                 self.overlay.hideLassoRect()
+                // If we were in a group-drag fast path, exit it so the
+                // overlay hides via the normal `updateWindow` flow (a
+                // stale groupDragBase would prevent the empty-frames
+                // teardown from taking effect).
+                self.overlay.endGroupDrag()
+                // Group drag is now LIVE: real windows have already been
+                // moved to their current position via each setPosition
+                // call, so canceling just stops the drag where it is —
+                // matches the user's "stops where the cancellation
+                // initiated" spec. No positions to restore.
+                //
                 // Cancel the eventMonitor's in-flight drag so the next
                 // mouseUp doesn't get silently consumed (it would fire
-                // onLassoDragEnded with a nil anchor and the event
-                // would still be eaten by the tap, swallowing the
-                // user's mouse release with nothing visible to show
-                // for it).
+                // onLassoDragEnded with nil state and the event would
+                // still be eaten by the tap, swallowing the user's
+                // mouse release with nothing visible to show for it).
                 if wasDragging {
                     self.eventMonitor.cancelDrag()
                 }
@@ -179,20 +323,22 @@ final class LassoCoordinator {
         }
     }
 
-    /// Frames of the currently-selected windows that are actually
-    /// visible on the active Space (per each display, when displays
-    /// have separate Spaces). Filters by `windowID` against the
-    /// system's `optionOnScreenOnly` window list — this is what keeps
-    /// stale selection outlines from lingering on Spaces where the
-    /// underlying windows don't exist. Selection state itself is
-    /// unchanged; when the user swipes back to a Space that contains
-    /// the selected windows, this returns their frames again and the
-    /// overlay reappears.
+    /// The currently-selected windows that are visible on the active
+    /// Space, with FRESH frames from the system's on-screen window
+    /// list. Filters by `windowID` against `optionOnScreenOnly` — this
+    /// is what keeps stale selection outlines from lingering on Spaces
+    /// where the underlying windows don't exist. Also refreshes frames
+    /// so hit-testing on mouse-down uses each window's actual current
+    /// position, not the (possibly stale) frame stored at selection
+    /// time. Selection state itself is unchanged.
+    private func visibleSelectionWindows() -> [VisibleWindow] {
+        let visible = CrossAppWindowEnumerator.allVisibleWindows()
+        let selectedIDs = Set(selection.ordered.map(\.windowID))
+        return visible.filter { selectedIDs.contains($0.windowID) }
+    }
+
     private func visibleSelectionFrames() -> [CGRect] {
-        let visibleIDs = Set(CrossAppWindowEnumerator.allVisibleWindows().map(\.windowID))
-        return selection.ordered
-            .filter { visibleIDs.contains($0.windowID) }
-            .map(\.frame)
+        visibleSelectionWindows().map(\.frame)
     }
 
     // MARK: - Hit-testing
@@ -204,6 +350,88 @@ final class LassoCoordinator {
         let allWindows = CrossAppWindowEnumerator.allVisibleWindows()
         let hits = allWindows.filter { $0.frame.intersects(lassoRect) }
         selection.replace(with: hits)
+    }
+
+    /// Returns the currently-selected window at `point`, or nil if the
+    /// point is on empty space, on an unselected window, or on the
+    /// desktop. Used on mouse-down in lasso mode to decide whether the
+    /// gesture is a rubber-band selection (start rect from that point)
+    /// or a group drag (move the whole selection).
+    private func selectedWindowAt(_ point: CGPoint) -> VisibleWindow? {
+        // Iterate reversed so windows enumerated LATER (typically
+        // closer to the front in `allVisibleWindows`) win ties for
+        // overlapping selection frames — reasonable heuristic without
+        // a real z-order query.
+        return visibleSelectionWindows().reversed().first { $0.frame.contains(point) }
+    }
+
+    /// Returns the top-most visible window (selected or not) at
+    /// `point`, or nil for empty space. Used to implement "click on
+    /// any window replaces the selection with just that window."
+    private func topmostWindowAt(_ point: CGPoint) -> VisibleWindow? {
+        // Same z-order heuristic as `selectedWindowAt` — later in the
+        // enumeration wins for overlapping frames.
+        return CrossAppWindowEnumerator.allVisibleWindows()
+            .reversed()
+            .first { $0.frame.contains(point) }
+    }
+
+    /// Handles a click (mouse-down + immediate mouse-up, no drag) at
+    /// `point`. Per the lasso-mode click contract: clicking on any
+    /// window replaces the entire selection with just that window;
+    /// clicking on empty space clears the selection.
+    private func applyClick(at point: CGPoint) {
+        if let clicked = topmostWindowAt(point) {
+            selection.replace(with: [clicked])
+        } else {
+            selection.clear()
+        }
+    }
+
+    // MARK: - M6 group drag
+
+    /// Resolves AX elements for every visible-selected window ONCE at
+    /// drag start. `VisibleWindow` (from `CGWindowListCopyWindowInfo`)
+    /// doesn't carry an `AXUIElement` — CGWindowID has no public
+    /// mapping to AX. So we enumerate each owning app's window list
+    /// once and match by frame. Any window that can't be resolved is
+    /// silently dropped from the drag; the rest still move together.
+    ///
+    /// The whole point of caching axElements in the snapshot is so the
+    /// per-frame `setPosition` call in `onLassoDragUpdated` doesn't
+    /// need to re-enumerate — that would blow the CGEventTap's
+    /// ~75ms-per-callback budget with 5+ selected windows.
+    private func resolveSnapshots(from visible: [VisibleWindow]) -> [GroupDragSnapshot] {
+        let byPID = Dictionary(grouping: visible, by: \.ownerPID)
+        var snapshots: [GroupDragSnapshot] = []
+        snapshots.reserveCapacity(visible.count)
+        for (pid, windows) in byPID {
+            guard let app = NSRunningApplication(processIdentifier: pid) else { continue }
+            let axWindows = AXWindowEnumerator.windows(of: app)
+            for win in windows {
+                guard let match = axWindows.first(where: {
+                    Self.framesApproximatelyEqual($0.frame, win.frame, tolerance: 4)
+                }) else { continue }
+                snapshots.append(GroupDragSnapshot(
+                    windowID: win.windowID,
+                    ownerPID: win.ownerPID,
+                    originalFrame: win.frame,
+                    axElement: match.axElement
+                ))
+            }
+        }
+        return snapshots
+    }
+
+    private static func framesApproximatelyEqual(
+        _ a: CGRect,
+        _ b: CGRect,
+        tolerance: CGFloat
+    ) -> Bool {
+        abs(a.minX - b.minX) <= tolerance &&
+        abs(a.minY - b.minY) <= tolerance &&
+        abs(a.width - b.width) <= tolerance &&
+        abs(a.height - b.height) <= tolerance
     }
 
     // MARK: - Helpers
