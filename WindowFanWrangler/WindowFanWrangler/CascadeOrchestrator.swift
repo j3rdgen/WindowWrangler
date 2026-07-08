@@ -1029,6 +1029,17 @@ final class CascadeOrchestrator {
             Log.cascade.info(
                 "All-apps \(label, privacy: .public): \(count, privacy: .public)/\(laggardMoves.count, privacy: .public) laggards nudged"
             )
+
+            // Some apps (Chrome, Messages) auto-raise themselves when
+            // their frame is set. The retry we just did may have shoved
+            // one of them in front of a window that pass 1's z-order
+            // enforcement had correctly placed ahead of it — producing
+            // the "Finder behind Messages" reordering the user sees
+            // between cascade runs. Re-enforce z-order now so the retry
+            // doesn't break the stacking pass 1 established.
+            if count > 0 {
+                self.enforceCascadeZOrder(plans: plans)
+            }
         }
     }
 
