@@ -56,4 +56,7 @@ enum Log {
 
     /// Menu / status item / onboarding window.
     static let ui         = Logger(subsystem: subsystem, category: "ui")
+
+    /// Corral feature — save/restore of named window workspaces.
+    static let corral     = Logger(subsystem: subsystem, category: "corral")
 }
