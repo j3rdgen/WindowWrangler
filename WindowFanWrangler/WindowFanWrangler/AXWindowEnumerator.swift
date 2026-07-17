@@ -86,15 +86,24 @@ enum AXWindowEnumerator {
             // filtering those out was excluding real windows.
             if let subrole = stringAttribute(kAXSubroleAttribute, of: element),
                !allowedSubroles.contains(subrole) {
+                Log.ax.info(
+                    "Filtered \(appName, privacy: .public) window — subrole '\(subrole, privacy: .public)' not in allowlist"
+                )
                 filteredCount += 1
                 return nil
             }
             // Minimized windows aren't visible to the user.
             if let minimized = boolAttribute(kAXMinimizedAttribute, of: element), minimized {
+                Log.ax.info(
+                    "Filtered \(appName, privacy: .public) window — minimized"
+                )
                 filteredCount += 1
                 return nil
             }
             guard let frameAX = currentFrame(of: element) else {
+                Log.ax.info(
+                    "Filtered \(appName, privacy: .public) window — no frame"
+                )
                 filteredCount += 1
                 return nil
             }
@@ -102,19 +111,28 @@ enum AXWindowEnumerator {
             // certainly a system overlay or a small alert dialog, not
             // a real user-facing window.
             if frameAX.width < 200 || frameAX.height < 100 {
+                Log.ax.info(
+                    "Filtered \(appName, privacy: .public) window — size \(Int(frameAX.width), privacy: .public)×\(Int(frameAX.height), privacy: .public) below 200×100 minimum"
+                )
                 filteredCount += 1
                 return nil
             }
-            // Backdrop / pseudo-window filter. macOS's Finder Desktop
-            // is an invisible full-display-sized window that reports
-            // as a normal AXWindow but shouldn't participate in any
-            // cascade — if it did, the auto-anchor rule would promote
-            // Finder to the anchor slot and its 1728×1117 backdrop
-            // would hijack the layout. Same for fullscreen-mode
-            // windows (green-button fullscreen), which can't be moved
-            // or resized anyway. Signature: matches a display's full
-            // frame size AND reports non-resizable.
-            if isBackdropOrFullscreen(frameAX: frameAX, element: element) {
+            // Backdrop / pseudo-window filter. Historically this filter
+            // caught display-sized non-settable windows in ANY app, on
+            // the theory that only backdrops and fullscreen frames fit
+            // that pattern. That was too broad — a zoomed / maximized
+            // TextEdit (or any other regular app) window can hit the
+            // "display-size + non-settable" signature transiently and
+            // then falsely get filtered out of cascade / group-drag /
+            // Corral capture. Scoping the filter to Finder specifically
+            // keeps the original problem (invisible Finder Desktop
+            // hijacking anchor slot) solved without dropping legit
+            // windows from other apps.
+            if app.bundleIdentifier == "com.apple.finder"
+                && isBackdropOrFullscreen(frameAX: frameAX, element: element) {
+                Log.ax.info(
+                    "Filtered \(appName, privacy: .public) window — Finder Desktop backdrop"
+                )
                 filteredCount += 1
                 return nil
             }
