@@ -82,12 +82,37 @@ final class LassoCoordinator {
         }
     }
 
+    /// Suspends the CGEventTap's mouse-event consumption without
+    /// changing lasso mode itself. Used by Corral flows (save pill,
+    /// release menu, name-collision alert) so their modal UI can
+    /// receive clicks — lasso mode's mouse consumption would
+    /// otherwise swallow the click on the OK button of an NSAlert
+    /// or the click that focuses the pill's text field.
+    ///
+    /// Pair every suspend with a matching resume. Selection state,
+    /// overlay outlines, mode hint, and the ⌃⌥⌘C shortcut all keep
+    /// working while suspended — only mouse-event consumption pauses.
+    func suspendMouseConsumption() {
+        eventMonitor.isConsumptionSuspended = true
+    }
+
+    func resumeMouseConsumption() {
+        eventMonitor.isConsumptionSuspended = false
+    }
+
     /// Toggles lasso mode on/off — bound to the ⌃⌥⌘C global shortcut.
     func toggleLassoMode() {
         isLassoModeActive.toggle()
         eventMonitor.isLassoModeActive = isLassoModeActive
         if isLassoModeActive {
             modeHint.show()
+            // Prefetch every running browser's tabs in the background
+            // so that if the user ends up saving the selection as a
+            // Corral, `BrowserScripting.snapshotBrowserWindows` gets
+            // a cache hit and skips the 200–800ms AppleScript wait.
+            // The prefetch is fire-and-forget; it doesn't delay the
+            // mode hint's appearance or the user's ability to drag.
+            BrowserScripting.prefetchAllBrowsers()
         } else {
             modeHint.hide()
         }

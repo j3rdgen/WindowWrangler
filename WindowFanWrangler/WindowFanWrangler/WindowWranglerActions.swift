@@ -25,4 +25,5 @@ import AppKit
     @objc func toggleLassoFromMenu()
     @objc func clearSelection()
     @objc func reopenOnboarding()
+    @objc func corralSave()
 }

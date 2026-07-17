@@ -35,6 +35,17 @@ final class GlobalEventMonitor {
     /// While false, mouse events pass through untouched.
     var isLassoModeActive: Bool = false
 
+    /// While `true`, the tap passes every mouse event through
+    /// unchanged even when `isLassoModeActive` is on. Used by the
+    /// Corral save (and future release) flows: the user is still
+    /// logically in lasso mode, but the name pill / release menu /
+    /// any NSAlert we display next needs clicks to reach it —
+    /// without this, consumption would swallow the OK-button click
+    /// on an alert or the text-field focus click on the pill and
+    /// leave them permanently unresponsive. Suspend on flow start,
+    /// resume on flow end.
+    var isConsumptionSuspended: Bool = false
+
     // MARK: - Callbacks
 
     /// Mouse-down location in Cocoa global coords. Only fires while
@@ -63,7 +74,13 @@ final class GlobalEventMonitor {
     // MARK: - Monitor handles
 
     /// Escape detection — passive NSEvent observer (no consumption needed).
+    /// `keyMonitor` fires for events destined for OTHER apps; local
+    /// monitor fires for events destined for our own app. Both feed
+    /// the same handler so escape works whether the user is focused
+    /// on us (e.g. right after our NSAlert dismisses) or on any
+    /// other app (the normal lasso case).
     private var keyMonitor: Any?
+    private var localKeyMonitor: Any?
 
     /// CGEventTap that intercepts left-mouse-down/dragged/up. Active
     /// (`.defaultTap`) so the callback can return nil to drop events.
@@ -78,11 +95,29 @@ final class GlobalEventMonitor {
 
         // Escape detection — NSEvent global monitor (passive observer)
         // is fine here. We never want to consume escape.
+        //
+        // Global monitor fires only when our app is NOT active
+        // (which is the normal lasso case — user is interacting
+        // with Finder/Chrome/whatever). Local monitor fires when
+        // our app IS active — after an NSAlert dismisses, our app
+        // holds focus briefly, and without the local monitor an
+        // escape press here would produce macOS's "unhandled key"
+        // pluck sound and leave lasso mode stuck on. Both feed the
+        // same handler; the local monitor returns the event
+        // unchanged so anything with a legitimate escape handler
+        // (a text field, an alert) still receives it too.
         keyMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self else { return }
             MainActor.assumeIsolated {
                 self.handleKey(event)
             }
+        }
+        localKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self else { return event }
+            MainActor.assumeIsolated {
+                self.handleKey(event)
+            }
+            return event
         }
 
         // Mouse: CGEventTap so we can consume events while lasso mode
@@ -99,6 +134,10 @@ final class GlobalEventMonitor {
             NSEvent.removeMonitor(monitor)
         }
         keyMonitor = nil
+        if let monitor = localKeyMonitor {
+            NSEvent.removeMonitor(monitor)
+        }
+        localKeyMonitor = nil
 
         if let tap = eventTap {
             CGEvent.tapEnable(tap: tap, enable: false)
@@ -181,6 +220,16 @@ final class GlobalEventMonitor {
             if let tap = eventTap {
                 CGEvent.tapEnable(tap: tap, enable: true)
             }
+            return Unmanaged.passUnretained(event)
+        }
+
+        // Consumption suspended (a corral pill / release menu / alert
+        // is on-screen and needs clicks). Pass every event through
+        // unchanged even if `isLassoModeActive` is still true — the
+        // user is logically still in lasso mode and the mode hint is
+        // still visible; we just can't eat the clicks that need to
+        // reach our own modal UI.
+        if isConsumptionSuspended {
             return Unmanaged.passUnretained(event)
         }
 

@@ -78,6 +78,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
         isTrusted: { [weak self] in self?.isTrusted ?? false }
     )
 
+    /// Persistent store of named window groups (M8 Corral feature).
+    /// Loads from UserDefaults on init; menu builder observes
+    /// `onChange` (wired in M8.4) to refresh its Release submenu
+    /// whenever a corral is added, overwritten, deleted, or renamed.
+    private let corralStore = CorralStore()
+
+    /// Owns the Corral save/restore flow. Shares the same
+    /// `windowSelection` the lasso populates, so triggering save
+    /// picks up whatever the user has currently lassoed. The
+    /// suspend/resume closures let the orchestrator pause lasso
+    /// mode's mouse-event consumption while any of its modal UI
+    /// (name pill, replace-confirm alert, no-selection alert) is
+    /// on-screen — without this, lasso's CGEventTap would swallow
+    /// the click needed to focus the pill or dismiss the alert.
+    private lazy var corralOrchestrator = CorralOrchestrator(
+        store: corralStore,
+        selection: windowSelection,
+        isTrusted: { [weak self] in self?.isTrusted ?? false },
+        suspendMouseCapture: { [weak self] in
+            self?.lassoCoordinator.suspendMouseConsumption()
+        },
+        resumeMouseCapture: { [weak self] in
+            self?.lassoCoordinator.resumeMouseConsumption()
+        }
+    )
+
     // MARK: - Launch
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -85,12 +111,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
         // app runs as a menu-bar-only "accessory" — no Dock icon.
         NSApp.setActivationPolicy(.accessory)
 
+        // Single-instance enforcement. Any other running Window Wrangler
+        // process is a zombie — most often from Xcode's debug session
+        // not fully cleaning up on stop, or from launching once from
+        // Finder and once from Xcode. Zombies matter here because our
+        // lasso CGEventTap is session-wide: a stray process with
+        // isLassoModeActive=true silently consumes every left-click on
+        // every desktop, making the whole Mac feel frozen. Force-quit
+        // any siblings on launch so only THIS instance holds a tap.
+        forceQuitOtherInstances()
+
         setupStatusItem()
         // Force-init lazy properties NOW so their internal observers
         // are wired up BEFORE setupSelectionObserver / permission
         // callbacks wrap them.
         _ = lassoCoordinator
         _ = cascadeOrchestrator
+        _ = corralOrchestrator
 
         // Menu must rebuild whenever the snapshot becomes available
         // or is consumed (cascade creates, restore consumes), so the
@@ -182,6 +219,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
             keyCode: KeyCode.leftBracket,
             action: { [weak self] in self?.shortcutCascadeAllApps(direction: .downLeft) },
             label: "Cascade All Apps Down-Left"
+        ))
+
+        // M8 Corral feature. ⌃⌥⌘S opens the name pill for the
+        // current lasso selection; ⌃⌥⌘R (wired in M8.3) opens the
+        // release menu. Both routes are safe to run synchronously —
+        // preflight (permission, empty selection, at-cap) is cheap
+        // and any AX/AppleScript work happens after the user hits
+        // Return on the pill, not on the shortcut press itself.
+        shortcuts.register(.init(
+            modifiers: modifiers,
+            keyCode: KeyCode.s,
+            action: { [weak self] in self?.corralSave() },
+            label: "Corral (Save Window Group)"
         ))
     }
 
@@ -426,6 +476,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
         } else {
             showOnboarding()
         }
+    }
+
+    @objc func corralSave() {
+        // Preflight (permission, empty selection, at-cap) is cheap and
+        // safe to run synchronously; the heavier snapshot work fires
+        // only after the user submits the name pill, at which point the
+        // menu is long dismissed.
+        corralOrchestrator.beginSave()
+    }
+
+    // MARK: - Zombie prevention + clean shutdown
+
+    /// On launch, force-terminates any other Window Wrangler process
+    /// that's already running. Called before we install our own
+    /// CGEventTap so the OS never has two Window Wrangler taps
+    /// competing for left-mouse events at the same session level.
+    ///
+    /// The concrete failure mode this prevents: an old debug build
+    /// left over from a previous Xcode run that still has
+    /// `isLassoModeActive == true`. That stray process silently
+    /// consumes every left-mouse click across the entire user session
+    /// — the visible symptom is "I can't click anything on my Mac,
+    /// need to reboot." Killing siblings here means the moment this
+    /// build launches, we're guaranteed to be the only one holding
+    /// a mouse tap.
+    private func forceQuitOtherInstances() {
+        guard let myBundle = Bundle.main.bundleIdentifier else { return }
+        let siblings = NSRunningApplication.runningApplications(withBundleIdentifier: myBundle)
+            .filter { $0.processIdentifier != NSRunningApplication.current.processIdentifier }
+        guard !siblings.isEmpty else { return }
+        Log.app.notice(
+            "Found \(siblings.count, privacy: .public) other Window Wrangler instance(s) — force-quitting to prevent duplicate event taps"
+        )
+        for sibling in siblings {
+            sibling.forceTerminate()
+        }
+    }
+
+    /// Explicit teardown on normal quit. macOS releases our CGEventTap
+    /// when the process dies, so this is mostly belt-and-suspenders,
+    /// but calling stop() explicitly gives us deterministic log lines
+    /// ("GlobalEventMonitor: stopped") so a debug session can be sure
+    /// the tap actually released before the process exited.
+    func applicationWillTerminate(_ notification: Notification) {
+        Log.app.notice("applicationWillTerminate — releasing lasso + shortcut taps")
+        lassoCoordinator.stop()
+        shortcuts.stop()
     }
 
     // MARK: - Menu/shortcut timing
