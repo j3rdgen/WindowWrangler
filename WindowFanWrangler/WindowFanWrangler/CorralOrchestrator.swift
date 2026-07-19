@@ -62,6 +62,9 @@ final class CorralOrchestrator {
     /// the capture finishes.
     private var progressToast: CorralToast?
 
+    /// Retains the release menu while it's on-screen.
+    private var releaseMenu: CorralReleaseMenu?
+
     /// True while any part of the save flow is on-screen (pill or an
     /// alert). Used to make suspend/resume idempotent — repeated
     /// calls during a single flow don't stack.
@@ -289,6 +292,554 @@ final class CorralOrchestrator {
         successToast = toast
     }
 
+    // MARK: - Release flow (⌃⌥⌘R)
+
+    /// Entry point for ⌃⌥⌘R and the future "Release" menu item.
+    /// Preflights AX permission, suspends lasso mouse capture so
+    /// the release menu can receive clicks, then presents the menu.
+    /// The menu itself handles the empty-store case by showing an
+    /// empty-state message and auto-dismissing after a short read.
+    func beginRelease() {
+        Log.corral.notice("beginRelease requested")
+
+        guard isTrusted() else {
+            showAlert(
+                title: "Accessibility permission required",
+                message: "Grant Window Wrangler access to Accessibility in System Settings, then try again."
+            )
+            return
+        }
+
+        beginFlow()
+
+        let menu = CorralReleaseMenu()
+        menu.onSelect = { [weak self] corral in
+            self?.releaseMenu = nil
+            self?.endFlow()
+            self?.performRestore(of: corral)
+        }
+        menu.onDelete = { [weak self] id in
+            guard let self else { return }
+            self.store.delete(id: id)
+            self.releaseMenu?.refresh(corrals: self.store.corrals)
+        }
+        menu.onDismiss = { [weak self] in
+            self?.releaseMenu = nil
+            self?.endFlow()
+        }
+        releaseMenu = menu
+        menu.present(corrals: store.corrals)
+    }
+
+    // MARK: - Restore
+
+    /// Restores every window in the given Corral. Non-browser
+    /// members are re-positioned via AX; browser members with saved
+    /// tabs are matched against currently-open browser windows by
+    /// URL-overlap (best match wins) and, when no match is found,
+    /// a fresh browser window is opened with the saved tabs via
+    /// AppleScript. Z-order is re-established in reverse-slot order
+    /// so the anchor (`zOrderIndex == 0`) lands on top.
+    ///
+    /// Missing windows (member's app not running, or no matching
+    /// window found for a non-browser member) are collected and
+    /// surfaced in the completion toast so the user knows exactly
+    /// what got restored and what didn't.
+    /// Two-phase restore. Phase 1 is synchronous: launch every app
+    /// that isn't running, ask every documents-based member's app to
+    /// open its specific file via `NSWorkspace.open`. Phase 2 runs
+    /// after a short deferred wait so those launches have time to
+    /// register their windows with the AX subsystem — then does the
+    /// existing find/move/z-order pass on whatever's now available.
+    ///
+    /// A "Restoring '<name>'…" progress toast covers the wait so it
+    /// doesn't feel like nothing's happening.
+    private func performRestore(of corral: Corral) {
+        Log.corral.notice(
+            "Restoring '\(corral.name, privacy: .public)' with \(corral.members.count, privacy: .public) member(s) — launching apps + opening docs"
+        )
+
+        let progress = CorralToast()
+        progress.showProgress(text: "Restoring '\(corral.name)'…")
+        progressToast = progress
+
+        // Group members by bundle-ID so a corral with three TextEdit
+        // docs launches TextEdit exactly once and opens all three
+        // docs in one NSWorkspace call.
+        let membersByBundle = Dictionary(grouping: corral.members, by: { $0.appBundleID })
+        var needsWait = false
+
+        for (bundleID, membersOfBundle) in membersByBundle {
+            guard let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else {
+                // App isn't installed. Nothing to launch. Restore will
+                // report these members as missing.
+                Log.corral.info(
+                    "Restore prep: no installed app for \(bundleID, privacy: .public) — will report members missing"
+                )
+                continue
+            }
+
+            let docURLs: [URL] = membersOfBundle.compactMap { member in
+                guard let path = member.documentPath, !path.isEmpty else { return nil }
+                return URL(fileURLWithPath: path)
+            }
+
+            if !docURLs.isEmpty {
+                // Open specific docs. NSWorkspace.open launches the
+                // app if needed AND asks it to open each URL — one
+                // generic API that covers every documents-based Cocoa
+                // app without per-app AppleScript.
+                Log.corral.info(
+                    "Restore prep: opening \(docURLs.count, privacy: .public) doc(s) via \(bundleID, privacy: .public)"
+                )
+                NSWorkspace.shared.open(
+                    docURLs,
+                    withApplicationAt: appURL,
+                    configuration: NSWorkspace.OpenConfiguration(),
+                    completionHandler: nil
+                )
+                needsWait = true
+            } else {
+                // No documentPath recorded. Which flavour of `open`
+                // we invoke depends on the app — some apps don't
+                // respond to `open -b <bundle>` on a running instance
+                // and need extra arguments to create a window.
+                openAppForRestore(
+                    bundleID: bundleID,
+                    membersOfBundle: membersOfBundle
+                )
+                needsWait = true
+            }
+        }
+
+        // Defer the actual find/move pass so the launched apps and
+        // just-opened docs have time to appear in the AX enumeration.
+        // 2 seconds is long enough for TextEdit/Preview to register
+        // a new window; Catalyst apps (Notes, Podcasts) can take
+        // longer, so we do one retry pass 2s after the first if
+        // anything's still missing.
+        let delay: TimeInterval = needsWait ? 2.0 : 0.05
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            self?.executeRestore(of: corral, allowRetry: true)
+        }
+    }
+
+    private func executeRestore(of corral: Corral, allowRetry: Bool) {
+        Log.corral.notice(
+            "Executing restore for '\(corral.name, privacy: .public)'"
+        )
+
+        // Sort members by zOrderIndex ascending so we walk them in
+        // "front-most first" order for logging clarity. The actual
+        // z-order raise below re-iterates in reverse so the frontmost
+        // ends up on top.
+        let ordered = corral.members.sorted { $0.zOrderIndex < $1.zOrderIndex }
+
+        // AX-tracked restores (non-browser windows we moved via
+        // WindowMutator, plus browser windows we didn't need to touch
+        // at all because their frame already matched). These are the
+        // members that will participate in the AX z-order raise pass.
+        var restoredForZOrder: [(member: CorralMember, axElement: AXUIElement)] = []
+        // Browser members restored via AppleScript that don't have an
+        // AX element to raise. They end up in the correct relative
+        // slot naturally: newly-opened windows are on top after
+        // creation, and every subsequent AX raise on another member
+        // pushes them one slot back.
+        var restoredWithoutAX: Int = 0
+        var missing: [String] = []
+        var axCache: [pid_t: [EnumeratedWindow]] = [:]
+
+        for (idx, member) in ordered.enumerated() {
+            Log.corral.info(
+                "Restore [\(idx + 1, privacy: .public)/\(ordered.count, privacy: .public)] '\(member.appName, privacy: .public)' (\(member.appBundleID, privacy: .public), slot \(member.zOrderIndex, privacy: .public))"
+            )
+            if let tabs = member.tabs, !tabs.isEmpty {
+                let result = restoreBrowserMember(member: member, tabs: tabs)
+                switch result {
+                case .movedExisting:
+                    Log.corral.info("  → matched & moved existing browser window")
+                    restoredWithoutAX += 1
+                case .openedNew:
+                    Log.corral.info("  → opened new browser window with \(tabs.count, privacy: .public) tab(s)")
+                    restoredWithoutAX += 1
+                case .failed:
+                    Log.corral.error("  → browser restore failed")
+                    missing.append(member.appName)
+                }
+            } else {
+                if let axElement = findWindow(for: member, axCache: &axCache) {
+                    WindowMutator.setFrame(member.frame, of: axElement)
+                    Log.corral.info("  → moved via AX")
+                    restoredForZOrder.append((member, axElement))
+                } else {
+                    Log.corral.error("  → no matching window found")
+                    missing.append(member.appName)
+                }
+            }
+        }
+
+        let totalRestored = restoredForZOrder.count + restoredWithoutAX
+
+        // If anything's still missing and we haven't retried yet,
+        // wait 2s more and try again. Catalyst apps like Notes and
+        // Podcasts have been observed to take 3–4s to spawn a window
+        // in response to `open -b` reopen — longer than our initial
+        // 2s prep delay. A single retry pass usually catches them
+        // without dragging the fast-path save/restore experience
+        // out for everyone.
+        if allowRetry && !missing.isEmpty {
+            Log.corral.info(
+                "Restore: \(missing.count, privacy: .public) member(s) missing after first pass — retrying in 2s"
+            )
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                self?.executeRestore(of: corral, allowRetry: false)
+            }
+            return
+        }
+
+        enforceRestoreZOrder(restored: restoredForZOrder)
+        Log.corral.notice(
+            "Restore complete: \(totalRestored, privacy: .public)/\(corral.members.count, privacy: .public) restored, \(missing.count, privacy: .public) missing"
+        )
+
+        // Take down the "Restoring…" progress toast so it doesn't
+        // stack visually with the result toast.
+        progressToast?.dismissNow()
+        progressToast = nil
+
+        showRestoreResultToast(
+            name: corral.name,
+            restoredCount: totalRestored,
+            total: corral.members.count,
+            missing: missing
+        )
+    }
+
+    /// Non-browser lookup. Fetches the owning app's AX windows once
+    /// per PID (cached) and matches by title. Exact match wins, then
+    /// substring match either direction; last-resort fallback is
+    /// "first window" so a Notes doc gets restored even if the title
+    /// changed since save.
+    private func findWindow(
+        for member: CorralMember,
+        axCache: inout [pid_t: [EnumeratedWindow]]
+    ) -> AXUIElement? {
+        guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: member.appBundleID).first else {
+            Log.corral.info(
+                "Restore: app \(member.appBundleID, privacy: .public) not running — skipping"
+            )
+            return nil
+        }
+        let pid = app.processIdentifier
+
+        let axWindows: [EnumeratedWindow]
+        if let cached = axCache[pid] {
+            axWindows = cached
+        } else {
+            axWindows = AXWindowEnumerator.windows(of: app)
+            axCache[pid] = axWindows
+        }
+
+        guard !axWindows.isEmpty else { return nil }
+
+        // Match by title if we saved one.
+        if !member.windowTitle.isEmpty {
+            for win in axWindows {
+                if readTitle(of: win.axElement) == member.windowTitle {
+                    return win.axElement
+                }
+            }
+            // Substring fallback — titles that shifted slightly
+            // (e.g. "Untitled — Edited" vs "Untitled") still match.
+            for win in axWindows {
+                let current = readTitle(of: win.axElement)
+                if current.isEmpty { continue }
+                if current.contains(member.windowTitle)
+                    || member.windowTitle.contains(current) {
+                    return win.axElement
+                }
+            }
+        }
+
+        // Last resort: any window of this app is better than no
+        // restore at all.
+        return axWindows.first?.axElement
+    }
+
+    /// Outcome of a browser restore. Both success cases position the
+    /// window entirely through AppleScript so we don't need an AX
+    /// element (previously we tried to hunt the newly-opened window
+    /// down via a frame match, which was flaky and produced
+    /// false-negatives that got surfaced to the user as "not
+    /// available" even though the AppleScript succeeded).
+    private enum BrowserRestoreResult {
+        case movedExisting
+        case openedNew
+        case failed
+    }
+
+    /// Browser lookup. Snapshots the browser (uses cache if fresh),
+    /// finds the window with the highest URL-set overlap against the
+    /// saved tabs, and — if that overlap is meaningful (≥ 50% of
+    /// saved URLs present) — repositions that window in place via
+    /// `BrowserScripting.moveBrowserWindow` (which addresses the
+    /// window by its scripting-dictionary id, avoiding the AX frame
+    /// mismatch pitfall). Otherwise opens a fresh browser window
+    /// with the saved tabs via AppleScript.
+    private func restoreBrowserMember(
+        member: CorralMember,
+        tabs: [TabInfo]
+    ) -> BrowserRestoreResult {
+        let targetBoundsAX = CoordinateSpace.axRect(fromCocoa: member.frame)
+
+        if let snapshots = BrowserScripting.snapshotBrowserWindows(bundleID: member.appBundleID) {
+            let savedURLs = Set(tabs.map { $0.url })
+            let ranked = snapshots
+                .map { snap -> (snap: BrowserScripting.BrowserWindowSnapshot, overlap: Int) in
+                    let currentURLs = Set(snap.tabs.map { $0.url })
+                    return (snap, savedURLs.intersection(currentURLs).count)
+                }
+                .max(by: { $0.overlap < $1.overlap })
+
+            let overlapThreshold = max(1, tabs.count / 2)
+            if let best = ranked, best.overlap >= overlapThreshold {
+                Log.corral.info(
+                    "  browser match: \(best.overlap, privacy: .public)/\(tabs.count, privacy: .public) URL overlap, window id \(best.snap.internalID, privacy: .public)"
+                )
+                let moved = BrowserScripting.moveBrowserWindow(
+                    bundleID: member.appBundleID,
+                    windowID: best.snap.internalID,
+                    boundsAX: targetBoundsAX
+                )
+                if moved {
+                    return .movedExisting
+                }
+                Log.corral.info("  move-existing failed — falling back to open new")
+            } else {
+                Log.corral.info(
+                    "  browser: no matched window (best overlap \(ranked?.overlap ?? 0, privacy: .public)/\(tabs.count, privacy: .public), threshold \(overlapThreshold, privacy: .public))"
+                )
+            }
+        } else {
+            Log.corral.info("  browser: snapshotBrowserWindows returned nil — opening fresh")
+        }
+
+        let opened = BrowserScripting.openBrowserWindow(
+            bundleID: member.appBundleID,
+            tabs: tabs,
+            boundsAX: targetBoundsAX
+        )
+        if opened { return .openedNew }
+
+        // AppleScript path failed. Fall back to `/usr/bin/open -a
+        // "<AppName>" URL1 URL2 …` which uses LaunchServices, doesn't
+        // touch AppleScript / TCC-Automation, and just tells the browser
+        // "open these URLs." Chrome-family and Safari all accept URL
+        // lists this way; when the browser is running with no visible
+        // windows this creates one, matching the user intent. The window
+        // won't land at the exact saved frame (that would need
+        // AppleScript to set bounds), but the tabs come back — which
+        // is the piece the user cares most about.
+        if openBrowserURLsViaLaunchServices(bundleID: member.appBundleID, tabs: tabs) {
+            return .openedNew
+        }
+        return .failed
+    }
+
+    /// Dispatches to the right `/usr/bin/open` invocation for the
+    /// given bundle. Most non-browser apps (Notes, Podcasts, Slack,
+    /// Discord, etc.) accept plain `open -b <bundle>` and use their
+    /// own `applicationShouldHandleReopen` handler to create a
+    /// default window. But some are quirky:
+    ///
+    /// - **Browsers** (Chrome + family, Safari): `open -b <bundle>`
+    ///   on a running instance doesn't produce a window. We pass
+    ///   URLs — the saved tab list if we have one, otherwise
+    ///   `about:blank` — via `open -b <bundle> URL1 URL2 …`. The
+    ///   URLs land as tabs in a fresh window, matching user intent.
+    ///
+    /// - **Finder**: `applicationShouldHandleReopen` doesn't trigger
+    ///   for Finder because it always "has" the Desktop pseudo-
+    ///   window (which we filter). Open a folder path (home) so a
+    ///   real Finder browser window appears.
+    private func openAppForRestore(
+        bundleID: String,
+        membersOfBundle: [CorralMember]
+    ) {
+        // If this bundle already has visible windows, don't `open`
+        // it — the app's fine, we'll just find and reposition its
+        // existing window in the execute step. Skipping here prevents
+        // two real bugs:
+        //   1. Chrome window multiplication: each `open -b Chrome
+        //      about:blank` on a Chrome that already has windows
+        //      creates a NEW window, so 3 rapid releases produced
+        //      6 windows piled on top of each other.
+        //   2. Rapid-fire re-releases (user double-clicks the corral):
+        //      the second `open -b <bundle>` fires while the first is
+        //      still processing; macOS silently drops the second, and
+        //      the app that was reopening gets confused.
+        if hasVisibleWindow(bundleID: bundleID) {
+            Log.corral.info(
+                "Restore prep: \(bundleID, privacy: .public) already has visible window(s) — skipping open"
+            )
+            return
+        }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+
+        if BrowserScripting.isSupportedBrowser(bundleID: bundleID) {
+            // Browsers: pass URLs so a new window is created. Prefer
+            // the saved tab list; fall back to about:blank.
+            let allTabs = membersOfBundle.flatMap { $0.tabs ?? [] }
+            let urls = allTabs.isEmpty ? ["about:blank"] : allTabs.map(\.url)
+            process.arguments = ["-b", bundleID] + urls
+            Log.corral.info(
+                "Restore prep: /usr/bin/open -b \(bundleID, privacy: .public) with \(urls.count, privacy: .public) URL(s)"
+            )
+        } else if bundleID == "com.apple.finder" {
+            // Finder: needs a folder path to create a real window
+            // (the Desktop backdrop doesn't count).
+            let homePath = NSString(string: "~").expandingTildeInPath
+            process.arguments = [homePath]
+            Log.corral.info(
+                "Restore prep: /usr/bin/open \(homePath, privacy: .public) (Finder home)"
+            )
+        } else {
+            // Default: reopen-hook path for well-behaved apps.
+            process.arguments = ["-b", bundleID]
+            Log.corral.info(
+                "Restore prep: /usr/bin/open -b \(bundleID, privacy: .public) (default reopen)"
+            )
+        }
+
+        do {
+            try process.run()
+        } catch {
+            Log.corral.error(
+                "Failed to spawn open for \(bundleID, privacy: .public): \(error.localizedDescription, privacy: .public)"
+            )
+        }
+    }
+
+    /// Shows a one-time-per-session alert when a browser's snapshot
+    /// script silently returns empty. Explains what's happening (TCC
+    /// grant is stale) and points the user at the manual toggle in
+    /// System Settings — the only reliable way to reset it, since
+    /// `tccutil reset` has been observed to freeze macOS.
+    private func notifyBrowserScriptingBrokenOnce(bundleID: String) {
+        guard !scriptingFailureNotified.contains(bundleID) else { return }
+        scriptingFailureNotified.insert(bundleID)
+
+        let appName = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID)
+            .flatMap { Bundle(url: $0)?.infoDictionary?["CFBundleName"] as? String } ?? bundleID
+        Log.corral.notice(
+            "Browser scripting broken for \(bundleID, privacy: .public) — showing settings alert"
+        )
+        let alert = NSAlert()
+        alert.messageText = "Can't read tabs from \(appName)"
+        alert.informativeText = """
+            Window Wrangler asked macOS for permission to control \(appName), and macOS says the permission is granted — but the actual scripting call returns nothing. This usually means \(appName)'s Automation entry got into a stale state from a previous version of the app.
+
+            To reset it: open System Settings > Privacy & Security > Automation, find Window Wrangler, and toggle \(appName) off and back on. Then try saving again.
+
+            (Corrals will still save the \(appName) window's position — you just won't get the tab list back on restore.)
+            """
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Open System Settings")
+        alert.addButton(withTitle: "Later")
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertFirstButtonReturn {
+            AutomationPermission.openSystemSettings()
+        }
+    }
+
+    /// True if the app with the given bundle-ID is currently running
+    /// AND has at least one AX-visible window that survives our
+    /// enumerator filters (the Finder Desktop pseudo-window and other
+    /// backdrops don't count).
+    private func hasVisibleWindow(bundleID: String) -> Bool {
+        guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first else {
+            return false
+        }
+        let windows = AXWindowEnumerator.windows(of: app)
+        return !windows.isEmpty
+    }
+
+    /// LaunchServices fallback for browser restore when AppleScript
+    /// is unavailable (stale TCC record, permission denied without
+    /// prompt, Chrome-specific hang, etc). Returns true on success.
+    private func openBrowserURLsViaLaunchServices(bundleID: String, tabs: [TabInfo]) -> Bool {
+        guard let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID),
+              let appName = Bundle(url: appURL)?.infoDictionary?["CFBundleName"] as? String else {
+            return false
+        }
+        let urls = tabs.map(\.url)
+        guard !urls.isEmpty else { return false }
+        Log.corral.info(
+            "LaunchServices browser restore: /usr/bin/open -a '\(appName, privacy: .public)' \(urls.count, privacy: .public) URL(s)"
+        )
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        process.arguments = ["-a", appName] + urls
+        do {
+            try process.run()
+            return true
+        } catch {
+            Log.corral.error(
+                "LaunchServices browser restore failed: \(error.localizedDescription, privacy: .public)"
+            )
+            return false
+        }
+    }
+
+    /// Raises windows in reverse-slot order so `zOrderIndex == 0`
+    /// (the anchor) ends up on top after every raise has completed —
+    /// same pattern the cascade uses in
+    /// `CascadeOrchestrator.enforceCascadeZOrder`.
+    private func enforceRestoreZOrder(
+        restored: [(member: CorralMember, axElement: AXUIElement)]
+    ) {
+        // Sort descending by zOrderIndex (backmost first) so the
+        // frontmost gets raised LAST and ends up on top of the stack.
+        let ordered = restored.sorted { $0.member.zOrderIndex > $1.member.zOrderIndex }
+        for entry in ordered {
+            AXUIElementPerformAction(entry.axElement, kAXRaiseAction as CFString)
+        }
+    }
+
+    /// Reads a window's title via AX. Empty string on failure.
+    private func readTitle(of element: AXUIElement) -> String {
+        var value: CFTypeRef?
+        let result = AXUIElementCopyAttributeValue(element, kAXTitleAttribute as CFString, &value)
+        guard result == .success, let title = value as? String else { return "" }
+        return title
+    }
+
+    // MARK: - Restore result toast
+
+    /// Shows the outcome of a restore. All good → green "✓ Restored
+    /// 'NAME'". Partial success → longer message that includes the
+    /// missing app names ("… — Messages, Notes not available") and
+    /// holds slightly longer so the user can read it.
+    private func showRestoreResultToast(name: String, restoredCount: Int, total: Int, missing: [String]) {
+        let text: String
+        let hold: TimeInterval
+        if missing.isEmpty {
+            text = "✓  Restored '\(name)'"
+            hold = 1.4
+        } else {
+            let missingList = missing.joined(separator: ", ")
+            text = "Restored \(restoredCount)/\(total) of '\(name)' — \(missingList) not available"
+            hold = 3.0
+        }
+        let toast = CorralToast()
+        toast.showMessage(text, style: .success, holdSeconds: hold) { [weak self] in
+            self?.successToast = nil
+        }
+        successToast = toast
+    }
+
     // MARK: - Member capture
 
     /// Turns each `VisibleWindow` into a fully-populated
@@ -319,6 +870,14 @@ final class CorralOrchestrator {
                 cache: &browserCache
             )
 
+            // Document path (for documents-based apps). Read from AX
+            // by matching the visible-window frame back to the app's
+            // AX enumeration, then querying kAXDocumentAttribute on
+            // that element. Nil for apps that don't expose it — that
+            // path degrades cleanly to "launch the app and hope its
+            // auto-restore brings back the window."
+            let docPath = resolveDocumentPath(for: win, axCache: &axCache)
+
             members.append(
                 CorralMember(
                     appBundleID: bundleID,
@@ -326,11 +885,52 @@ final class CorralOrchestrator {
                     windowTitle: title,
                     frame: win.frame,
                     zOrderIndex: idx,
-                    tabs: tabs
+                    tabs: tabs,
+                    documentPath: docPath
                 )
             )
         }
         return members
+    }
+
+    /// Reads `kAXDocumentAttribute` for the AX element whose frame
+    /// matches this visible window. Returns a POSIX file path if the
+    /// attribute is available and parses as a file URL; nil for apps
+    /// that don't expose it (Messages, Discord, Notes' bespoke object
+    /// model, Finder browser windows, etc.).
+    private func resolveDocumentPath(
+        for window: VisibleWindow,
+        axCache: inout [pid_t: [EnumeratedWindow]]
+    ) -> String? {
+        let axWindows: [EnumeratedWindow]
+        if let cached = axCache[window.ownerPID] {
+            axWindows = cached
+        } else if let app = NSRunningApplication(processIdentifier: window.ownerPID) {
+            axWindows = AXWindowEnumerator.windows(of: app)
+            axCache[window.ownerPID] = axWindows
+        } else {
+            return nil
+        }
+        guard let matched = axWindows.first(where: {
+            Self.framesMatch($0.frame, window.frame, tolerance: 4)
+        }) else {
+            return nil
+        }
+        var value: CFTypeRef?
+        let result = AXUIElementCopyAttributeValue(
+            matched.axElement,
+            kAXDocumentAttribute as CFString,
+            &value
+        )
+        guard result == .success, let str = value as? String else { return nil }
+        // kAXDocumentAttribute typically returns a file URL string
+        // like "file:///Users/jmw3/Desktop/foo.txt". Convert to a
+        // POSIX path so restore can pass it directly to
+        // NSWorkspace.open without needing another URL parse.
+        if let url = URL(string: str), url.isFileURL {
+            return url.path
+        }
+        return nil
     }
 
     /// Resolves the window's title via AX. Enumerates the owning
@@ -364,6 +964,13 @@ final class CorralOrchestrator {
         return title
     }
 
+    /// Tracks browser bundles whose scripting appears broken this
+    /// session (permission granted but AppleScript returns empty).
+    /// We show an actionable alert once per bundle so users know to
+    /// reset Automation for that browser in System Settings — not
+    /// every save (which would be spammy).
+    private var scriptingFailureNotified: Set<String> = []
+
     /// If the app is a supported browser, snapshots all its windows
     /// (once, cached) and returns the tab list for the window whose
     /// bounds match the given Cocoa frame. Returns nil for non-browsers
@@ -387,6 +994,16 @@ final class CorralOrchestrator {
             snapshots = queried
         }
         guard let snapshots else { return nil }
+
+        // If the browser returned NO windows at all, its scripting is
+        // effectively broken (permission granted per TCC but the actual
+        // script silently returns empty — usually a stale TCC signature
+        // from repeated rebuilds). Surface a one-time alert per bundle
+        // per session pointing the user at System Settings, so they
+        // can manually reset Automation for the affected browser.
+        if snapshots.isEmpty {
+            notifyBrowserScriptingBrokenOnce(bundleID: bundleID)
+        }
 
         // AppleScript returned AX-space (top-left) bounds; our
         // selection frames are in Cocoa (bottom-left) space. Convert

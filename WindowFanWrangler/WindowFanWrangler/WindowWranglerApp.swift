@@ -222,16 +222,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
         ))
 
         // M8 Corral feature. ⌃⌥⌘S opens the name pill for the
-        // current lasso selection; ⌃⌥⌘R (wired in M8.3) opens the
-        // release menu. Both routes are safe to run synchronously —
-        // preflight (permission, empty selection, at-cap) is cheap
-        // and any AX/AppleScript work happens after the user hits
-        // Return on the pill, not on the shortcut press itself.
+        // current lasso selection; ⌃⌥⌘R opens the release menu
+        // listing every saved corral. Both routes are safe to run
+        // synchronously — preflight (permission, empty selection,
+        // at-cap) is cheap and any AX/AppleScript work happens
+        // after the user commits to an action from within the
+        // respective UI, not on the shortcut press itself.
         shortcuts.register(.init(
             modifiers: modifiers,
             keyCode: KeyCode.s,
             action: { [weak self] in self?.corralSave() },
             label: "Corral (Save Window Group)"
+        ))
+        shortcuts.register(.init(
+            modifiers: modifiers,
+            keyCode: KeyCode.r,
+            action: { [weak self] in self?.corralRelease() },
+            label: "Release (Open Window Group)"
         ))
     }
 
@@ -386,7 +393,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
                 self.lassoCoordinator.start()
                 self.cascadeOrchestrator.warmUpAccessibility()
                 Log.permission.notice("Global shortcuts + lasso started")
+                // Fire the Automation-permission prompt for every
+                // installed browser now — the user is in "granting
+                // permissions" mode having just handled Accessibility,
+                // so getting all the browser prompts here (as one
+                // batch) is the least intrusive place to ask. Also
+                // surfaces any previously-denied permission so we can
+                // guide the user to System Settings.
+                BrowserScripting.requestAutomationPermissionsForInstalledBrowsers()
+                self.notifyIfAutomationDenied()
             }
+        }
+    }
+
+    /// Called after `requestAutomationPermissionsForInstalledBrowsers`.
+    /// If any browsers ended up denied — either macOS TCC recorded a
+    /// previous "Don't Allow" (won't re-prompt) or the automation
+    /// record is stale from an earlier signature — we surface an
+    /// alert pointing the user at System Settings > Privacy >
+    /// Automation, which is the only place they can flip the toggle
+    /// back. Wording stays browser-agnostic so users installing new
+    /// browsers later understand the pattern applies to those too.
+    private func notifyIfAutomationDenied() {
+        let denied = BrowserScripting.deniedBundles
+        guard !denied.isEmpty else { return }
+        let names: [String] = denied.compactMap { bundleID -> String? in
+            guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else {
+                return bundleID
+            }
+            return (Bundle(url: url)?.infoDictionary?["CFBundleName"] as? String) ?? bundleID
+        }.sorted()
+
+        let alert = NSAlert()
+        alert.messageText = "Enable browser control for Corral tab restore"
+        alert.informativeText = """
+            For each browser you want to save and restore tabs from — currently \(names.joined(separator: ", ")) — \
+            Window Wrangler needs macOS's "Automation" permission.
+
+            Open System Settings > Privacy & Security > Automation, find Window Wrangler, and enable the toggle for each browser you use. \
+            The same steps apply to any browser (Chrome, Safari, Brave, Edge, etc.) you install later.
+
+            If a toggle looks stuck, flip it off and on to reset it.
+            """
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Open System Settings")
+        alert.addButton(withTitle: "Later")
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertFirstButtonReturn {
+            AutomationPermission.openSystemSettings()
         }
     }
 
@@ -484,6 +538,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
         // only after the user submits the name pill, at which point the
         // menu is long dismissed.
         corralOrchestrator.beginSave()
+    }
+
+    @objc func corralRelease() {
+        // Preflight is cheap; the release menu itself renders
+        // immediately. The actual restore work only runs after the
+        // user picks a corral from the menu.
+        corralOrchestrator.beginRelease()
     }
 
     // MARK: - Zombie prevention + clean shutdown

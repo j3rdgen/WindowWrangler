@@ -71,6 +71,26 @@ final class CorralToast {
         )
     }
 
+    /// Shows an auto-dismissing toast with arbitrary text. Used by
+    /// the release path where the message may include restore
+    /// results ("Restored 3/5 of 'X' — Y, Z not available") rather
+    /// than fitting the "✓ Saved 'NAME'" template. `holdSeconds`
+    /// widens for partial-success messages so the user has time to
+    /// read the missing-window list.
+    func showMessage(
+        _ text: String,
+        style: Style = .success,
+        holdSeconds: TimeInterval = 1.8,
+        onDismiss: @escaping () -> Void
+    ) {
+        present(
+            text: text,
+            style: style,
+            autoDismiss: holdSeconds,
+            onDismiss: onDismiss
+        )
+    }
+
     /// Internal presenter used by both progress and success toasts.
     /// Extracted so the two paths share the panel-construction and
     /// positioning code and only differ in color / auto-dismiss.

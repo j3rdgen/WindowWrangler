@@ -26,4 +26,5 @@ import AppKit
     @objc func clearSelection()
     @objc func reopenOnboarding()
     @objc func corralSave()
+    @objc func corralRelease()
 }

@@ -68,6 +68,19 @@ struct CorralMember: Codable, Equatable {
     /// window with the same URL set or (b) open a new browser window
     /// with these tabs if no match exists.
     let tabs: [TabInfo]?
+    /// POSIX path of the document the window was displaying at save
+    /// time, read from `kAXDocumentAttribute`. Populated for every
+    /// documents-based Cocoa app (TextEdit, Preview, Xcode, Pages,
+    /// Numbers, Keynote, Sketch, and countless third parties) — the
+    /// attribute is a standard part of the accessibility contract for
+    /// document windows. Non-documents apps (Messages, Discord, Notes'
+    /// custom object model, Finder browser windows) leave this nil.
+    ///
+    /// At restore time, `NSWorkspace.open([fileURL], withApplicationAt:)`
+    /// launches the owning app if needed AND opens this specific
+    /// document — one generic API that covers every documents-based
+    /// app without per-app scripting.
+    let documentPath: String?
 }
 
 // MARK: - Corral
