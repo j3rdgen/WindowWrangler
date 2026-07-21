@@ -449,12 +449,28 @@ final class CorralOrchestrator {
         var missing: [String] = []
         var axCache: [pid_t: [EnumeratedWindow]] = [:]
 
+        // For each browser bundle in this corral, decide once whether
+        // the URL-overlap snapshot is worth running. If the browser
+        // has zero visible windows now, there's nothing to reuse — we
+        // skip the snapshot for every member of that bundle. Even
+        // once we've started creating new windows via AppleScript,
+        // subsequent members shouldn't try to reuse those (they're
+        // ours, not user-owned pre-existing windows), so the
+        // "empty at start" decision stays sticky per restore session.
+        var browserStartedEmpty: [String: Bool] = [:]
+        for member in ordered where member.tabs != nil && !(member.tabs?.isEmpty ?? true) {
+            if browserStartedEmpty[member.appBundleID] == nil {
+                browserStartedEmpty[member.appBundleID] = !hasVisibleWindow(bundleID: member.appBundleID)
+            }
+        }
+
         for (idx, member) in ordered.enumerated() {
             Log.corral.info(
                 "Restore [\(idx + 1, privacy: .public)/\(ordered.count, privacy: .public)] '\(member.appName, privacy: .public)' (\(member.appBundleID, privacy: .public), slot \(member.zOrderIndex, privacy: .public))"
             )
             if let tabs = member.tabs, !tabs.isEmpty {
-                let result = restoreBrowserMember(member: member, tabs: tabs)
+                let skipOverlap = browserStartedEmpty[member.appBundleID] ?? false
+                let result = restoreBrowserMember(member: member, tabs: tabs, skipOverlapCheck: skipOverlap)
                 switch result {
                 case .movedExisting:
                     Log.corral.info("  → matched & moved existing browser window")
@@ -588,11 +604,21 @@ final class CorralOrchestrator {
     /// with the saved tabs via AppleScript.
     private func restoreBrowserMember(
         member: CorralMember,
-        tabs: [TabInfo]
+        tabs: [TabInfo],
+        skipOverlapCheck: Bool
     ) -> BrowserRestoreResult {
         let targetBoundsAX = CoordinateSpace.axRect(fromCocoa: member.frame)
 
-        if let snapshots = BrowserScripting.snapshotBrowserWindows(bundleID: member.appBundleID) {
+        // When the browser had zero visible windows at restore start,
+        // there's nothing to reuse — every member goes straight to
+        // openBrowserWindow. Skipping the snapshot saves ~1s per
+        // member of walking Chrome's hidden helper windows, and also
+        // avoids the 5s timeout that fires on the Nth member when the
+        // N-1 windows we just created have grown the snapshot pool
+        // past what Chrome can enumerate under the timeout.
+        if skipOverlapCheck {
+            Log.corral.info("  browser: skipping URL-overlap snapshot (browser started empty)")
+        } else if let snapshots = BrowserScripting.snapshotBrowserWindows(bundleID: member.appBundleID) {
             let savedURLs = Set(tabs.map { $0.url })
             let ranked = snapshots
                 .map { snap -> (snap: BrowserScripting.BrowserWindowSnapshot, overlap: Int) in
@@ -689,13 +715,26 @@ final class CorralOrchestrator {
         process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
 
         if BrowserScripting.isSupportedBrowser(bundleID: bundleID) {
-            // Browsers: pass URLs so a new window is created. Prefer
-            // the saved tab list; fall back to about:blank.
-            let allTabs = membersOfBundle.flatMap { $0.tabs ?? [] }
-            let urls = allTabs.isEmpty ? ["about:blank"] : allTabs.map(\.url)
-            process.arguments = ["-b", bundleID] + urls
+            // Browsers: launch/activate WITHOUT URLs. Passing URLs
+            // here caused Chrome to collapse every tab from every
+            // saved member into a single merged window, which then
+            // sat on top of the per-member windows that
+            // restoreBrowserMember's openChromiumWindowScript creates
+            // (via `activate` + `make new window`) with the correct
+            // per-window tab lists. Result was N+1 Chrome windows
+            // instead of N.
+            //
+            // For running-windowless Chrome (`open -b` alone doesn't
+            // create a window), openChromiumWindowScript's `activate`
+            // + `make new window` still creates the correct windows.
+            // For not-running Chrome, `open -b` launches it (Chrome
+            // may create its default window); the per-member AppleScript
+            // then adds ours. Users see the default window as one extra
+            // — acceptable trade-off vs. the merged-tabs bug.
+            _ = membersOfBundle  // tabs are handled per-member downstream
+            process.arguments = ["-b", bundleID]
             Log.corral.info(
-                "Restore prep: /usr/bin/open -b \(bundleID, privacy: .public) with \(urls.count, privacy: .public) URL(s)"
+                "Restore prep: /usr/bin/open -b \(bundleID, privacy: .public) (browser — tabs handled per-member downstream)"
             )
         } else if bundleID == "com.apple.finder" {
             // Finder: needs a folder path to create a real window
@@ -982,53 +1021,30 @@ final class CorralOrchestrator {
         cache: inout [String: [BrowserScripting.BrowserWindowSnapshot]?]
     ) -> [TabInfo]? {
         guard BrowserScripting.isSupportedBrowser(bundleID: bundleID) else { return nil }
+        _ = cache  // full-snapshot cache no longer used at save time
 
-        // Cache lookup: nil (never queried), Optional.none (queried, no data),
-        // Optional.some (queried with data).
-        let snapshots: [BrowserScripting.BrowserWindowSnapshot]?
-        if let cached = cache[bundleID] {
-            snapshots = cached
-        } else {
-            let queried = BrowserScripting.snapshotBrowserWindows(bundleID: bundleID)
-            cache[bundleID] = queried
-            snapshots = queried
-        }
-        guard let snapshots else { return nil }
-
-        // If the browser returned NO windows at all, its scripting is
-        // effectively broken (permission granted per TCC but the actual
-        // script silently returns empty — usually a stale TCC signature
-        // from repeated rebuilds). Surface a one-time alert per bundle
-        // per session pointing the user at System Settings, so they
-        // can manually reset Automation for the affected browser.
-        if snapshots.isEmpty {
-            notifyBrowserScriptingBrokenOnce(bundleID: bundleID)
-        }
-
-        // AppleScript returned AX-space (top-left) bounds; our
-        // selection frames are in Cocoa (bottom-left) space. Convert
-        // for matching so we compare like-to-like.
-        //
-        // Tolerance bumped to 20pt for browsers: Chrome's AppleScript
-        // rounds bounds to integers AND appears to occasionally shave
-        // a few points off vs. what kAXPosition/kAXSize report (title
-        // bar / traffic-light overhang, we think). 10pt was too tight;
-        // 20pt is loose enough for the observed drift without
-        // introducing false positives (multiple browser windows are
-        // never within 20pt of each other in practice).
+        // Targeted snapshot: bounds-only enumeration (fast, no per-
+        // window tab access on the browser's hidden helper windows)
+        // → find best-matching window → tabs-for-that-window only.
+        // Replaces the "one big walk-every-window-and-every-tab
+        // script" approach that Chrome silently returned "" from
+        // when the user had 30+ Chrome windows.
         let targetAX = CoordinateSpace.axRect(fromCocoa: cocoaFrame)
-        guard let match = snapshots.first(where: {
-            Self.framesMatch($0.boundsAX, targetAX, tolerance: 20)
-        }) else {
-            // Log EVERY candidate so the user can share this and we
-            // can diagnose exactly which axis (x, y, w, h) is drifting
-            // and by how much. Cheap since it only fires on the
-            // no-match path.
-            let candidates = snapshots.map {
-                "(\(Int($0.boundsAX.minX)),\(Int($0.boundsAX.minY)) \(Int($0.boundsAX.width))×\(Int($0.boundsAX.height)))"
-            }.joined(separator: " | ")
+        guard let match = BrowserScripting.snapshotBrowserWindowNearFrame(
+            bundleID: bundleID,
+            targetBoundsAX: targetAX
+        ) else {
+            // Log-only. Saves only trigger while lasso mode is on, so
+            // any NSAlert we present here would appear behind the
+            // lasso overlay window (which sits at NSStatusWindowLevel)
+            // and be click-blocked — a dead-end UX. With the targeted
+            // snapshot in place, "no match" is much rarer than it was
+            // in the full-snapshot era; a saved corral without tab
+            // data is a degraded-but-usable outcome (browser window
+            // restores empty on release, other members restore
+            // normally).
             Log.corral.info(
-                "No browser window matched \(bundleID, privacy: .public) — target=(\(Int(targetAX.minX), privacy: .public),\(Int(targetAX.minY), privacy: .public) \(Int(targetAX.width), privacy: .public)×\(Int(targetAX.height), privacy: .public)) candidates=[\(candidates, privacy: .public)]"
+                "No targeted browser match for \(bundleID, privacy: .public) — target=(\(Int(targetAX.minX), privacy: .public),\(Int(targetAX.minY), privacy: .public) \(Int(targetAX.width), privacy: .public)×\(Int(targetAX.height), privacy: .public))"
             )
             return nil
         }

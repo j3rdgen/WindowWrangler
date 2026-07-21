@@ -35,11 +35,34 @@ enum AXWindowEnumerator {
         let appElement = AXUIElementCreateApplication(app.processIdentifier)
 
         var windowsValue: CFTypeRef?
-        let result = AXUIElementCopyAttributeValue(
+        var result = AXUIElementCopyAttributeValue(
             appElement,
             kAXWindowsAttribute as CFString,
             &windowsValue
         )
+
+        // Retry once on kAXErrorAPIDisabled (-25211). macOS's AX
+        // layer puts backgrounded/idle apps into a state where their
+        // AX proxy responds -25211 until "touched" — the first call
+        // often wakes the proxy up, and the second call succeeds.
+        // This affects most non-frontmost apps on Sequoia+ and is
+        // the standard workaround pattern for AX-based window
+        // managers. 50ms is long enough for macOS to route our first
+        // call to the target app's runloop and short enough not to
+        // stall a cascade (worst case: N idle apps × 50ms).
+        if result == .apiDisabled {
+            usleep(50_000)  // 50ms
+            result = AXUIElementCopyAttributeValue(
+                appElement,
+                kAXWindowsAttribute as CFString,
+                &windowsValue
+            )
+            if result == .success {
+                Log.ax.info(
+                    "'\(appName, privacy: .public)' pid=\(app.processIdentifier, privacy: .public) kAXWindows recovered after -25211 retry"
+                )
+            }
+        }
 
         guard result == .success else {
             Log.ax.error(
