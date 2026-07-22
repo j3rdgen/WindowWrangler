@@ -136,14 +136,4 @@ struct Corral: Codable, Equatable, Identifiable {
         )
     }
 
-    /// Returns a new Corral with the same `id`, `capturedAt`, and
-    /// `members`, but a new `name`. For future rename UI.
-    func withRenamed(_ newName: String) -> Corral {
-        return Corral(
-            id: id,
-            name: newName,
-            capturedAt: capturedAt,
-            members: members
-        )
-    }
 }

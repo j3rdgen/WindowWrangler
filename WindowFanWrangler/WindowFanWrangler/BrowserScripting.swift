@@ -128,13 +128,13 @@ enum BrowserScripting {
             )
             return cached
         }
-        guard let appName = localizedNameForBundle(bundleID) else {
+        guard NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first != nil else {
             Log.corral.info(
                 "Browser \(bundleID, privacy: .public) not running — skipping tab capture"
             )
             return nil
         }
-        guard let snapshots = fetchSnapshot(bundleID: bundleID, appName: appName) else {
+        guard let snapshots = fetchSnapshot(bundleID: bundleID) else {
             return nil
         }
         // Same rule for writes: only cache a meaningful result.
@@ -185,39 +185,29 @@ enum BrowserScripting {
             return nil
         }
 
-        // Step 1a: whose-filter shortcut. Ask Chrome/Safari for the
-        // ONE window whose bounds equals the target — evaluated
-        // server-side by AppleScript, no client-side iteration, no
-        // walking hidden helper windows. When it matches we go
-        // straight to step 2 (tabs).
-        if chromiumBundleIDs.contains(bundleID) {
-            let shortcutSource = chromiumBoundsByFilterScript(bundleID: bundleID, targetAX: targetBoundsAX)
-            let shortStart = CFAbsoluteTimeGetCurrent()
-            if let text = runScript(source: shortcutSource), !text.isEmpty {
-                let list = parseBoundsOnly(text)
-                let shortMs = Int((CFAbsoluteTimeGetCurrent() - shortStart) * 1000)
-                if let entry = list.first {
-                    Log.corral.notice(
-                        "Targeted snapshot: whose-filter matched window \(entry.index, privacy: .public) in \(shortMs, privacy: .public)ms"
-                    )
-                    return fetchTabsForMatch(
-                        bundleID: bundleID,
-                        matchIndex: entry.index,
-                        matchBounds: entry.bounds
-                    )
-                }
+        // Step 1a: whose-filter shortcut. Ask the browser for the ONE
+        // window whose bounds equals the target — evaluated server-
+        // side, no client-side iteration.
+        let shortcutSource = boundsByFilterScript(bundleID: bundleID, targetAX: targetBoundsAX)
+        let shortStart = CFAbsoluteTimeGetCurrent()
+        if let text = runScript(source: shortcutSource), !text.isEmpty {
+            let list = parseBoundsOnly(text)
+            let shortMs = Int((CFAbsoluteTimeGetCurrent() - shortStart) * 1000)
+            if let entry = list.first {
+                Log.corral.notice(
+                    "Targeted snapshot: whose-filter matched window \(entry.index, privacy: .public) in \(shortMs, privacy: .public)ms"
+                )
+                return fetchTabsForMatch(
+                    bundleID: bundleID,
+                    matchIndex: entry.index,
+                    matchBounds: entry.bounds
+                )
             }
         }
 
-        // Step 1b: bounds-only enumeration (capped at 8 windows).
-        let boundsSource: String
-        if chromiumBundleIDs.contains(bundleID) {
-            boundsSource = chromiumBoundsOnlyScript(bundleID: bundleID)
-        } else {
-            boundsSource = safariBoundsOnlyScript(bundleID: bundleID)
-        }
+        // Step 1b: bounds-only enumeration fallback (capped at 8).
         let start = CFAbsoluteTimeGetCurrent()
-        guard let boundsText = runScript(source: boundsSource), !boundsText.isEmpty else {
+        guard let boundsText = runScript(source: boundsOnlyScript(bundleID: bundleID)), !boundsText.isEmpty else {
             Log.corral.info(
                 "Targeted snapshot: bounds-only script returned empty for \(bundleID, privacy: .public)"
             )
@@ -276,12 +266,7 @@ enum BrowserScripting {
         matchIndex: Int,
         matchBounds: CGRect
     ) -> BrowserWindowSnapshot? {
-        let tabsSource: String
-        if chromiumBundleIDs.contains(bundleID) {
-            tabsSource = chromiumTabsForWindowScript(bundleID: bundleID, windowIndex: matchIndex)
-        } else {
-            tabsSource = safariTabsForWindowScript(bundleID: bundleID, windowIndex: matchIndex)
-        }
+        let tabsSource = tabsForWindowScript(bundleID: bundleID, windowIndex: matchIndex)
         let tabStart = CFAbsoluteTimeGetCurrent()
         let tabs: [TabInfo]
         if let tabsText = runScript(source: tabsSource) {
@@ -356,41 +341,55 @@ enum BrowserScripting {
     private(set) static var deniedBundles: Set<String> = []
 
     /// Surfaces the macOS Automation-permission prompt for every
-    /// **currently running** supported browser we haven't asked
-    /// about this session. Uses `AEDeterminePermissionToAutomateTarget`
-    /// (the correct API — it triggers the OS's own dialog when the
-    /// decision hasn't been made, and returns a clean status on
-    /// subsequent calls). Runs synchronously on main; the browser
-    /// prompt UI blocks the main runloop briefly while the user
-    /// clicks OK/Don't Allow, which is fine because they're right
-    /// there having just toggled lasso mode.
+    /// **currently running** supported browser we haven't asked about
+    /// this session. Runs synchronously on main; the browser prompt UI
+    /// blocks the main runloop briefly while the user clicks OK/Don't
+    /// Allow, which is fine because they're right there having just
+    /// toggled lasso mode.
     @MainActor
     static func requestAutomationPermissions() {
-        let browsers: [String] = NSWorkspace.shared.runningApplications
-            .compactMap { app in
-                guard let bid = app.bundleIdentifier,
-                      isSupportedBrowser(bundleID: bid),
-                      !permissionRequested.contains(bid) else { return nil }
-                return bid
-            }
-        guard !browsers.isEmpty else { return }
+        let running = NSWorkspace.shared.runningApplications
+            .compactMap { $0.bundleIdentifier }
+            .filter { isSupportedBrowser(bundleID: $0) }
+        requestPermissions(for: running, logPrefix: "Requesting")
+    }
+
+    /// Onboarding variant: checks every INSTALLED supported browser,
+    /// not just the running ones. Called once from AppDelegate right
+    /// after accessibility permission is granted, so the user gets all
+    /// the prompts in one intentional burst instead of one at a time
+    /// later when they toggle lasso.
+    @MainActor
+    static func requestAutomationPermissionsForInstalledBrowsers() {
+        let installed = (Array(chromiumBundleIDs) + [safariBundleID])
+            .filter { NSWorkspace.shared.urlForApplication(withBundleIdentifier: $0) != nil }
+        requestPermissions(for: installed, logPrefix: "Onboarding: requesting")
+    }
+
+    /// Shared body of the two public entry points above. Filters out
+    /// bundles we've already asked about this session, runs the
+    /// AutomationPermission check for each remaining one, updates the
+    /// denied set, and probes any granted-and-running browser to
+    /// surface the "TCC says granted but scripts hang" case in the log.
+    @MainActor
+    private static func requestPermissions(for bundleIDs: [String], logPrefix: String) {
+        let pending = bundleIDs.filter { !permissionRequested.contains($0) }
+        guard !pending.isEmpty else { return }
         Log.corral.info(
-            "Requesting Automation permission for \(browsers.count, privacy: .public) browser(s)"
+            "\(logPrefix, privacy: .public) Automation permission for \(pending.count, privacy: .public) browser(s)"
         )
-        for bundleID in browsers {
+        for bundleID in pending {
             permissionRequested.insert(bundleID)
-            let status = AutomationPermission.check(bundleID: bundleID, askIfNeeded: true)
-            switch status {
+            switch AutomationPermission.check(bundleID: bundleID, askIfNeeded: true) {
             case .granted:
                 Log.corral.info("Automation granted: \(bundleID, privacy: .public)")
                 deniedBundles.remove(bundleID)
-                // Sanity-probe: run a minimal "count windows" script and
-                // log its result and timing. If TCC says granted but this
-                // probe hangs or returns empty, the TCC record for this
-                // browser is stale (common after several rebuilds change
-                // our binary signature). User can `tccutil reset
-                // AppleEvents com.jmw3.WindowWrangler` to clear it.
-                probeBrowserScripting(bundleID: bundleID)
+                // Only probe running browsers — a `count of windows`
+                // against a non-running browser would trigger a cold
+                // launch (bad UX during onboarding).
+                if NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first != nil {
+                    probeBrowserScripting(bundleID: bundleID)
+                }
             case .denied:
                 Log.corral.notice("Automation DENIED: \(bundleID, privacy: .public) — user must enable in System Settings")
                 deniedBundles.insert(bundleID)
@@ -402,10 +401,10 @@ enum BrowserScripting {
         }
     }
 
-    /// Runs the smallest possible script against the given browser and
-    /// logs its result + timing. Used only to diagnose the case where
-    /// TCC reports "granted" but real scripts hang and return empty
-    /// (which usually means the TCC record is stale from a rebuild).
+    /// Runs `count of windows` against the browser and logs the
+    /// result + timing. Diagnoses the "TCC reports granted but real
+    /// scripts hang or return empty" state (usually a stale TCC record
+    /// from repeated dev-build resigning).
     @MainActor
     private static func probeBrowserScripting(bundleID: String) {
         let source = "tell application id \"\(bundleID)\" to return (count of windows) as string"
@@ -415,48 +414,6 @@ enum BrowserScripting {
         Log.corral.notice(
             "Probe \(bundleID, privacy: .public): result='\(result ?? "nil", privacy: .public)' in \(elapsedMs, privacy: .public)ms"
         )
-    }
-
-    /// Same as `requestAutomationPermissions` but for the onboarding
-    /// flow — checks every INSTALLED supported browser, not just the
-    /// running ones. Called once from AppDelegate right after
-    /// accessibility permission is granted, so the user gets all
-    /// the prompts in one intentional burst instead of one at a
-    /// time later when they toggle lasso.
-    @MainActor
-    static func requestAutomationPermissionsForInstalledBrowsers() {
-        let allSupported: [String] = Array(chromiumBundleIDs) + [safariBundleID]
-        let installed: [String] = allSupported.filter { bid in
-            NSWorkspace.shared.urlForApplication(withBundleIdentifier: bid) != nil
-                && !permissionRequested.contains(bid)
-        }
-        guard !installed.isEmpty else { return }
-        Log.corral.info(
-            "Onboarding: requesting Automation permission for \(installed.count, privacy: .public) installed browser(s)"
-        )
-        for bundleID in installed {
-            permissionRequested.insert(bundleID)
-            let status = AutomationPermission.check(bundleID: bundleID, askIfNeeded: true)
-            switch status {
-            case .granted:
-                Log.corral.info("Automation granted: \(bundleID, privacy: .public)")
-                deniedBundles.remove(bundleID)
-                // Probe only if the browser is actually running — a
-                // "count of windows" script against a non-running
-                // browser would trigger a cold launch (bad UX during
-                // onboarding).
-                if NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first != nil {
-                    probeBrowserScripting(bundleID: bundleID)
-                }
-            case .denied:
-                Log.corral.notice("Automation DENIED: \(bundleID, privacy: .public)")
-                deniedBundles.insert(bundleID)
-            case .notAvailable:
-                Log.corral.info("Automation not available (target not running): \(bundleID, privacy: .public)")
-            case .other(let err):
-                Log.corral.error("Automation check error \(err, privacy: .public) for \(bundleID, privacy: .public)")
-            }
-        }
     }
 
     /// Fires off a background snapshot for every running supported
@@ -477,28 +434,26 @@ enum BrowserScripting {
         // save falls back to sync, sync ALSO silently returns empty,
         // and Chrome ends up in the corral without any tabs.
         requestAutomationPermissions()
-        // Snapshot the app list on main; browser lookup + name
-        // resolution needs NSWorkspace which is main-thread-preferred.
-        let browsersToFetch: [(bundleID: String, appName: String)] = NSWorkspace.shared.runningApplications
+        // Snapshot the running-browser bundle IDs on main; NSWorkspace
+        // is main-thread-preferred. Background thread does the fetch.
+        let browsersToFetch: [String] = NSWorkspace.shared.runningApplications
             .compactMap { app in
                 guard let bundleID = app.bundleIdentifier,
-                      isSupportedBrowser(bundleID: bundleID),
-                      let appName = app.localizedName else { return nil }
-                return (bundleID, appName)
+                      isSupportedBrowser(bundleID: bundleID) else { return nil }
+                return bundleID
             }
         guard !browsersToFetch.isEmpty else { return }
 
         Log.corral.info(
             "Prefetching \(browsersToFetch.count, privacy: .public) browser(s) in background"
         )
-        for (bundleID, appName) in browsersToFetch {
-            // Background thread — NSAppleScript.executeAndReturnError
-            // is safe to call from any thread in practice (Chrome/
-            // Safari's AX servers don't care about our thread). If we
-            // ever see instability, swap to `Process` invoking
-            // /usr/bin/osascript, which has strict thread-safety.
+        for bundleID in browsersToFetch {
+            // NSAppleScript.executeAndReturnError on a background
+            // thread is not officially supported but works in practice
+            // for Chrome/Safari — empty results (which we don't cache)
+            // are the observed failure mode, not crashes.
             DispatchQueue.global(qos: .userInitiated).async {
-                let snapshot = fetchSnapshot(bundleID: bundleID, appName: appName)
+                let snapshot = fetchSnapshot(bundleID: bundleID)
                 guard let snapshot, !snapshot.isEmpty else {
                     // Never cache an empty prefetch result. The save
                     // path will re-fetch synchronously and get real
@@ -551,13 +506,7 @@ enum BrowserScripting {
             return false
         }
         let source = openChromiumWindowScript(bundleID: bundleID, tabs: tabs, boundsAX: boundsAX)
-        let ok = runScript(source: source) != nil
-        if ok {
-            // Invalidate the cache — a new window just appeared that
-            // wasn't in any prior snapshot.
-            snapshotCache.removeValue(forKey: bundleID)
-        }
-        return ok
+        return runScript(source: source) != nil
     }
 
     /// Chromium AppleScript that creates a new window, ensures it
@@ -593,14 +542,9 @@ enum BrowserScripting {
             """
         }
 
-        // No `activate` before `make new window`. Activating Chrome
-        // when its "current" window lives on a different Space causes
-        // macOS to flip to that Space momentarily before returning to
-        // the user's active Space where the new window is placed —
-        // a visible half-second flash during restore. Without
-        // activate, Chrome's AppleScript handler still creates the
-        // window, and macOS places it on the user's current Space
-        // without the intermediate Space switch.
+        // No `activate` — activating Chrome when its front window is
+        // on another Space causes a visible Space flip before the new
+        // window lands.
         var lines: [String] = []
         lines.append("tell application id \"\(bundleID)\"")
         lines.append("    set newWin to make new window")
@@ -634,18 +578,10 @@ enum BrowserScripting {
     /// synchronous main-thread path (cache miss on save) and the
     /// background prefetch path. Doesn't touch main-actor state.
     nonisolated private static func fetchSnapshot(
-        bundleID: String,
-        appName: String
+        bundleID: String
     ) -> [BrowserWindowSnapshot]? {
-        let source: String
-        if chromiumBundleIDs.contains(bundleID) {
-            source = chromiumSnapshotScript(bundleID: bundleID)
-        } else if bundleID == safariBundleID {
-            source = safariSnapshotScript(bundleID: bundleID)
-        } else {
-            return nil
-        }
-        _ = appName
+        guard isSupportedBrowser(bundleID: bundleID) else { return nil }
+        let source = fullSnapshotScript(bundleID: bundleID)
         guard let text = runScript(source: source) else { return nil }
         return parseSnapshot(text)
     }
@@ -673,64 +609,35 @@ enum BrowserScripting {
     /// never call `id of w` — that property returned unusual values
     /// on some Chrome versions and caused the whole script to error
     /// out silently, indistinguishable from "no windows" downstream.
-    private static func chromiumSnapshotScript(bundleID: String) -> String {
-        // Uses `tabCh` (ASCII 9) and `lf` (ASCII 10) as separators
-        // declared OUTSIDE the `tell` block. Inside a Chromium tell,
-        // the identifier `tab` refers to Chrome's `tab` class object
-        // — not AppleScript's built-in tab-character constant — and
-        // coerces to the literal string "tab", producing garbage
-        // output the parser can't split. Declaring the separator
-        // outside the tell block avoids the shadowing.
-        //
-        // Same 8-window cap as chromiumBoundsOnlyScript — the full
-        // snapshot is used by restoreBrowserMember for URL-overlap
-        // matching against existing windows, and walking Chrome's
-        // 25+ hidden helper windows (extensions popups, devtools,
-        // PWA hosts) reliably times out at 5s per member on machines
-        // with heavy Chrome use. Real user-visible browser windows
-        // are always at the top of Chrome's z-order; capping at 8
-        // covers all realistic reuse targets.
-        //
-        // Try blocks around every property access defend against
-        // any helper windows that do sneak into the top-8 and lack
-        // the `tabs` property.
-        return """
-        set tabCh to (ASCII character 9)
-        set lf to (ASCII character 10)
-        tell application id "\(bundleID)"
-            set out to ""
-            set winCount to count of windows
-            if winCount > 8 then set winCount to 8
-            repeat with i from 1 to winCount
-                try
-                    set w to window i
-                    set b to bounds of w
-                    set out to out & "W" & tabCh & (i as string) & tabCh & ((item 1 of b) as string) & tabCh & ((item 2 of b) as string) & tabCh & ((item 3 of b) as string) & tabCh & ((item 4 of b) as string) & lf
-                    try
-                        set tabCount to count of tabs of w
-                        repeat with j from 1 to tabCount
-                            try
-                                set aTab to tab j of w
-                                set out to out & "T" & tabCh & (URL of aTab as string) & tabCh & (title of aTab as string) & lf
-                            end try
-                        end repeat
-                    end try
-                end try
-            end repeat
-            return out
-        end tell
-        """
+    // MARK: Script builders
+    //
+    // Chromium and Safari share the same AppleScript vocabulary for
+    // windows, tabs, and bounds; they differ only in the tab-title
+    // property name — Chromium uses `title of tab`, Safari uses
+    // `name of tab`. All builders below take a `tabTitleProperty`
+    // and route through the same template.
+    //
+    // Every script declares `tabCh` (ASCII 9) and `lf` (ASCII 10)
+    // OUTSIDE the tell block. Inside a Chromium/Safari tell, the
+    // identifier `tab` refers to the browser's `tab` class object
+    // (browsers model tabs as first-class AppleScript objects), NOT
+    // AppleScript's built-in tab-character constant. Writing bare
+    // `tab` as a separator would coerce to the literal string "tab"
+    // and break parsing — see CLAUDE.md's parking-lot entry.
+    //
+    // The 8-window cap exists because Chromium's `windows` collection
+    // includes 25+ hidden helper windows (extensions popups, devtools,
+    // PWA hosts) that reliably hang the scripting handler when walked
+    // via bounds/tabs access. Chromium's `windows` is z-ordered
+    // (frontmost first), so top-8 always covers user-visible browser
+    // windows. The `whose bounds is {…}` shortcut has no such cap.
+
+    private static func tabTitleProperty(for bundleID: String) -> String {
+        bundleID == safariBundleID ? "name" : "title"
     }
 
-    /// Safari variant. Same output shape as Chromium; only the
-    /// property names differ (`name of tab` instead of `title of
-    /// tab`). Also uses bundle-ID addressing + index-based
-    /// iteration for the same reasons as Chromium.
-    private static func safariSnapshotScript(bundleID: String) -> String {
-        // Same tab-class shadowing avoidance and 8-window cap as
-        // Chromium — Safari also defines a `tab` class in its
-        // dictionary, so `tab` inside its tell block resolves to the
-        // class, not the character. Cap is a cheap safety net.
+    private static func fullSnapshotScript(bundleID: String) -> String {
+        let tabTitle = tabTitleProperty(for: bundleID)
         return """
         set tabCh to (ASCII character 9)
         set lf to (ASCII character 10)
@@ -748,7 +655,7 @@ enum BrowserScripting {
                         repeat with j from 1 to tabCount
                             try
                                 set aTab to tab j of w
-                                set out to out & "T" & tabCh & (URL of aTab as string) & tabCh & (name of aTab as string) & lf
+                                set out to out & "T" & tabCh & (URL of aTab as string) & tabCh & (\(tabTitle) of aTab as string) & lf
                             end try
                         end repeat
                     end try
@@ -760,20 +667,13 @@ enum BrowserScripting {
     }
 
     /// Bounds-only enumeration — one line per window, index + bounds,
-    /// **no tab access**. This is the fast half of the targeted
-    /// snapshot pattern used at save time when a user with many
-    /// browser windows would otherwise pay the full 12–20 second
-    /// per-window walking cost on their entire (33-window) Chrome
-    /// process just to identify which window is the lassoed one.
+    /// **no tab access**. Fast half of the targeted snapshot: a user
+    /// with 33 Chrome windows pays the full walking cost only once
+    /// per lassoed window here, and skips per-window tab access on
+    /// windows we don't care about.
     ///
-    /// Format: `i\tx1\ty1\tx2\ty2\n` per window (5 fields, no leading
-    /// tag). Try blocks skip windows whose bounds can't be read —
-    /// again those tend to be hidden helper windows.
-    private static func chromiumBoundsOnlyScript(bundleID: String) -> String {
-        // Cap at 8 windows to avoid Chrome's hidden helpers (see the
-        // chromiumSnapshotScript comment). Uses tabCh/lf declared
-        // outside the tell block to avoid Chrome's `tab` class
-        // shadowing the tab-character constant.
+    /// Format: `i\tx1\ty1\tx2\ty2\n` per window (no leading tag).
+    private static func boundsOnlyScript(bundleID: String) -> String {
         return """
         set tabCh to (ASCII character 9)
         set lf to (ASCII character 10)
@@ -792,30 +692,16 @@ enum BrowserScripting {
         """
     }
 
-    /// Surgical alternative to the bounds-only enumeration: asks
-    /// Chrome/Safari for the ONE window whose bounds match the given
-    /// AX-space rectangle. Uses AppleScript's native `whose` filter
-    /// clause — Chrome evaluates the predicate server-side and
-    /// returns just the matching window's index (or errors if there
-    /// isn't one).
-    ///
-    /// This is the ideal path: no client-side iteration, no walking
-    /// Chrome's hidden helper windows. When it matches, we go
-    /// straight to the tabs script for that specific index. When it
-    /// misses (usually because the target's bounds don't exactly
-    /// equal any Chrome window's bounds — AX / AppleScript coordinate
-    /// drift), the caller falls back to bounds-only enumeration.
-    ///
-    /// Format on success: one line with `i\tx1\ty1\tx2\ty2`. Format
-    /// on miss / error: empty string.
-    private static func chromiumBoundsByFilterScript(bundleID: String, targetAX: CGRect) -> String {
+    /// Surgical alternative: asks the browser for the ONE window
+    /// whose bounds match `targetAX`. AppleScript evaluates the
+    /// `whose` predicate server-side — no client-side iteration, no
+    /// walking hidden helper windows. Returns one bounds line on
+    /// match, empty on miss (caller falls back to `boundsOnlyScript`).
+    private static func boundsByFilterScript(bundleID: String, targetAX: CGRect) -> String {
         let x1 = Int(targetAX.minX.rounded())
         let y1 = Int(targetAX.minY.rounded())
         let x2 = Int(targetAX.maxX.rounded())
         let y2 = Int(targetAX.maxY.rounded())
-        // tabCh/lf declared outside the tell block — see the
-        // chromiumSnapshotScript comment on Chrome's `tab` class
-        // shadowing the tab-character constant.
         return """
         set tabCh to (ASCII character 9)
         set lf to (ASCII character 10)
@@ -832,15 +718,10 @@ enum BrowserScripting {
         """
     }
 
-    /// Fetches tabs for **one specific window** (addressed by index).
-    /// Combined with `chromiumBoundsOnlyScript`, this is the second
-    /// half of the targeted snapshot: caller runs bounds-only,
-    /// matches an AX target frame client-side, then calls this for
-    /// just the matched index.
-    ///
-    /// Format: `url\ttitle\n` per tab (2 fields, no leading tag).
-    /// Chromium uses `title of tab`.
-    private static func chromiumTabsForWindowScript(bundleID: String, windowIndex: Int) -> String {
+    /// Fetches tabs for the single window at `windowIndex`. Format:
+    /// `url\ttitle\n` per tab.
+    private static func tabsForWindowScript(bundleID: String, windowIndex: Int) -> String {
+        let tabTitle = tabTitleProperty(for: bundleID)
         return """
         set tabCh to (ASCII character 9)
         set lf to (ASCII character 10)
@@ -852,52 +733,7 @@ enum BrowserScripting {
                 repeat with j from 1 to tabCount
                     try
                         set aTab to tab j of w
-                        set out to out & (URL of aTab as string) & tabCh & (title of aTab as string) & lf
-                    end try
-                end repeat
-            end try
-            return out
-        end tell
-        """
-    }
-
-    /// Safari variant of the bounds-only script. Same output shape;
-    /// same try-block safety.
-    private static func safariBoundsOnlyScript(bundleID: String) -> String {
-        // Same 8-window cap + tab-class-avoidance as Chromium.
-        return """
-        set tabCh to (ASCII character 9)
-        set lf to (ASCII character 10)
-        tell application id "\(bundleID)"
-            set out to ""
-            set winCount to count of windows
-            if winCount > 8 then set winCount to 8
-            repeat with i from 1 to winCount
-                try
-                    set b to bounds of window i
-                    set out to out & (i as string) & tabCh & ((item 1 of b) as string) & tabCh & ((item 2 of b) as string) & tabCh & ((item 3 of b) as string) & tabCh & ((item 4 of b) as string) & lf
-                end try
-            end repeat
-            return out
-        end tell
-        """
-    }
-
-    /// Safari variant of the per-window tabs script. Safari uses
-    /// `name of tab` instead of `title of tab`.
-    private static func safariTabsForWindowScript(bundleID: String, windowIndex: Int) -> String {
-        return """
-        set tabCh to (ASCII character 9)
-        set lf to (ASCII character 10)
-        tell application id "\(bundleID)"
-            set out to ""
-            try
-                set w to window \(windowIndex)
-                set tabCount to count of tabs of w
-                repeat with j from 1 to tabCount
-                    try
-                        set aTab to tab j of w
-                        set out to out & (URL of aTab as string) & tabCh & (name of aTab as string) & lf
+                        set out to out & (URL of aTab as string) & tabCh & (\(tabTitle) of aTab as string) & lf
                     end try
                 end repeat
             end try
@@ -943,13 +779,7 @@ enum BrowserScripting {
             set bounds of window \(windowID) to {\(x1), \(y1), \(x2), \(y2)}
         end tell
         """
-        let ok = runScript(source: source) != nil
-        if ok {
-            // Bounds changed — invalidate the cache so a subsequent
-            // save-flow snapshot fetch doesn't see stale coordinates.
-            snapshotCache.removeValue(forKey: bundleID)
-        }
-        return ok
+        return runScript(source: source) != nil
     }
 
     // MARK: - Execution

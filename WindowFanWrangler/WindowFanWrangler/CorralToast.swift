@@ -162,7 +162,7 @@ final class CorralToast {
         panel.sharingType = .none
         panel.contentView = bg
 
-        positionAtCenter(panel: panel)
+        centerCorralPanel(panel)
         panel.alphaValue = 0
         panel.orderFrontRegardless()
         self.panel = panel
@@ -192,23 +192,4 @@ final class CorralToast {
     }
 
     /// Positions the pill mid-screen, matching the vertical placement
-    /// used by `CorralNamePill.positionAtCenter` so the toast appears
-    /// exactly where the pill just was — the user's eye is already
-    /// there.
-    private func positionAtCenter(panel: NSPanel) {
-        guard let screen = activeScreen() else { return }
-        let visible = screen.visibleFrame
-        let size = panel.frame.size
-        let x = visible.midX - size.width / 2
-        let y = visible.midY - size.height / 2 + visible.height * 0.08
-        panel.setFrameOrigin(NSPoint(x: x, y: y))
-    }
-
-    private func activeScreen() -> NSScreen? {
-        let mouse = NSEvent.mouseLocation
-        if let s = NSScreen.screens.first(where: { $0.frame.contains(mouse) }) {
-            return s
-        }
-        return NSScreen.main ?? NSScreen.screens.first
-    }
 }

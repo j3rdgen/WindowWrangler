@@ -86,22 +86,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
 
     /// Owns the Corral save/restore flow. Shares the same
     /// `windowSelection` the lasso populates, so triggering save
-    /// picks up whatever the user has currently lassoed. The
-    /// suspend/resume closures let the orchestrator pause lasso
-    /// mode's mouse-event consumption while any of its modal UI
-    /// (name pill, replace-confirm alert, no-selection alert) is
-    /// on-screen — without this, lasso's CGEventTap would swallow
-    /// the click needed to focus the pill or dismiss the alert.
+    /// picks up whatever the user has currently lassoed.
     private lazy var corralOrchestrator = CorralOrchestrator(
         store: corralStore,
         selection: windowSelection,
-        isTrusted: { [weak self] in self?.isTrusted ?? false },
-        suspendMouseCapture: { [weak self] in
-            self?.lassoCoordinator.suspendMouseConsumption()
-        },
-        resumeMouseCapture: { [weak self] in
-            self?.lassoCoordinator.resumeMouseConsumption()
-        }
+        isTrusted: { [weak self] in self?.isTrusted ?? false }
     )
 
     // MARK: - Launch
@@ -134,6 +123,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
         // Restore item's enabled state stays accurate.
         cascadeOrchestrator.onSnapshotChanged = { [weak self] in
             self?.rebuildMenu()
+        }
+
+        // Refresh lasso selection outlines after every cascade pass
+        // so they track windows to their new positions. Uses AX reads
+        // (fresh) instead of CGWindowList (lags AX writes).
+        cascadeOrchestrator.onWindowsMoved = { [weak self] in
+            self?.lassoCoordinator.refreshSelectionOverlay()
         }
 
         // Menu must also rebuild whenever the corral list changes

@@ -78,6 +78,11 @@ final class CascadeOrchestrator {
     /// so the Restore item's enabled state stays accurate.
     var onSnapshotChanged: (() -> Void)?
 
+    /// Fires after each cascade pass moves windows. LassoCoordinator
+    /// wires this to refresh the selection outlines so they follow
+    /// the windows to their new positions.
+    var onWindowsMoved: (() -> Void)?
+
     init(
         resolveTargetApp: @escaping () -> NSRunningApplication?,
         isTrusted: @escaping () -> Bool
@@ -183,6 +188,7 @@ final class CascadeOrchestrator {
         Log.cascade.info(
             "\(String(describing: direction), privacy: .public) on '\(targetAppName, privacy: .public)' pass 1: \(count1, privacy: .public)/\(windows.count, privacy: .public) windows moved"
         )
+        if count1 > 0 { onWindowsMoved?() }
 
         scheduleCascadePass(generation: myGen, after: 0.12, label: "pass 2",
                             app: targetApp, name: targetAppName,
@@ -564,6 +570,7 @@ final class CascadeOrchestrator {
         Log.cascade.info(
             "All-apps \(String(describing: direction), privacy: .public) pass 1: \(count1, privacy: .public)/\(allMoves.count, privacy: .public) windows moved"
         )
+        if count1 > 0 { onWindowsMoved?() }
 
         // Enforce z-order so the visual stacking matches the cascade's
         // intent: the anchor (first window in cascade order, the most
@@ -744,6 +751,7 @@ final class CascadeOrchestrator {
             Log.cascade.info(
                 "\(String(describing: direction), privacy: .public) on '\(name, privacy: .public)' \(label, privacy: .public): \(count, privacy: .public)/\(refreshed.count, privacy: .public) windows moved"
             )
+            if count > 0 { self.onWindowsMoved?() }
         }
     }
 
@@ -1029,6 +1037,7 @@ final class CascadeOrchestrator {
             Log.cascade.info(
                 "All-apps \(label, privacy: .public): \(count, privacy: .public)/\(laggardMoves.count, privacy: .public) laggards nudged"
             )
+            if count > 0 { self.onWindowsMoved?() }
 
             // Some apps (Chrome, Messages) auto-raise themselves when
             // their frame is set. The retry we just did may have shoved

@@ -12,6 +12,7 @@
 //
 
 import AppKit
+import ApplicationServices
 import os
 
 @MainActor
@@ -86,12 +87,8 @@ final class LassoCoordinator {
             .forEach { center.removeObserver($0) }
     }
 
-    /// Belt-and-suspenders safety net for the "left lasso on and
-    /// walked away" scenario. If macOS is about to sleep or the
-    /// session is going inactive (screen lock, fast user switch), we
-    /// force lasso off before that state transition — so our
-    /// CGEventTap can't come back from sleep in an inconsistent state
-    /// where clicks are still being consumed.
+    /// Force lasso off on sleep / session-lock so the CGEventTap
+    /// can't come back from a system-sleep in a stuck state.
     private func wireIdleSafetyObservers() {
         let center = NSWorkspace.shared.notificationCenter
         willSleepObserver = center.addObserver(
@@ -122,44 +119,96 @@ final class LassoCoordinator {
         toggleLassoMode()
     }
 
-    /// Suspends the CGEventTap's mouse-event consumption without
-    /// changing lasso mode itself. Used by Corral flows (save pill,
-    /// release menu, name-collision alert) so their modal UI can
-    /// receive clicks — lasso mode's mouse consumption would
-    /// otherwise swallow the click on the OK button of an NSAlert
-    /// or the click that focuses the pill's text field.
-    ///
-    /// Pair every suspend with a matching resume. Selection state,
-    /// overlay outlines, mode hint, and the ⌃⌥⌘C shortcut all keep
-    /// working while suspended — only mouse-event consumption pauses.
-    func suspendMouseConsumption() {
-        eventMonitor.isConsumptionSuspended = true
+    // MARK: - AX-frame refresh (for cascade-during-lasso)
+
+    /// AX element cached per selected window. Resolved when the
+    /// selection changes (windows are stationary at that moment, so
+    /// PID+frame matching against `AXWindowEnumerator` is reliable)
+    /// and reused by `refreshSelectionOverlay` to read fresh
+    /// positions directly from AX after cascade — bypassing
+    /// CGWindowList, whose frame data lags AX writes by hundreds of
+    /// ms for cross-app windows.
+    private var axElementCache: [CGWindowID: AXUIElement] = [:]
+
+    /// Rebuilds `axElementCache` for the current selection. Called
+    /// after every selection.onChange so the map stays in sync with
+    /// membership changes. Cheap: one AX enumeration per unique PID
+    /// in the selection.
+    private func rebuildAXElementCache() {
+        axElementCache.removeAll(keepingCapacity: true)
+        var perPIDCache: [pid_t: [EnumeratedWindow]] = [:]
+        for vw in selection.ordered {
+            let axWindows: [EnumeratedWindow]
+            if let cached = perPIDCache[vw.ownerPID] {
+                axWindows = cached
+            } else if let app = NSRunningApplication(processIdentifier: vw.ownerPID) {
+                axWindows = AXWindowEnumerator.windows(of: app)
+                perPIDCache[vw.ownerPID] = axWindows
+            } else {
+                continue
+            }
+            // Match the AX element by frame within 4pt tolerance —
+            // safe because the selection was just captured and the
+            // windows haven't moved yet.
+            if let match = axWindows.first(where: { rectsApproxEqual($0.frame, vw.frame, tolerance: 4) }) {
+                axElementCache[vw.windowID] = match.axElement
+            }
+        }
     }
 
-    func resumeMouseConsumption() {
-        eventMonitor.isConsumptionSuspended = false
+    /// Refreshes the selection overlay by reading each cached AX
+    /// element's current position and size directly. AX reads are
+    /// synchronous and reflect the app's real window state —
+    /// including any move the cascade just performed. Falls back to
+    /// the selection's stored Cocoa frame if an AX element is missing
+    /// (e.g., window closed) or an AX read fails.
+    func refreshSelectionOverlay() {
+        guard isLassoModeActive else { return }
+        let fresh: [CGRect] = selection.ordered.compactMap { vw in
+            if let element = axElementCache[vw.windowID],
+               let axFrame = readAXFrame(element) {
+                return CoordinateSpace.cocoaRect(fromAX: axFrame)
+            }
+            return vw.frame  // fallback: last-known frame
+        }
+        overlay.setSelectionFrames(fresh)
+    }
+
+    /// Reads `kAXPosition` + `kAXSize` off an AX element and returns
+    /// the composed AX-space CGRect. Nil if either attribute is
+    /// unavailable or fails to unwrap as an AXValue.
+    private func readAXFrame(_ element: AXUIElement) -> CGRect? {
+        var posRef: CFTypeRef?
+        var sizeRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXPositionAttribute as CFString, &posRef) == .success,
+              AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &sizeRef) == .success,
+              let posVal = posRef, let sizeVal = sizeRef else {
+            return nil
+        }
+        var pos = CGPoint.zero
+        var size = CGSize.zero
+        AXValueGetValue((posVal as! AXValue), .cgPoint, &pos)
+        AXValueGetValue((sizeVal as! AXValue), .cgSize, &size)
+        return CGRect(origin: pos, size: size)
+    }
+
+    private func rectsApproxEqual(_ a: CGRect, _ b: CGRect, tolerance: CGFloat) -> Bool {
+        abs(a.minX - b.minX) < tolerance
+            && abs(a.minY - b.minY) < tolerance
+            && abs(a.width - b.width) < tolerance
+            && abs(a.height - b.height) < tolerance
     }
 
     /// Toggles lasso mode on/off — bound to the ⌃⌥⌘C global shortcut.
     func toggleLassoMode() {
         isLassoModeActive.toggle()
         eventMonitor.isLassoModeActive = isLassoModeActive
-        // Gate the CGEventTap to lasso being active. When lasso is
-        // off, the tap is DISABLED — macOS routes left-mouse events
-        // directly to their targets without our callback ever running.
-        // Eliminates the class of "background app freezes clicks"
-        // failures where an idle-state edge case in our callback
-        // (empty NSScreen.screens, misbehaving NSApp.windows, etc.)
-        // could hose the system-wide click flow.
+        // Tap only runs while lasso is on (see `setTapActive`).
         eventMonitor.setTapActive(isLassoModeActive)
         if isLassoModeActive {
             modeHint.show()
-            // Prefetch every running browser's tabs in the background
-            // so that if the user ends up saving the selection as a
-            // Corral, `BrowserScripting.snapshotBrowserWindows` gets
-            // a cache hit and skips the 200–800ms AppleScript wait.
-            // The prefetch is fire-and-forget; it doesn't delay the
-            // mode hint's appearance or the user's ability to drag.
+            // Warm the browser-tab cache in the background so save
+            // hits fresh data instead of blocking on AppleScript.
             BrowserScripting.prefetchAllBrowsers()
         } else {
             modeHint.hide()
@@ -366,8 +415,11 @@ final class LassoCoordinator {
         // Whenever the selection changes (lasso updates it, or other
         // future paths add to/remove from it), redraw the overlay
         // filtered to windows currently visible on the active Space.
+        // Also rebuild the AX-element cache so `refreshSelectionOverlay`
+        // has fresh AX references to read positions from after cascade.
         selection.onChange = { [weak self] in
             guard let self else { return }
+            self.rebuildAXElementCache()
             self.overlay.setSelectionFrames(self.visibleSelectionFrames())
         }
 

@@ -58,7 +58,7 @@ final class CorralReleaseMenu {
 
     // MARK: - State
 
-    private var panel: ReleasePanel?
+    private var panel: KeyablePanel?
     private var contentView: NSView?
     private var buttonTargets: [ButtonTarget] = []
     private var keyMonitor: Any?
@@ -136,7 +136,7 @@ final class CorralReleaseMenu {
         }
         self.contentView = content
 
-        let panel = ReleasePanel(
+        let panel = KeyablePanel(
             contentRect: content.bounds,
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
@@ -161,7 +161,7 @@ final class CorralReleaseMenu {
         self.panel = panel
 
         rebuildContent()
-        positionAtCenter(panel: panel)
+        centerCorralPanel(panel)
 
         panel.alphaValue = 0
         panel.makeKeyAndOrderFront(nil)
@@ -365,23 +365,6 @@ final class CorralReleaseMenu {
 
     // MARK: - Positioning
 
-    private func positionAtCenter(panel: NSPanel) {
-        guard let screen = activeScreen() else { return }
-        let visible = screen.visibleFrame
-        let size = panel.frame.size
-        let x = visible.midX - size.width / 2
-        let y = visible.midY - size.height / 2 + visible.height * 0.08
-        panel.setFrameOrigin(NSPoint(x: x, y: y))
-    }
-
-    private func activeScreen() -> NSScreen? {
-        let mouse = NSEvent.mouseLocation
-        if let s = NSScreen.screens.first(where: { $0.frame.contains(mouse) }) {
-            return s
-        }
-        return NSScreen.main ?? NSScreen.screens.first
-    }
-
     // MARK: - Escape handling
 
     /// Local NSEvent monitor so Escape closes the menu while our
@@ -411,23 +394,7 @@ final class CorralReleaseMenu {
     }
 }
 
-// MARK: - Panel + target helpers
-
-/// NSPanel subclass that accepts keyboard focus — required so the
-/// local Escape monitor observes key events while the menu is up.
-private final class ReleasePanel: NSPanel {
-    override var canBecomeKey: Bool { true }
-    override var canBecomeMain: Bool { true }
-}
-
-/// @objc bridge for NSButton target/action → Swift closure. Same
-/// pattern as CorralNamePill.SaveButtonTarget — keeps the closure
-/// alive for the button's lifetime and dispatches on click.
-private final class ButtonTarget: NSObject {
-    private let action: () -> Void
-    init(action: @escaping () -> Void) { self.action = action }
-    @objc func fire(_ sender: Any) { action() }
-}
+// MARK: - Row helpers
 
 /// Row container that handles mouseDown directly and fires
 /// `onClick`. Used instead of a full-row transparent NSButton

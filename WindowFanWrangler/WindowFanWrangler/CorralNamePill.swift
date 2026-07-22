@@ -46,10 +46,10 @@ final class CorralNamePill {
 
     // MARK: - State
 
-    private var panel: NamePillPanel?
+    private var panel: KeyablePanel?
     private var textField: NSTextField?
     private var delegate: TextFieldDelegate?
-    private var buttonTarget: SaveButtonTarget?
+    private var buttonTarget: ButtonTarget?
 
     /// Guards onSubmit/onCancel against being called twice — e.g.
     /// if the user hits Return AND focus loss fires in quick
@@ -85,7 +85,7 @@ final class CorralNamePill {
         // click through the same handler Return uses, so both paths
         // produce identical behavior including the immediate
         // pill-dismiss animation.
-        let target = SaveButtonTarget { [weak self] in
+        let target = ButtonTarget { [weak self] in
             guard let field = self?.textField else { return }
             let trimmed = field.stringValue
                 .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -93,10 +93,10 @@ final class CorralNamePill {
             self?.handleSubmit(text: trimmed)
         }
         saveButton.target = target
-        saveButton.action = #selector(SaveButtonTarget.fire(_:))
+        saveButton.action = #selector(ButtonTarget.fire(_:))
         self.buttonTarget = target
 
-        positionAtCenter(panel: panel)
+        centerCorralPanel(panel)
 
         panel.alphaValue = 0
         panel.makeKeyAndOrderFront(nil)
@@ -133,24 +133,10 @@ final class CorralNamePill {
 
     // MARK: - Handlers
 
-    /// On submit we tear the pill down INSTANTLY — no fade — then
-    /// defer the save work by one runloop tick. Why no fade:
-    ///
-    /// The next thing that happens after submit is either the
-    /// "Replace 'NAME'?" alert (on a name collision) or the
-    /// success toast. Both appear centered on the same screen the
-    /// pill was on. If the pill were still on-screen mid-fade
-    /// (even at 30% alpha), it would sit on top of where the
-    /// alert wants to open and intercept the click on Replace —
-    /// which is exactly the symptom the user hit. `orderOut`
-    /// removes the panel from the window server IMMEDIATELY, so
-    /// by the time the alert appears there's nothing left to
-    /// steal its clicks.
-    ///
-    /// The defer via `DispatchQueue.main.async` still matters —
-    /// it lets the runloop drain the orderOut before we block on
-    /// the ~500ms capture, so the user sees the pill vanish
-    /// before we're busy.
+    /// `orderOut` immediately (no fade) so a mid-fade pill can't
+    /// intercept clicks on the follow-up alert. Defer the save by
+    /// one runloop tick so the user sees the pill vanish before
+    /// captureMembers blocks main.
     private func handleSubmit(text: String) {
         guard !didFinish else { return }
         didFinish = true
@@ -274,8 +260,8 @@ final class CorralNamePill {
         return field
     }
 
-    private func makePanel(contentView: NSView) -> NamePillPanel {
-        let panel = NamePillPanel(
+    private func makePanel(contentView: NSView) -> KeyablePanel {
+        let panel = KeyablePanel(
             contentRect: contentView.bounds,
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
@@ -300,47 +286,6 @@ final class CorralNamePill {
         return panel
     }
 
-    // MARK: - Positioning
-
-    private func positionAtCenter(panel: NSPanel) {
-        guard let screen = activeScreen() else { return }
-        let visible = screen.visibleFrame
-        let size = panel.frame.size
-        let x = visible.midX - size.width / 2
-        // Slightly above vertical center — reads better than dead
-        // middle (matches macOS's own "type to search" affordance).
-        let y = visible.midY - size.height / 2 + visible.height * 0.08
-        panel.setFrameOrigin(NSPoint(x: x, y: y))
-    }
-
-    private func activeScreen() -> NSScreen? {
-        let mouse = NSEvent.mouseLocation
-        if let s = NSScreen.screens.first(where: { $0.frame.contains(mouse) }) {
-            return s
-        }
-        return NSScreen.main ?? NSScreen.screens.first
-    }
-}
-
-// MARK: - Key-accepting panel subclass
-
-/// NSPanel with `.borderless` doesn't accept keyboard focus by
-/// default. Overriding `canBecomeKey` (and `canBecomeMain` for
-/// belt-and-suspenders) enables the text field inside to receive
-/// keystrokes when `makeKeyAndOrderFront` is called.
-private final class NamePillPanel: NSPanel {
-    override var canBecomeKey: Bool { true }
-    override var canBecomeMain: Bool { true }
-}
-
-/// Small `NSObject` shell that routes an NSButton click into a
-/// Swift closure. NSButton needs an `@objc` target/action pair; the
-/// pill's state is held on a non-@objc Swift class, so this bridge
-/// keeps the closure alive and dispatches on click.
-private final class SaveButtonTarget: NSObject {
-    private let action: () -> Void
-    init(action: @escaping () -> Void) { self.action = action }
-    @objc func fire(_ sender: Any) { action() }
 }
 
 /// NSTextFieldCell that draws its interior in a rectangle vertically

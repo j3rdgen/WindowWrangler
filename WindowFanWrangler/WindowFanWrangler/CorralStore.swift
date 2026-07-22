@@ -153,24 +153,6 @@ final class CorralStore {
         Log.corral.info("Deleted corral id \(id.uuidString, privacy: .public)")
     }
 
-    /// Renames the corral with the given id. No-op if not found.
-    /// Doesn't validate the new name against collisions — that check
-    /// belongs in the UI layer (rename prompt) since it needs to
-    /// interact with the user.
-    func rename(id: UUID, to newName: String) {
-        guard let idx = corrals.firstIndex(where: { $0.id == id }) else {
-            Log.corral.error(
-                "Rename failed — no corral with id \(id.uuidString, privacy: .public)"
-            )
-            return
-        }
-        corrals[idx] = corrals[idx].withRenamed(newName)
-        persist()
-        Log.corral.info(
-            "Renamed corral \(id.uuidString, privacy: .public) to '\(newName, privacy: .public)'"
-        )
-    }
-
     // MARK: - Lookup
 
     /// Case-insensitive lookup by exact name. Used by the save flow

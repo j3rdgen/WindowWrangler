@@ -35,17 +35,6 @@ final class GlobalEventMonitor {
     /// While false, mouse events pass through untouched.
     var isLassoModeActive: Bool = false
 
-    /// While `true`, the tap passes every mouse event through
-    /// unchanged even when `isLassoModeActive` is on. Used by the
-    /// Corral save (and future release) flows: the user is still
-    /// logically in lasso mode, but the name pill / release menu /
-    /// any NSAlert we display next needs clicks to reach it —
-    /// without this, consumption would swallow the OK-button click
-    /// on an alert or the text-field focus click on the pill and
-    /// leave them permanently unresponsive. Suspend on flow start,
-    /// resume on flow end.
-    var isConsumptionSuspended: Bool = false
-
     // MARK: - Callbacks
 
     /// Mouse-down location in Cocoa global coords. Only fires while
@@ -129,23 +118,15 @@ final class GlobalEventMonitor {
         )
     }
 
-    /// Enables/disables the CGEventTap. Called by LassoCoordinator
-    /// when lasso mode toggles on/off. When disabled, macOS routes
-    /// left-mouse events directly to their targets without touching
-    /// our callback — no chance for us to accidentally consume or
-    /// slow-process an event.
-    ///
-    /// Safe to call before `start()` (no-op if the tap hasn't been
-    /// created yet) and idempotent (macOS handles repeated
-    /// enable-true / enable-false calls cleanly).
+    /// Enables/disables the CGEventTap. Safe before `start()`
+    /// (no-op if the tap isn't created yet).
     func setTapActive(_ active: Bool) {
         guard let tap = eventTap else { return }
         CGEvent.tapEnable(tap: tap, enable: active)
         if !active {
-            // Reset drag state on disable so a partial drag (e.g.,
-            // user toggled off mid-lasso) can't leave dragInProgress
-            // stuck true and consume the next up/dragged pair when
-            // the tap gets re-enabled later.
+            // Reset partial drag state so a toggle-off mid-lasso
+            // doesn't leave dragInProgress stuck true for the next
+            // enable.
             dragInProgress = false
         }
         Log.lasso.info(
@@ -202,13 +183,9 @@ final class GlobalEventMonitor {
 
         let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
         CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
-        // Create the tap DISABLED. It gets enabled only when lasso
-        // mode turns on (via `setTapActive(true)`) and immediately
-        // disabled when lasso turns off. This keeps our left-mouse
-        // interception out of the system-wide event flow the 99% of
-        // the time the user isn't actively lassoing — a defensive
-        // measure against the class of "background app somehow
-        // freezes all clicks" failures that plague CGEventTap users.
+        // Created disabled; enabled only while lasso mode is on (see
+        // `setTapActive`). Keeps left-mouse interception out of the
+        // system-wide event flow when the user isn't lassoing.
         CGEvent.tapEnable(tap: tap, enable: false)
 
         eventTap = tap
@@ -254,43 +231,17 @@ final class GlobalEventMonitor {
             return Unmanaged.passUnretained(event)
         }
 
-        // Consumption suspended (a corral pill / release menu / alert
-        // is on-screen and needs clicks). Pass every event through
-        // unchanged even if `isLassoModeActive` is still true — the
-        // user is logically still in lasso mode and the mode hint is
-        // still visible; we just can't eat the clicks that need to
-        // reach our own modal UI.
-        if isConsumptionSuspended {
-            return Unmanaged.passUnretained(event)
-        }
-
-        // Cocoa-global coords (bottom-left origin) — matches what the
-        // earlier NSEvent.locationInWindow path produced, so downstream
-        // code (overlay, hit-test) doesn't need to change.
         let location = locationInCocoaCoords(event)
 
-        // Menu bar exception. Any click on the macOS menu bar
-        // (including our own status-item icon and other apps' menu-bar
-        // items) must be passed through unchanged even during lasso
-        // mode. Consuming these would make the menu bar
-        // uninteractable while lasso is on — the user couldn't open
-        // our own dropdown, click a wifi/battery/clock icon, or reach
-        // any other menu-bar utility. `y > visibleFrame.maxY` is the
-        // Cocoa-space test for "above the visible area", which is
-        // where the menu bar sits.
+        // Menu bar clicks: pass through so the user can still open
+        // menu-bar apps (ours + system utilities) during lasso.
         if let screen = NSScreen.screens.first, location.y > screen.visibleFrame.maxY {
             return Unmanaged.passUnretained(event)
         }
 
-        // Our-own-interactive-windows exception. If the click lands on
-        // one of our app's visible windows that WANT mouse events (name
-        // pill, release menu, an NSAlert, the corner-× on the release
-        // menu — anything we present as a modal-ish UI), pass the
-        // click through so the user can interact with it while lasso
-        // mode is still on. Transparent overlays (SelectionOverlay,
-        // LassoModeHint) have `ignoresMouseEvents = true` and are
-        // filtered out by the guard, so clicks over them still get
-        // consumed for lasso as intended.
+        // Clicks on our own interactive windows (name pill, release
+        // menu, NSAlerts): pass through. Transparent overlays are
+        // filtered out via `ignoresMouseEvents`.
         for window in NSApp.windows where window.isVisible && !window.ignoresMouseEvents {
             if window.frame.contains(location) {
                 return Unmanaged.passUnretained(event)

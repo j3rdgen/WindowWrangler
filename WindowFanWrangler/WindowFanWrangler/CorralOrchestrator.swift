@@ -38,15 +38,6 @@ final class CorralOrchestrator {
     private let selection: WindowSelection
     private let isTrusted: () -> Bool
 
-    /// Pauses/resumes the lasso mouse-event consumption while any
-    /// Corral flow is on-screen. Without this, lasso mode's CGEventTap
-    /// swallows clicks meant for the name pill, the "Replace 'NAME'?"
-    /// alert, or the "no windows selected" alert — leaving those
-    /// modal surfaces permanently unresponsive if the user triggered
-    /// the flow with lasso mode on (which is the default path).
-    private let suspendMouseCapture: () -> Void
-    private let resumeMouseCapture: () -> Void
-
     // MARK: - State
 
     /// Retains the pill while it's on-screen; released when
@@ -65,23 +56,14 @@ final class CorralOrchestrator {
     /// Retains the release menu while it's on-screen.
     private var releaseMenu: CorralReleaseMenu?
 
-    /// True while any part of the save flow is on-screen (pill or an
-    /// alert). Used to make suspend/resume idempotent — repeated
-    /// calls during a single flow don't stack.
-    private var isFlowActive: Bool = false
-
     init(
         store: CorralStore,
         selection: WindowSelection,
-        isTrusted: @escaping () -> Bool,
-        suspendMouseCapture: @escaping () -> Void,
-        resumeMouseCapture: @escaping () -> Void
+        isTrusted: @escaping () -> Bool
     ) {
         self.store = store
         self.selection = selection
         self.isTrusted = isTrusted
-        self.suspendMouseCapture = suspendMouseCapture
-        self.resumeMouseCapture = resumeMouseCapture
     }
 
     // MARK: - Public entry point
@@ -93,17 +75,11 @@ final class CorralOrchestrator {
     func beginSave() {
         Log.corral.notice("beginSave requested")
 
-        // Suspend lasso mouse-consumption FIRST so any preflight
-        // alert we show below can actually be clicked. Every exit
-        // path in this method must resume before returning.
-        beginFlow()
-
         guard isTrusted() else {
             showAlert(
                 title: "Accessibility permission required",
                 message: "Grant Window Wrangler access to Accessibility in System Settings, then try again."
             )
-            endFlow()
             return
         }
 
@@ -112,7 +88,6 @@ final class CorralOrchestrator {
                 title: "No windows selected",
                 message: "Turn on Lasso Mode with ⌃⌥⌘C, drag to select windows, then press ⌃⌥⌘S to save them as a group."
             )
-            endFlow()
             return
         }
 
@@ -121,37 +96,13 @@ final class CorralOrchestrator {
                 title: "Group limit reached",
                 message: "You have \(CorralStore.maxCorrals) saved groups. Delete one before creating a new one."
             )
-            endFlow()
             return
         }
 
         // Snapshot the ordered selection now so a stray click during
-        // name entry can't mutate what we're about to save. Selection
-        // itself remains as-is; we just close over this frozen copy.
+        // name entry can't mutate what we're about to save.
         let frozenSelection = selection.ordered
         presentNamePill(frozenSelection: frozenSelection)
-        // Note: endFlow() is called from the pill's onSubmit /
-        // onCancel closures, not here — the flow stays active
-        // until the user finishes with the pill.
-    }
-
-    /// Marks the flow as active and suspends mouse-consumption
-    /// once per flow. Repeated calls within a single flow are safe
-    /// no-ops thanks to the `isFlowActive` guard — even if we route
-    /// through multiple alerts and callbacks.
-    private func beginFlow() {
-        guard !isFlowActive else { return }
-        isFlowActive = true
-        suspendMouseCapture()
-    }
-
-    /// Marks the flow inactive and resumes mouse-consumption. No-op
-    /// if we weren't in a flow (defensive; a stray call shouldn't
-    /// erroneously toggle consumption for lasso mode).
-    private func endFlow() {
-        guard isFlowActive else { return }
-        isFlowActive = false
-        resumeMouseCapture()
     }
 
     // MARK: - Name entry
@@ -161,12 +112,10 @@ final class CorralOrchestrator {
         pill.onSubmit = { [weak self] name in
             self?.namePill = nil
             self?.completeSave(name: name, frozenSelection: frozenSelection)
-            self?.endFlow()
         }
         pill.onCancel = { [weak self] in
             self?.namePill = nil
             Log.corral.info("Save cancelled by user")
-            self?.endFlow()
         }
         namePill = pill
         pill.present()
@@ -310,15 +259,6 @@ final class CorralOrchestrator {
             return
         }
 
-        // Deliberately NOT calling beginFlow() here — the release menu
-        // should coexist with lasso mode, per user request. The
-        // event-tap's window-frame exception (in GlobalEventMonitor)
-        // already routes clicks that land on our modal windows
-        // (including this menu) through to Cocoa, while clicks
-        // elsewhere on screen are still consumed for lasso. Result:
-        // the user can browse the release menu AND lasso-select
-        // windows in the background at the same time.
-
         let menu = CorralReleaseMenu()
         menu.onSelect = { [weak self] corral in
             self?.releaseMenu = nil
@@ -442,10 +382,7 @@ final class CorralOrchestrator {
                 // we invoke depends on the app — some apps don't
                 // respond to `open -b <bundle>` on a running instance
                 // and need extra arguments to create a window.
-                openAppForRestore(
-                    bundleID: bundleID,
-                    membersOfBundle: membersOfBundle
-                )
+                openAppForRestore(bundleID: bundleID)
                 needsWait = true
             }
         }
@@ -487,14 +424,9 @@ final class CorralOrchestrator {
         var missing: [String] = []
         var axCache: [pid_t: [EnumeratedWindow]] = [:]
 
-        // For each browser bundle in this corral, decide once whether
-        // the URL-overlap snapshot is worth running. If the browser
-        // has zero visible windows now, there's nothing to reuse — we
-        // skip the snapshot for every member of that bundle. Even
-        // once we've started creating new windows via AppleScript,
-        // subsequent members shouldn't try to reuse those (they're
-        // ours, not user-owned pre-existing windows), so the
-        // "empty at start" decision stays sticky per restore session.
+        // Per bundle: decide once whether the URL-overlap snapshot is
+        // worth running. Sticky across the restore so subsequent
+        // members don't try to reuse a window we just created.
         var browserStartedEmpty: [String: Bool] = [:]
         for member in ordered where member.tabs != nil && !(member.tabs?.isEmpty ?? true) {
             if browserStartedEmpty[member.appBundleID] == nil {
@@ -647,13 +579,8 @@ final class CorralOrchestrator {
     ) -> BrowserRestoreResult {
         let targetBoundsAX = CoordinateSpace.axRect(fromCocoa: member.frame)
 
-        // When the browser had zero visible windows at restore start,
-        // there's nothing to reuse — every member goes straight to
-        // openBrowserWindow. Skipping the snapshot saves ~1s per
-        // member of walking Chrome's hidden helper windows, and also
-        // avoids the 5s timeout that fires on the Nth member when the
-        // N-1 windows we just created have grown the snapshot pool
-        // past what Chrome can enumerate under the timeout.
+        // Browser started empty → nothing to reuse, skip the snapshot
+        // (saves ~1s per member of walking Chrome's helper windows).
         if skipOverlapCheck {
             Log.corral.info("  browser: skipping URL-overlap snapshot (browser started empty)")
         } else if let snapshots = BrowserScripting.snapshotBrowserWindows(bundleID: member.appBundleID) {
@@ -711,37 +638,21 @@ final class CorralOrchestrator {
     }
 
     /// Dispatches to the right `/usr/bin/open` invocation for the
-    /// given bundle. Most non-browser apps (Notes, Podcasts, Slack,
-    /// Discord, etc.) accept plain `open -b <bundle>` and use their
-    /// own `applicationShouldHandleReopen` handler to create a
-    /// default window. But some are quirky:
+    /// given bundle. Most apps get plain `open -b <bundle>` and
+    /// respond via `applicationShouldHandleReopen`. Finder is the one
+    /// exception — it always "has" the Desktop pseudo-window, so
+    /// reopen doesn't fire; we open a folder path (home) instead.
     ///
-    /// - **Browsers** (Chrome + family, Safari): `open -b <bundle>`
-    ///   on a running instance doesn't produce a window. We pass
-    ///   URLs — the saved tab list if we have one, otherwise
-    ///   `about:blank` — via `open -b <bundle> URL1 URL2 …`. The
-    ///   URLs land as tabs in a fresh window, matching user intent.
-    ///
-    /// - **Finder**: `applicationShouldHandleReopen` doesn't trigger
-    ///   for Finder because it always "has" the Desktop pseudo-
-    ///   window (which we filter). Open a folder path (home) so a
-    ///   real Finder browser window appears.
-    private func openAppForRestore(
-        bundleID: String,
-        membersOfBundle: [CorralMember]
-    ) {
-        // If this bundle already has visible windows, don't `open`
-        // it — the app's fine, we'll just find and reposition its
-        // existing window in the execute step. Skipping here prevents
-        // two real bugs:
-        //   1. Chrome window multiplication: each `open -b Chrome
-        //      about:blank` on a Chrome that already has windows
-        //      creates a NEW window, so 3 rapid releases produced
-        //      6 windows piled on top of each other.
-        //   2. Rapid-fire re-releases (user double-clicks the corral):
-        //      the second `open -b <bundle>` fires while the first is
-        //      still processing; macOS silently drops the second, and
-        //      the app that was reopening gets confused.
+    /// Browsers deliberately also get plain `open -b` here — the
+    /// per-member `openChromiumWindowScript` in `restoreBrowserMember`
+    /// creates windows with correct per-window tab lists via
+    /// AppleScript. Passing URLs at this layer previously caused
+    /// Chrome to collapse every saved member's tabs into a single
+    /// merged window layered on top of the correct ones.
+    private func openAppForRestore(bundleID: String) {
+        // Skip if the app already has visible windows — the execute
+        // step will find and reposition them. Prevents Chrome window
+        // multiplication and race issues on rapid re-releases.
         if hasVisibleWindow(bundleID: bundleID) {
             Log.corral.info(
                 "Restore prep: \(bundleID, privacy: .public) already has visible window(s) — skipping open"
@@ -752,41 +663,16 @@ final class CorralOrchestrator {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
 
-        if BrowserScripting.isSupportedBrowser(bundleID: bundleID) {
-            // Browsers: launch/activate WITHOUT URLs. Passing URLs
-            // here caused Chrome to collapse every tab from every
-            // saved member into a single merged window, which then
-            // sat on top of the per-member windows that
-            // restoreBrowserMember's openChromiumWindowScript creates
-            // (via `activate` + `make new window`) with the correct
-            // per-window tab lists. Result was N+1 Chrome windows
-            // instead of N.
-            //
-            // For running-windowless Chrome (`open -b` alone doesn't
-            // create a window), openChromiumWindowScript's `activate`
-            // + `make new window` still creates the correct windows.
-            // For not-running Chrome, `open -b` launches it (Chrome
-            // may create its default window); the per-member AppleScript
-            // then adds ours. Users see the default window as one extra
-            // — acceptable trade-off vs. the merged-tabs bug.
-            _ = membersOfBundle  // tabs are handled per-member downstream
-            process.arguments = ["-b", bundleID]
-            Log.corral.info(
-                "Restore prep: /usr/bin/open -b \(bundleID, privacy: .public) (browser — tabs handled per-member downstream)"
-            )
-        } else if bundleID == "com.apple.finder" {
-            // Finder: needs a folder path to create a real window
-            // (the Desktop backdrop doesn't count).
+        if bundleID == "com.apple.finder" {
             let homePath = NSString(string: "~").expandingTildeInPath
             process.arguments = [homePath]
             Log.corral.info(
                 "Restore prep: /usr/bin/open \(homePath, privacy: .public) (Finder home)"
             )
         } else {
-            // Default: reopen-hook path for well-behaved apps.
             process.arguments = ["-b", bundleID]
             Log.corral.info(
-                "Restore prep: /usr/bin/open -b \(bundleID, privacy: .public) (default reopen)"
+                "Restore prep: /usr/bin/open -b \(bundleID, privacy: .public)"
             )
         }
 
@@ -796,38 +682,6 @@ final class CorralOrchestrator {
             Log.corral.error(
                 "Failed to spawn open for \(bundleID, privacy: .public): \(error.localizedDescription, privacy: .public)"
             )
-        }
-    }
-
-    /// Shows a one-time-per-session alert when a browser's snapshot
-    /// script silently returns empty. Explains what's happening (TCC
-    /// grant is stale) and points the user at the manual toggle in
-    /// System Settings — the only reliable way to reset it, since
-    /// `tccutil reset` has been observed to freeze macOS.
-    private func notifyBrowserScriptingBrokenOnce(bundleID: String) {
-        guard !scriptingFailureNotified.contains(bundleID) else { return }
-        scriptingFailureNotified.insert(bundleID)
-
-        let appName = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID)
-            .flatMap { Bundle(url: $0)?.infoDictionary?["CFBundleName"] as? String } ?? bundleID
-        Log.corral.notice(
-            "Browser scripting broken for \(bundleID, privacy: .public) — showing settings alert"
-        )
-        let alert = NSAlert()
-        alert.messageText = "Can't read tabs from \(appName)"
-        alert.informativeText = """
-            Window Wrangler asked macOS for permission to control \(appName), and macOS says the permission is granted — but the actual scripting call returns nothing. This usually means \(appName)'s Automation entry got into a stale state from a previous version of the app.
-
-            To reset it: open System Settings > Privacy & Security > Automation, find Window Wrangler, and toggle \(appName) off and back on. Then try saving again.
-
-            (Corrals will still save the \(appName) window's position — you just won't get the tab list back on restore.)
-            """
-        alert.alertStyle = .informational
-        alert.addButton(withTitle: "Open System Settings")
-        alert.addButton(withTitle: "Later")
-        NSApp.activate(ignoringOtherApps: true)
-        if alert.runModal() == .alertFirstButtonReturn {
-            AutomationPermission.openSystemSettings()
         }
     }
 
@@ -927,7 +781,6 @@ final class CorralOrchestrator {
     /// AppleScript round-trip.
     private func captureMembers(from windows: [VisibleWindow]) -> [CorralMember] {
         var axCache: [pid_t: [EnumeratedWindow]] = [:]
-        var browserCache: [String: [BrowserScripting.BrowserWindowSnapshot]?] = [:]
         var members: [CorralMember] = []
 
         for (idx, win) in windows.enumerated() {
@@ -943,8 +796,7 @@ final class CorralOrchestrator {
 
             let tabs = tabsForBrowserWindow(
                 bundleID: bundleID,
-                cocoaFrame: win.frame,
-                cache: &browserCache
+                cocoaFrame: win.frame
             )
 
             // Document path (for documents-based apps). Read from AX
@@ -970,52 +822,13 @@ final class CorralOrchestrator {
         return members
     }
 
-    /// Reads `kAXDocumentAttribute` for the AX element whose frame
-    /// matches this visible window. Returns a POSIX file path if the
-    /// attribute is available and parses as a file URL; nil for apps
-    /// that don't expose it (Messages, Discord, Notes' bespoke object
-    /// model, Finder browser windows, etc.).
-    private func resolveDocumentPath(
+    /// Returns the AX element whose frame matches this visible
+    /// window. Enumerates the owning app's AX windows once per PID
+    /// (cached in `axCache`) and matches by frame within 4pt.
+    private func axElement(
         for window: VisibleWindow,
         axCache: inout [pid_t: [EnumeratedWindow]]
-    ) -> String? {
-        let axWindows: [EnumeratedWindow]
-        if let cached = axCache[window.ownerPID] {
-            axWindows = cached
-        } else if let app = NSRunningApplication(processIdentifier: window.ownerPID) {
-            axWindows = AXWindowEnumerator.windows(of: app)
-            axCache[window.ownerPID] = axWindows
-        } else {
-            return nil
-        }
-        guard let matched = axWindows.first(where: {
-            Self.framesMatch($0.frame, window.frame, tolerance: 4)
-        }) else {
-            return nil
-        }
-        var value: CFTypeRef?
-        let result = AXUIElementCopyAttributeValue(
-            matched.axElement,
-            kAXDocumentAttribute as CFString,
-            &value
-        )
-        guard result == .success, let str = value as? String else { return nil }
-        // kAXDocumentAttribute typically returns a file URL string
-        // like "file:///Users/jmw3/Desktop/foo.txt". Convert to a
-        // POSIX path so restore can pass it directly to
-        // NSWorkspace.open without needing another URL parse.
-        if let url = URL(string: str), url.isFileURL {
-            return url.path
-        }
-        return nil
-    }
-
-    /// Resolves the window's title via AX. Enumerates the owning
-    /// app's AX windows once per PID and matches by frame.
-    private func resolveTitle(
-        for window: VisibleWindow,
-        axCache: inout [pid_t: [EnumeratedWindow]]
-    ) -> String {
+    ) -> AXUIElement? {
         let axWindows: [EnumeratedWindow]
         if let cached = axCache[window.ownerPID] {
             axWindows = cached
@@ -1024,16 +837,44 @@ final class CorralOrchestrator {
             axCache[window.ownerPID] = axWindows
         } else {
             axCache[window.ownerPID] = []
-            return ""
+            return nil
         }
-        guard let matched = axWindows.first(where: {
+        return axWindows.first(where: {
             Self.framesMatch($0.frame, window.frame, tolerance: 4)
-        }) else {
-            return ""
+        })?.axElement
+    }
+
+    /// Reads `kAXDocumentAttribute` and returns a POSIX file path if
+    /// the attribute is present and parses as a file URL. Nil for apps
+    /// that don't expose it (Messages, Discord, Notes' bespoke object
+    /// model, Finder browser windows, etc.).
+    private func resolveDocumentPath(
+        for window: VisibleWindow,
+        axCache: inout [pid_t: [EnumeratedWindow]]
+    ) -> String? {
+        guard let element = axElement(for: window, axCache: &axCache) else { return nil }
+        var value: CFTypeRef?
+        let result = AXUIElementCopyAttributeValue(
+            element,
+            kAXDocumentAttribute as CFString,
+            &value
+        )
+        guard result == .success, let str = value as? String else { return nil }
+        if let url = URL(string: str), url.isFileURL {
+            return url.path
         }
+        return nil
+    }
+
+    /// Resolves the window's title via AX.
+    private func resolveTitle(
+        for window: VisibleWindow,
+        axCache: inout [pid_t: [EnumeratedWindow]]
+    ) -> String {
+        guard let element = axElement(for: window, axCache: &axCache) else { return "" }
         var titleValue: CFTypeRef?
         let result = AXUIElementCopyAttributeValue(
-            matched.axElement,
+            element,
             kAXTitleAttribute as CFString,
             &titleValue
         )
@@ -1041,32 +882,14 @@ final class CorralOrchestrator {
         return title
     }
 
-    /// Tracks browser bundles whose scripting appears broken this
-    /// session (permission granted but AppleScript returns empty).
-    /// We show an actionable alert once per bundle so users know to
-    /// reset Automation for that browser in System Settings — not
-    /// every save (which would be spammy).
-    private var scriptingFailureNotified: Set<String> = []
-
-    /// If the app is a supported browser, snapshots all its windows
-    /// (once, cached) and returns the tab list for the window whose
-    /// bounds match the given Cocoa frame. Returns nil for non-browsers
-    /// and for browsers where either scripting isn't authorized or
-    /// no window matches the frame.
+    /// Returns tabs for the browser window whose bounds match
+    /// `cocoaFrame` (targeted whose-filter → per-window fetch).
+    /// Nil for non-browsers or when no window matches.
     private func tabsForBrowserWindow(
         bundleID: String,
-        cocoaFrame: CGRect,
-        cache: inout [String: [BrowserScripting.BrowserWindowSnapshot]?]
+        cocoaFrame: CGRect
     ) -> [TabInfo]? {
         guard BrowserScripting.isSupportedBrowser(bundleID: bundleID) else { return nil }
-        _ = cache  // full-snapshot cache no longer used at save time
-
-        // Targeted snapshot: bounds-only enumeration (fast, no per-
-        // window tab access on the browser's hidden helper windows)
-        // → find best-matching window → tabs-for-that-window only.
-        // Replaces the "one big walk-every-window-and-every-tab
-        // script" approach that Chrome silently returned "" from
-        // when the user had 30+ Chrome windows.
         let targetAX = CoordinateSpace.axRect(fromCocoa: cocoaFrame)
         guard let match = BrowserScripting.snapshotBrowserWindowNearFrame(
             bundleID: bundleID,
@@ -1117,17 +940,10 @@ final class CorralOrchestrator {
         return response == .alertFirstButtonReturn
     }
 
-    /// Generic informational alert for preflight failures. Modal
-    /// because the user's next action should be an acknowledgment,
-    /// not a keystroke consumed by something else.
-    ///
-    /// Suspends the CGEventTap around the modal so the alert is
-    /// clickable during lasso mode — without this, our tap consumes
-    /// the click on the "OK" button and the user has to keyboard-
-    /// dismiss with Return / Escape.
+    /// Generic informational alert for preflight failures. The event
+    /// tap's window-frame exception routes clicks on this alert
+    /// through to Cocoa even while lasso is on.
     private func showAlert(title: String, message: String) {
-        suspendMouseCapture()
-        defer { resumeMouseCapture() }
         let alert = NSAlert()
         alert.messageText = title
         alert.informativeText = message
