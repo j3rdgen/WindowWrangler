@@ -136,6 +136,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
             self?.rebuildMenu()
         }
 
+        // Menu must also rebuild whenever the corral list changes
+        // (save / overwrite / delete / rename) so the "Release ▸"
+        // submenu stays fresh — same pattern as the snapshot hook.
+        corralStore.onChange = { [weak self] in
+            self?.rebuildMenu()
+        }
+
         startPermissionMonitoring()
         startActiveAppTracking()
         cascadeOrchestrator.warmUpAccessibility()
@@ -476,7 +483,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
             isTrusted: isTrusted,
             lassoModeActive: lassoCoordinator.isLassoModeActive,
             selectionCount: windowSelection.count,
-            hasSnapshot: cascadeOrchestrator.hasSnapshot
+            hasSnapshot: cascadeOrchestrator.hasSnapshot,
+            corrals: corralStore.corrals,
+            corralsAtCap: corralStore.isAtCap
         )
         statusItem?.menu = MenuBuilder.build(state: state, target: self)
     }
@@ -545,6 +554,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
         // immediately. The actual restore work only runs after the
         // user picks a corral from the menu.
         corralOrchestrator.beginRelease()
+    }
+
+    /// Menu bar "Release ▸" submenu callback. The sender is the
+    /// NSMenuItem whose `representedObject` carries the corral's UUID.
+    @objc func restoreCorralFromMenu(_ sender: Any) {
+        guard let item = sender as? NSMenuItem,
+              let id = item.representedObject as? UUID else {
+            Log.corral.error("restoreCorralFromMenu: sender missing UUID representedObject")
+            return
+        }
+        corralOrchestrator.restoreCorral(byID: id)
     }
 
     // MARK: - Zombie prevention + clean shutdown

@@ -30,6 +30,15 @@ enum MenuBuilder {
         /// Is there a `lastSnapshot` to restore? Drives the
         /// enable/disable state on the Restore item.
         let hasSnapshot: Bool
+        /// Saved corrals, in insertion order. Populates the
+        /// "Release ▸" submenu; empty list shows a grayed
+        /// "No Saved Corrals" placeholder.
+        let corrals: [Corral]
+        /// True when the store is at its 5-corral cap. The Save item
+        /// remains clickable — the orchestrator handles the cap alert
+        /// itself — but we append a "(5/5)" hint to the title so the
+        /// user knows before clicking.
+        let corralsAtCap: Bool
     }
 
     /// Builds a fresh NSMenu reflecting `state`. Menu items are wired
@@ -72,6 +81,18 @@ enum MenuBuilder {
             modifiers: shortcutModifiers,
             isTrusted: state.isTrusted,
             hasSnapshot: state.hasSnapshot
+        )
+
+        menu.addItem(.separator())
+
+        addCorralSection(
+            to: menu,
+            target: target,
+            modifiers: shortcutModifiers,
+            isTrusted: state.isTrusted,
+            selectionCount: state.selectionCount,
+            corrals: state.corrals,
+            corralsAtCap: state.corralsAtCap
         )
 
         if !state.isTrusted {
@@ -212,6 +233,95 @@ enum MenuBuilder {
         // Enabled only when we have AX permission AND a snapshot to restore.
         restore.isEnabled = isTrusted && hasSnapshot
         menu.addItem(restore)
+    }
+
+    /// Corral (Save + Release) section. Save is the top item; Release
+    /// is a submenu containing one entry per saved corral (clicking
+    /// restores that specific corral directly, no pill needed) plus a
+    /// "Manage Corrals…" item at the bottom that opens the pill for
+    /// delete / management.
+    ///
+    /// Save is enabled only when there's a lasso selection AND
+    /// accessibility is granted — matches the ⌃⌥⌘S shortcut's
+    /// preflight in CorralOrchestrator.beginSave.
+    ///
+    /// Release is always enabled when accessibility is granted (even
+    /// with zero saved corrals, so users can still discover the "no
+    /// saved corrals yet" empty-state message via the pill).
+    private static func addCorralSection(
+        to menu: NSMenu,
+        target: WindowWranglerActions,
+        modifiers: NSEvent.ModifierFlags,
+        isTrusted: Bool,
+        selectionCount: Int,
+        corrals: [Corral],
+        corralsAtCap: Bool
+    ) {
+        // Save — requires selection + not-at-cap for enabling
+        // (orchestrator still handles the cap alert if user forces it).
+        let saveTitle = corralsAtCap
+            ? "Corral (Save Window Group) — (\(corrals.count)/\(CorralStore.maxCorrals) — delete one first)"
+            : "Corral (Save Window Group)"
+        let save = NSMenuItem(
+            title: saveTitle,
+            action: #selector(WindowWranglerActions.corralSave),
+            keyEquivalent: "s"  // ⌃⌥⌘S
+        )
+        save.keyEquivalentModifierMask = modifiers
+        save.target = target
+        save.isEnabled = isTrusted && selectionCount > 0 && !corralsAtCap
+        menu.addItem(save)
+
+        // Release — submenu of saved corrals + "Manage…" pill entry.
+        let release = NSMenuItem(
+            title: "Release (Open Window Group)",
+            action: nil,
+            keyEquivalent: ""
+        )
+        release.isEnabled = isTrusted
+        let submenu = NSMenu()
+        submenu.autoenablesItems = false
+
+        if corrals.isEmpty {
+            let empty = NSMenuItem(
+                title: "No Saved Corrals",
+                action: nil,
+                keyEquivalent: ""
+            )
+            empty.isEnabled = false
+            submenu.addItem(empty)
+        } else {
+            for corral in corrals {
+                let item = NSMenuItem(
+                    title: corral.name,
+                    action: #selector(WindowWranglerActions.restoreCorralFromMenu(_:)),
+                    keyEquivalent: ""
+                )
+                item.target = target
+                item.isEnabled = isTrusted
+                // Pass the UUID through so the action handler knows
+                // which corral to restore — NSMenuItem targets are
+                // Obj-C runtime dispatched and can't take typed args
+                // directly, so representedObject is the standard
+                // out-of-band channel.
+                item.representedObject = corral.id
+                submenu.addItem(item)
+            }
+        }
+
+        submenu.addItem(.separator())
+        let manage = NSMenuItem(
+            title: "Manage Corrals…",
+            action: #selector(WindowWranglerActions.corralRelease),
+            keyEquivalent: "r"  // ⌃⌥⌘R — opens the release pill (delete UI)
+        )
+        manage.keyEquivalentModifierMask = modifiers
+        manage.target = target
+        manage.isEnabled = isTrusted
+        submenu.addItem(manage)
+
+        release.submenu = submenu
+        menu.addItem(release)
     }
 
     private static func addReopenSetupItem(to menu: NSMenu, target: WindowWranglerActions) {

@@ -27,4 +27,8 @@ import AppKit
     @objc func reopenOnboarding()
     @objc func corralSave()
     @objc func corralRelease()
+    /// Restores a specific corral directly from the menu bar
+    /// "Release ▸" submenu. The sender's `representedObject` carries
+    /// the corral's UUID (set by MenuBuilder at build time).
+    @objc func restoreCorralFromMenu(_ sender: Any)
 }

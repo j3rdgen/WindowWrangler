@@ -262,13 +262,13 @@ final class CorralNamePill {
         field.isBordered = false
         field.drawsBackground = false
         field.focusRingType = .none
-        field.font = .systemFont(ofSize: 15, weight: .regular)
+        field.font = .systemFont(ofSize: 16.5, weight: .regular)
         field.textColor = .white
         field.placeholderAttributedString = NSAttributedString(
             string: "Name this window group…",
             attributes: [
                 .foregroundColor: NSColor.white.withAlphaComponent(0.45),
-                .font: NSFont.systemFont(ofSize: 15, weight: .regular),
+                .font: NSFont.systemFont(ofSize: 16.5, weight: .regular),
             ]
         )
         return field
@@ -361,6 +361,44 @@ private final class CenteredTextFieldCell: NSTextFieldCell {
             newRect.origin.y += heightDelta / 2
         }
         return newRect
+    }
+
+    // Route the field-editor's rect through the same centering
+    // adjustment as drawing, so the caret + selected text stay
+    // vertically centered while the user is typing (not just when
+    // the field is idle and the cell is drawing text itself).
+    override func edit(
+        withFrame rect: NSRect,
+        in controlView: NSView,
+        editor textObj: NSText,
+        delegate: Any?,
+        event: NSEvent?
+    ) {
+        super.edit(
+            withFrame: drawingRect(forBounds: rect),
+            in: controlView,
+            editor: textObj,
+            delegate: delegate,
+            event: event
+        )
+    }
+
+    override func select(
+        withFrame rect: NSRect,
+        in controlView: NSView,
+        editor textObj: NSText,
+        delegate: Any?,
+        start selStart: Int,
+        length selLength: Int
+    ) {
+        super.select(
+            withFrame: drawingRect(forBounds: rect),
+            in: controlView,
+            editor: textObj,
+            delegate: delegate,
+            start: selStart,
+            length: selLength
+        )
     }
 }
 

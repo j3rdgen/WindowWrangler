@@ -70,16 +70,56 @@ final class LassoCoordinator {
     /// we redraw whenever the active Space changes so stale outlines
     /// don't linger on a Space where the underlying windows don't live.
     private var activeSpaceObserver: NSObjectProtocol?
+    private var willSleepObserver: NSObjectProtocol?
+    private var sessionInactiveObserver: NSObjectProtocol?
 
     init(selection: WindowSelection) {
         self.selection = selection
         wireEvents()
+        wireIdleSafetyObservers()
     }
 
     deinit {
-        if let token = activeSpaceObserver {
-            NSWorkspace.shared.notificationCenter.removeObserver(token)
+        let center = NSWorkspace.shared.notificationCenter
+        [activeSpaceObserver, willSleepObserver, sessionInactiveObserver]
+            .compactMap { $0 }
+            .forEach { center.removeObserver($0) }
+    }
+
+    /// Belt-and-suspenders safety net for the "left lasso on and
+    /// walked away" scenario. If macOS is about to sleep or the
+    /// session is going inactive (screen lock, fast user switch), we
+    /// force lasso off before that state transition — so our
+    /// CGEventTap can't come back from sleep in an inconsistent state
+    /// where clicks are still being consumed.
+    private func wireIdleSafetyObservers() {
+        let center = NSWorkspace.shared.notificationCenter
+        willSleepObserver = center.addObserver(
+            forName: NSWorkspace.willSleepNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.forceLassoOffIfNeeded(reason: "system will sleep")
+            }
         }
+        sessionInactiveObserver = center.addObserver(
+            forName: NSWorkspace.sessionDidResignActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.forceLassoOffIfNeeded(reason: "session did resign active")
+            }
+        }
+    }
+
+    private func forceLassoOffIfNeeded(reason: String) {
+        guard isLassoModeActive else { return }
+        Log.lasso.notice(
+            "Force-disabling lasso: \(reason, privacy: .public)"
+        )
+        toggleLassoMode()
     }
 
     /// Suspends the CGEventTap's mouse-event consumption without
@@ -104,6 +144,14 @@ final class LassoCoordinator {
     func toggleLassoMode() {
         isLassoModeActive.toggle()
         eventMonitor.isLassoModeActive = isLassoModeActive
+        // Gate the CGEventTap to lasso being active. When lasso is
+        // off, the tap is DISABLED — macOS routes left-mouse events
+        // directly to their targets without our callback ever running.
+        // Eliminates the class of "background app freezes clicks"
+        // failures where an idle-state edge case in our callback
+        // (empty NSScreen.screens, misbehaving NSApp.windows, etc.)
+        // could hose the system-wide click flow.
+        eventMonitor.setTapActive(isLassoModeActive)
         if isLassoModeActive {
             modeHint.show()
             // Prefetch every running browser's tabs in the background

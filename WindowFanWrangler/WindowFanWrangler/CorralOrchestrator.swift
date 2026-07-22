@@ -310,12 +310,18 @@ final class CorralOrchestrator {
             return
         }
 
-        beginFlow()
+        // Deliberately NOT calling beginFlow() here — the release menu
+        // should coexist with lasso mode, per user request. The
+        // event-tap's window-frame exception (in GlobalEventMonitor)
+        // already routes clicks that land on our modal windows
+        // (including this menu) through to Cocoa, while clicks
+        // elsewhere on screen are still consumed for lasso. Result:
+        // the user can browse the release menu AND lasso-select
+        // windows in the background at the same time.
 
         let menu = CorralReleaseMenu()
         menu.onSelect = { [weak self] corral in
             self?.releaseMenu = nil
-            self?.endFlow()
             self?.performRestore(of: corral)
         }
         menu.onDelete = { [weak self] id in
@@ -325,10 +331,42 @@ final class CorralOrchestrator {
         }
         menu.onDismiss = { [weak self] in
             self?.releaseMenu = nil
-            self?.endFlow()
         }
         releaseMenu = menu
         menu.present(corrals: store.corrals)
+    }
+
+    // MARK: - Direct restore (menu bar quick-restore)
+
+    /// Restores a corral by id without opening the release-menu pill.
+    /// Used by the menu bar dropdown's "Release ▸" submenu — clicking
+    /// a corral name there triggers this directly. The pill remains
+    /// the path for delete / management (via ⌃⌥⌘R or the "Manage
+    /// Corrals…" menu item).
+    ///
+    /// Silently no-ops on missing id (corral could have been deleted
+    /// between menu build and click — the menu snapshot is fresh but
+    /// not atomic with the click). Also runs the same accessibility
+    /// preflight as `beginRelease`.
+    func restoreCorral(byID id: UUID) {
+        Log.corral.notice("restoreCorral(byID:) requested — \(id.uuidString, privacy: .public)")
+
+        guard isTrusted() else {
+            showAlert(
+                title: "Accessibility permission required",
+                message: "Grant Window Wrangler access to Accessibility in System Settings, then try again."
+            )
+            return
+        }
+
+        guard let corral = store.corrals.first(where: { $0.id == id }) else {
+            Log.corral.notice(
+                "restoreCorral(byID:) — no corral with id \(id.uuidString, privacy: .public) (likely deleted between menu build and click)"
+            )
+            return
+        }
+
+        performRestore(of: corral)
     }
 
     // MARK: - Restore
@@ -1082,7 +1120,14 @@ final class CorralOrchestrator {
     /// Generic informational alert for preflight failures. Modal
     /// because the user's next action should be an acknowledgment,
     /// not a keystroke consumed by something else.
+    ///
+    /// Suspends the CGEventTap around the modal so the alert is
+    /// clickable during lasso mode — without this, our tap consumes
+    /// the click on the "OK" button and the user has to keyboard-
+    /// dismiss with Return / Escape.
     private func showAlert(title: String, message: String) {
+        suspendMouseCapture()
+        defer { resumeMouseCapture() }
         let alert = NSAlert()
         alert.messageText = title
         alert.informativeText = message

@@ -49,12 +49,12 @@ final class CorralReleaseMenu {
     private let rowSpacing: CGFloat = 6
     private let outerPadding: CGFloat = 12
     private let horizontalPadding: CGFloat = 16
-    private let deleteButtonSize: CGFloat = 24
+    private let deleteButtonSize: CGFloat = 26   // +10% for hit-target
     private let emptyStateHeight: CGFloat = 60
     /// Height of the top strip that holds the menu-level × close
     /// button. Kept small so it doesn't dominate the panel.
-    private let headerHeight: CGFloat = 30
-    private let closeButtonSize: CGFloat = 22
+    private let headerHeight: CGFloat = 32       // +header to fit larger ×
+    private let closeButtonSize: CGFloat = 24    // +10% for hit-target
 
     // MARK: - State
 
@@ -235,7 +235,7 @@ final class CorralReleaseMenu {
         closeButton.title = "×"
         closeButton.bezelStyle = .circular
         closeButton.isBordered = true
-        closeButton.font = .systemFont(ofSize: 13, weight: .bold)
+        closeButton.font = .systemFont(ofSize: 14.5, weight: .bold)  // +10%
         closeButton.contentTintColor = NSColor.white.withAlphaComponent(0.85)
         let target = ButtonTarget { [weak self] in
             self?.dismiss(fireDismiss: true)
@@ -325,7 +325,7 @@ final class CorralReleaseMenu {
         deleteButton.title = "×"
         deleteButton.bezelStyle = .circular
         deleteButton.isBordered = true
-        deleteButton.font = .systemFont(ofSize: 14, weight: .bold)
+        deleteButton.font = .systemFont(ofSize: 15.5, weight: .bold)  // +10%
         deleteButton.contentTintColor = NSColor(
             calibratedRed: 1.0,
             green: 0.45,
