@@ -430,7 +430,7 @@ final class CorralOrchestrator {
         var browserStartedEmpty: [String: Bool] = [:]
         for member in ordered where member.tabs != nil && !(member.tabs?.isEmpty ?? true) {
             if browserStartedEmpty[member.appBundleID] == nil {
-                browserStartedEmpty[member.appBundleID] = !hasVisibleWindow(bundleID: member.appBundleID)
+                browserStartedEmpty[member.appBundleID] = !hasWindowOnCurrentDesktop(bundleID: member.appBundleID)
             }
         }
 
@@ -438,6 +438,16 @@ final class CorralOrchestrator {
             Log.corral.info(
                 "Restore [\(idx + 1, privacy: .public)/\(ordered.count, privacy: .public)] '\(member.appName, privacy: .public)' (\(member.appBundleID, privacy: .public), slot \(member.zOrderIndex, privacy: .public))"
             )
+            // Idempotency: skip if a window with this bundleID is
+            // already at (approximately) the saved frame on the
+            // current Desktop. Prevents the retry pass from creating
+            // duplicate browser windows for members the first pass
+            // already restored.
+            if alreadyAtTarget(member: member) {
+                Log.corral.info("  → already at target — skipping")
+                restoredWithoutAX += 1
+                continue
+            }
             if let tabs = member.tabs, !tabs.isEmpty {
                 let skipOverlap = browserStartedEmpty[member.appBundleID] ?? false
                 let result = restoreBrowserMember(member: member, tabs: tabs, skipOverlapCheck: skipOverlap)
@@ -484,8 +494,18 @@ final class CorralOrchestrator {
         }
 
         enforceRestoreZOrder(restored: restoredForZOrder)
+
+        // Scatter audit: for each restored member, is a window
+        // matching its saved frame actually visible on the CURRENT
+        // Desktop? Windows that got AX-moved on other Desktops
+        // succeeded logically but aren't here for the user. Anything
+        // in `missing` is already accounted for elsewhere, so audit
+        // only the ones we count as restored.
+        let restoredMembers = corral.members.filter { !missing.contains($0.appName) }
+        let scatterCount = countMembersOnOtherDesktops(restoredMembers)
+
         Log.corral.notice(
-            "Restore complete: \(totalRestored, privacy: .public)/\(corral.members.count, privacy: .public) restored, \(missing.count, privacy: .public) missing"
+            "Restore complete: \(totalRestored, privacy: .public)/\(corral.members.count, privacy: .public) restored, \(missing.count, privacy: .public) missing, \(scatterCount, privacy: .public) on other Desktops"
         )
 
         // Take down the "Restoring…" progress toast so it doesn't
@@ -497,8 +517,25 @@ final class CorralOrchestrator {
             name: corral.name,
             restoredCount: totalRestored,
             total: corral.members.count,
-            missing: missing
+            missing: missing,
+            scatterCount: scatterCount
         )
+    }
+
+    /// Counts members whose saved frame doesn't correspond to any
+    /// window currently visible on the current Desktop. Uses
+    /// `CGWindowListOnScreenOnly` (via CrossAppWindowEnumerator)
+    /// which filters to current-Space windows only. Frame proximity
+    /// tolerance is generous (30pt) because some apps clamp the
+    /// requested frame slightly (Chrome's min-width, Notes' aspect
+    /// preferences, etc.).
+    private func countMembersOnOtherDesktops(_ members: [CorralMember]) -> Int {
+        let currentDesktopWindows = CrossAppWindowEnumerator.allVisibleWindows()
+        return members.filter { member in
+            !currentDesktopWindows.contains(where: {
+                Self.framesMatch($0.frame, member.frame, tolerance: 30)
+            })
+        }.count
     }
 
     /// Non-browser lookup. Fetches the owning app's AX windows once
@@ -510,20 +547,31 @@ final class CorralOrchestrator {
         for member: CorralMember,
         axCache: inout [pid_t: [EnumeratedWindow]]
     ) -> AXUIElement? {
-        guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: member.appBundleID).first else {
+        // Iterate ALL PIDs for this bundleID — Console and some
+        // other Apple apps can have multiple concurrent PIDs, and
+        // window ownership can land on any of them. Use the first
+        // PID whose AX enumeration returns non-empty windows.
+        let apps = NSRunningApplication.runningApplications(withBundleIdentifier: member.appBundleID)
+        guard !apps.isEmpty else {
             Log.corral.info(
                 "Restore: app \(member.appBundleID, privacy: .public) not running — skipping"
             )
             return nil
         }
-        let pid = app.processIdentifier
-
-        let axWindows: [EnumeratedWindow]
-        if let cached = axCache[pid] {
-            axWindows = cached
-        } else {
-            axWindows = AXWindowEnumerator.windows(of: app)
-            axCache[pid] = axWindows
+        var axWindows: [EnumeratedWindow] = []
+        for app in apps {
+            let pid = app.processIdentifier
+            let candidate: [EnumeratedWindow]
+            if let cached = axCache[pid] {
+                candidate = cached
+            } else {
+                candidate = AXWindowEnumerator.windows(of: app)
+                axCache[pid] = candidate
+            }
+            if !candidate.isEmpty {
+                axWindows = candidate
+                break
+            }
         }
 
         guard !axWindows.isEmpty else { return nil }
@@ -650,12 +698,26 @@ final class CorralOrchestrator {
     /// Chrome to collapse every saved member's tabs into a single
     /// merged window layered on top of the correct ones.
     private func openAppForRestore(bundleID: String) {
-        // Skip if the app already has visible windows — the execute
-        // step will find and reposition them. Prevents Chrome window
-        // multiplication and race issues on rapid re-releases.
-        if hasVisibleWindow(bundleID: bundleID) {
+        // Browsers: never call `open -b`. AppleScript's `make new
+        // window` in restoreBrowserMember launches the app if
+        // needed AND creates the window on the current Desktop
+        // without triggering macOS's "activate switches to app's
+        // Space" behavior — which would otherwise auto-swipe to
+        // whatever Desktop the browser's front window is on when
+        // the browser is running with windows elsewhere.
+        if BrowserScripting.isSupportedBrowser(bundleID: bundleID) {
             Log.corral.info(
-                "Restore prep: \(bundleID, privacy: .public) already has visible window(s) — skipping open"
+                "Restore prep: \(bundleID, privacy: .public) is a browser — deferring to AppleScript"
+            )
+            return
+        }
+        // Non-browsers: skip if the app already has a window on the
+        // CURRENT Desktop — the execute step will find and reposition
+        // it. If windows exist only on OTHER Desktops, we DO run
+        // `open` so a fresh window has a chance of landing here.
+        if hasWindowOnCurrentDesktop(bundleID: bundleID) {
+            Log.corral.info(
+                "Restore prep: \(bundleID, privacy: .public) already has window(s) on current Desktop — skipping open"
             )
             return
         }
@@ -685,16 +747,36 @@ final class CorralOrchestrator {
         }
     }
 
-    /// True if the app with the given bundle-ID is currently running
-    /// AND has at least one AX-visible window that survives our
-    /// enumerator filters (the Finder Desktop pseudo-window and other
-    /// backdrops don't count).
-    private func hasVisibleWindow(bundleID: String) -> Bool {
-        guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first else {
-            return false
+    /// True if the app has a window visible on the CURRENT Desktop
+    /// (Space). Uses `CGWindowListOnScreenOnly` which filters to
+    /// current-Space windows only. If the app is running with
+    /// windows only on OTHER Desktops, this returns false — so
+    /// callers force a fresh open that has a better chance of
+    /// landing on the current Desktop instead of trying to reuse a
+    /// window that would visually stay put on its Desktop while
+    /// getting AX-moved to the saved frame there.
+    private func hasWindowOnCurrentDesktop(bundleID: String) -> Bool {
+        let ourApps = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
+        guard !ourApps.isEmpty else { return false }
+        let ourPIDs = Set(ourApps.map { $0.processIdentifier })
+        return CrossAppWindowEnumerator.allVisibleWindows()
+            .contains(where: { ourPIDs.contains($0.ownerPID) })
+    }
+
+    /// True if a window owned by this member's app is already at
+    /// (approximately) the saved frame on the current Desktop.
+    /// Idempotency check so the retry pass doesn't re-restore
+    /// members the first pass already placed correctly — for
+    /// browsers, that would create duplicate windows because the
+    /// URL-overlap snapshot times out on the newly-busy browser.
+    private func alreadyAtTarget(member: CorralMember) -> Bool {
+        let ourApps = NSRunningApplication.runningApplications(withBundleIdentifier: member.appBundleID)
+        guard !ourApps.isEmpty else { return false }
+        let ourPIDs = Set(ourApps.map { $0.processIdentifier })
+        return CrossAppWindowEnumerator.allVisibleWindows().contains {
+            ourPIDs.contains($0.ownerPID)
+                && Self.framesMatch($0.frame, member.frame, tolerance: 30)
         }
-        let windows = AXWindowEnumerator.windows(of: app)
-        return !windows.isEmpty
     }
 
     /// LaunchServices fallback for browser restore when AppleScript
@@ -753,15 +835,21 @@ final class CorralOrchestrator {
     /// 'NAME'". Partial success → longer message that includes the
     /// missing app names ("… — Messages, Notes not available") and
     /// holds slightly longer so the user can read it.
-    private func showRestoreResultToast(name: String, restoredCount: Int, total: Int, missing: [String]) {
+    private func showRestoreResultToast(name: String, restoredCount: Int, total: Int, missing: [String], scatterCount: Int) {
         let text: String
         let hold: TimeInterval
-        if missing.isEmpty {
+        let scatterNote = scatterCount > 0
+            ? "; \(scatterCount) on other Desktops"
+            : ""
+        if missing.isEmpty && scatterCount == 0 {
             text = "✓  Restored '\(name)'"
             hold = 1.4
+        } else if missing.isEmpty {
+            text = "Restored '\(name)' — \(scatterCount) on other Desktops"
+            hold = 2.5
         } else {
             let missingList = missing.joined(separator: ", ")
-            text = "Restored \(restoredCount)/\(total) of '\(name)' — \(missingList) not available"
+            text = "Restored \(restoredCount)/\(total) of '\(name)' — \(missingList) not available\(scatterNote)"
             hold = 3.0
         }
         let toast = CorralToast()
