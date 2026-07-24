@@ -261,12 +261,15 @@ final class LassoCoordinator {
                     primaryWindowID: hit.windowID,
                     snapshots: snapshots
                 )
-                // Snapshot the panel + view state now so `updateGroupDrag`
-                // can pan the panel via `setFrameOrigin` on every mouse
-                // event instead of going through the full redraw path.
-                // The panel already exists because a selection was drawn
-                // before the drag started.
-                self.overlay.beginGroupDrag()
+                // Hide outlines entirely for the duration of the drag.
+                // Rather than fight AX latency to keep outlines pinned
+                // to moving windows (which drifts 20–100px for slow
+                // apps like Console/Chrome/Zoom under a fast drag),
+                // the outlines only appear when windows are AT REST.
+                // Reappearance is handled in `onLassoDragEnded` after a
+                // brief settle delay so Chrome/Console have time to
+                // process our final AX writes.
+                self.overlay.setSelectionFrames([])
                 Log.lasso.info(
                     "Group drag began on window \(hit.windowID, privacy: .public) ('\(hit.ownerName, privacy: .public)') — \(snapshots.count, privacy: .public) window(s) will move"
                 )
@@ -288,45 +291,47 @@ final class LassoCoordinator {
                 let rect = Self.rectBetween(anchor, point)
                 self.overlay.showLassoRect(rect)
                 self.updateSelection(forLassoRect: rect)
-            case .groupDrag(let anchor, let primaryID, let snapshots):
-                // Read the primary window's actual position BEFORE
-                // issuing this event's write. The read reflects the
-                // effect of the PREVIOUS event's write, which had a
-                // full inter-event interval to propagate through the
-                // target app's runloop and reach WindowServer. That's
-                // as close to "where the pixels actually are right
-                // now" as we can get without a display link.
-                //
-                // Pacing the overlay by this read keeps the outlines
-                // pinned to the real windows even when target apps
-                // (Chrome, Zoom) are slow to process AX writes. The
-                // outlines and windows may both trail the cursor
-                // slightly on a fast drag — that's inherent to AX —
-                // but they trail together, so the outlines stay
-                // attached.
-                let paceOffset: CGPoint
-                if let primary = snapshots.first(where: { $0.windowID == primaryID }),
-                   let actualAX = AXWindowEnumerator.currentFrame(of: primary.axElement) {
-                    let actual = CoordinateSpace.cocoaRect(fromAX: actualAX)
-                    paceOffset = CGPoint(
-                        x: actual.origin.x - primary.originalFrame.origin.x,
-                        y: actual.origin.y - primary.originalFrame.origin.y
-                    )
-                } else {
-                    paceOffset = CGPoint(x: point.x - anchor.x, y: point.y - anchor.y)
-                }
-                self.overlay.updateGroupDrag(offset: paceOffset)
-
-                // Now issue this event's write — LIVE movement of the
-                // real windows to the cursor's current target. Next
-                // event's read will reflect where these writes land.
+            case .groupDrag(let anchor, _, let snapshots):
+                // Windows move live during drag; outlines stay hidden
+                // (see `onLassoDragBegan`). The prior AX-read pacing
+                // to keep outlines pinned is gone — with nothing to
+                // render mid-drag, there's nothing to drift, and we
+                // skip a per-event synchronous AX read that was
+                // eating into the tap-callback time budget.
                 let targetDelta = CGPoint(x: point.x - anchor.x, y: point.y - anchor.y)
-                for snap in snapshots {
-                    let newFrame = snap.originalFrame.offsetBy(
-                        dx: targetDelta.x, dy: targetDelta.y
-                    )
-                    WindowMutator.setPosition(of: snap.axElement, cocoaFrame: newFrame)
+                // Parallelize writes across apps: a single app's
+                // runloop processes AX writes serially anyway (so
+                // multiple windows in the SAME app stay in-order per
+                // group), but different apps' runloops run
+                // independently, so we can shave a lot of wall-clock
+                // by not making Chrome wait for Console's write to
+                // finish. AX writes are thread-safe per Apple docs.
+                //
+                // Cost per event drops from `sum(per-app write time)`
+                // to `max(per-app write time)`. For a typical
+                // 3-app selection that's a 2–3× speedup, which is
+                // what the user actually notices as "cursor lag."
+                let byPID = Dictionary(grouping: snapshots, by: \.ownerPID)
+                let dispatchGroup = DispatchGroup()
+                for (_, groupSnaps) in byPID {
+                    dispatchGroup.enter()
+                    DispatchQueue.global(qos: .userInteractive).async {
+                        for snap in groupSnaps {
+                            let newFrame = snap.originalFrame.offsetBy(
+                                dx: targetDelta.x, dy: targetDelta.y
+                            )
+                            WindowMutator.setPosition(of: snap.axElement, cocoaFrame: newFrame)
+                        }
+                        dispatchGroup.leave()
+                    }
                 }
+                // Block the tap callback until all app writes finish.
+                // Must remain synchronous relative to the callback so
+                // the next mouse event doesn't queue writes on top of
+                // in-flight ones (which would just move the bottleneck
+                // and add reordering risk). Bounded by max per-app
+                // time — well under the tap's 75ms budget in practice.
+                dispatchGroup.wait()
             }
         }
 
@@ -349,23 +354,26 @@ final class LassoCoordinator {
                 )
             case .groupDrag(let anchor, _, let snapshots):
                 let delta = CGPoint(x: point.x - anchor.x, y: point.y - anchor.y)
-                // Exit the fast-path pan mode before refreshing frames —
-                // the next `setSelectionFrames` call needs to go through
-                // the normal redraw path so the panel resizes to the
-                // (possibly new) union bounds.
-                self.overlay.endGroupDrag()
                 if delta == .zero {
                     // Click without any drag on a selected window —
-                    // per the same rule, replace selection with just
-                    // that window. Real windows never moved.
+                    // replace selection with just that window. Real
+                    // windows never moved; outlines were hidden on
+                    // mouse-down and now come back for the new
+                    // single-window selection.
                     self.applyClick(at: anchor)
                     self.overlay.setSelectionFrames(self.visibleSelectionFrames())
-                } else {
-                    // Windows already moved live during onDragUpdated
-                    // via setPosition. Nothing further to write here;
-                    // just refresh the overlay from the system's fresh
-                    // frames so a subsequent redraw (e.g. Space change)
-                    // finds the up-to-date positions.
+                }
+                // Real drag: outlines were hidden during motion, so
+                // there's nothing to snap. Wait a beat for Chrome /
+                // Console / Zoom to actually apply our last AX writes,
+                // then re-show outlines at the settled positions.
+                // 200ms is enough for the slowest common apps to
+                // process the write; faster than that shows outlines
+                // still catching up. Keep the drag "in progress" flag
+                // cleared right away so a follow-up click isn't blocked.
+                let redrawDelay: TimeInterval = 0.20
+                DispatchQueue.main.asyncAfter(deadline: .now() + redrawDelay) { [weak self] in
+                    guard let self else { return }
                     self.overlay.setSelectionFrames(self.visibleSelectionFrames())
                 }
                 Log.lasso.info(
@@ -435,6 +443,23 @@ final class LassoCoordinator {
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self else { return }
+                // If a group drag is in progress, defer the teardown.
+                // With "Displays have separate Spaces" enabled in
+                // System Settings, macOS fires this notification when
+                // the cursor crosses a display boundary — right in
+                // the middle of a cross-display drag. Destroying the
+                // overlay panel here makes the outlines visibly
+                // detach for a frame, and worse, invalidates the
+                // `groupDragBase.panelOrigin` snapshot so the next
+                // `updateGroupDrag` snaps the new panel to a wrong
+                // origin. Both symptoms are visible in cross-display
+                // group drag when this fires mid-drag.
+                //
+                // Post-drag, the next selection change or explicit
+                // action will rebuild the overlay on the current
+                // Space anyway, so skipping the teardown mid-drag
+                // costs nothing.
+                if self.currentDrag != nil { return }
                 // Destroy the old overlay panel (it's pinned to the
                 // previous Space and already animated off). The next
                 // frame-setting call recreates a fresh panel on the

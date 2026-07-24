@@ -233,18 +233,29 @@ final class GlobalEventMonitor {
 
         let location = locationInCocoaCoords(event)
 
-        // Menu bar clicks: pass through so the user can still open
-        // menu-bar apps (ours + system utilities) during lasso.
-        if let screen = NSScreen.screens.first, location.y > screen.visibleFrame.maxY {
-            return Unmanaged.passUnretained(event)
-        }
-
-        // Clicks on our own interactive windows (name pill, release
-        // menu, NSAlerts): pass through. Transparent overlays are
-        // filtered out via `ignoresMouseEvents`.
-        for window in NSApp.windows where window.isVisible && !window.ignoresMouseEvents {
-            if window.frame.contains(location) {
+        // Passthrough exceptions (menu-bar clicks, clicks on our own
+        // interactive windows) only apply BEFORE a drag begins. Once
+        // dragInProgress is true, the user is mid-drag with the mouse
+        // held down — no modal or menu can be brought up, so these
+        // checks would just add per-event cost. At display boundaries
+        // during fast group drags that extra cost compounds with the
+        // existing AX read + N AX writes and can push our callback
+        // past macOS's ~75ms tap-timeout, fragmenting the drag into
+        // multiple began/ended cycles.
+        if !dragInProgress {
+            // Menu bar clicks: pass through so the user can still open
+            // menu-bar apps (ours + system utilities) during lasso.
+            if let screen = NSScreen.screens.first, location.y > screen.visibleFrame.maxY {
                 return Unmanaged.passUnretained(event)
+            }
+
+            // Clicks on our own interactive windows (name pill, release
+            // menu, NSAlerts): pass through. Transparent overlays are
+            // filtered out via `ignoresMouseEvents`.
+            for window in NSApp.windows where window.isVisible && !window.ignoresMouseEvents {
+                if window.frame.contains(location) {
+                    return Unmanaged.passUnretained(event)
+                }
             }
         }
 
