@@ -39,6 +39,9 @@ enum MenuBuilder {
         /// itself — but we append a "(5/5)" hint to the title so the
         /// user knows before clicking.
         let corralsAtCap: Bool
+        /// Whether the app is currently registered to launch at
+        /// login. Drives the checkmark on the "Launch at Login" item.
+        let launchAtLoginEnabled: Bool
     }
 
     /// Builds a fresh NSMenu reflecting `state`. Menu items are wired
@@ -101,6 +104,7 @@ enum MenuBuilder {
         }
 
         menu.addItem(.separator())
+        addLaunchAtLoginItem(to: menu, target: target, enabled: state.launchAtLoginEnabled)
         addQuitItem(to: menu)
 
         return menu
@@ -332,6 +336,33 @@ enum MenuBuilder {
         )
         item.target = target
         item.isEnabled = true
+        menu.addItem(item)
+    }
+
+    private static func addLaunchAtLoginItem(
+        to menu: NSMenu,
+        target: WindowWranglerActions,
+        enabled: Bool
+    ) {
+        let item = NSMenuItem(
+            title: "Launch at Login",
+            action: #selector(WindowWranglerActions.toggleLaunchAtLogin),
+            keyEquivalent: ""
+        )
+        item.target = target
+        item.isEnabled = true
+        // Use an SF-Symbol checkmark in the image slot instead of
+        // NSMenuItem's state indicator. The state indicator column
+        // sits ~24pt to the left of the text (macOS default reserved
+        // width); an image renders flush against the text, matching
+        // the visual grouping of Quit's icon in the same menu.
+        if enabled {
+            let config = NSImage.SymbolConfiguration(pointSize: 12, weight: .semibold)
+            item.image = NSImage(
+                systemSymbolName: "checkmark",
+                accessibilityDescription: "Launch at Login is on"
+            )?.withSymbolConfiguration(config)
+        }
         menu.addItem(item)
     }
 

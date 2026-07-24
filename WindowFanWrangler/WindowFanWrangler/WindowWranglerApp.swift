@@ -481,7 +481,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
             selectionCount: windowSelection.count,
             hasSnapshot: cascadeOrchestrator.hasSnapshot,
             corrals: corralStore.corrals,
-            corralsAtCap: corralStore.isAtCap
+            corralsAtCap: corralStore.isAtCap,
+            launchAtLoginEnabled: LoginItemManager.isEnabled
         )
         statusItem?.menu = MenuBuilder.build(state: state, target: self)
     }
@@ -561,6 +562,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
             return
         }
         corralOrchestrator.restoreCorral(byID: id)
+    }
+
+    /// Toggles the Login Item registration and rebuilds the menu so
+    /// the checkmark reflects the new state on next open.
+    @objc func toggleLaunchAtLogin() {
+        LoginItemManager.setEnabled(!LoginItemManager.isEnabled)
+        rebuildMenu()
     }
 
     // MARK: - Zombie prevention + clean shutdown

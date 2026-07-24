@@ -31,4 +31,7 @@ import AppKit
     /// "Release ▸" submenu. The sender's `representedObject` carries
     /// the corral's UUID (set by MenuBuilder at build time).
     @objc func restoreCorralFromMenu(_ sender: Any)
+    /// Toggles the Login Item registration — the "Launch at Login"
+    /// checkbox in the menu.
+    @objc func toggleLaunchAtLogin()
 }
