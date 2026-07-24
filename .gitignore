@@ -8,3 +8,7 @@
 # Build outputs
 DerivedData/
 build/
+
+# Derived doc outputs (regenerate via scripts/md_to_pdf.py)
+*.html
+*.pdf
