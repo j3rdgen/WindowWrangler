@@ -1082,5 +1082,63 @@ enum BrowserScripting {
         }
         return nil
     }
+
+    // MARK: - URL normalization
+
+    /// Canonical form of a URL used for tab-set comparisons in the
+    /// Corral browser restore matcher. Two URLs that render the same
+    /// page should normalize to the same string.
+    ///
+    /// Rules:
+    /// - Lowercase the scheme + host (case-insensitive per RFC 3986).
+    /// - Drop the URL fragment (`#anchor`) — client-side navigation
+    ///   inside a tab, not part of the destination page identity.
+    /// - Preserve the path AND query — those DO change the page.
+    /// - Normalize a bare-domain trailing slash: `example.com` and
+    ///   `example.com/` compare equal.
+    /// - Leave weak-signal URLs (`about:blank`, `chrome://newtab/`)
+    ///   as their canonical string so the scorer can downweight them
+    ///   via a shared-empty check.
+    ///
+    /// Failure mode: if URLComponents can't parse the input, return
+    /// the original string lowercased — better than crashing or
+    /// returning nil.
+    static func normalizedURL(_ raw: String) -> String {
+        // Fast path for the two common blank-page cases so the caller
+        // can spot them without re-parsing.
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lowerTrim = trimmed.lowercased()
+        if lowerTrim == "about:blank" { return "about:blank" }
+        if lowerTrim.hasPrefix("chrome://newtab") { return "chrome://newtab/" }
+
+        guard var components = URLComponents(string: trimmed) else {
+            return lowerTrim
+        }
+        components.fragment = nil
+        if let scheme = components.scheme {
+            components.scheme = scheme.lowercased()
+        }
+        if let host = components.host {
+            components.host = host.lowercased()
+        }
+        // Normalize a lone trailing slash on the path (empty path or
+        // "/"). Deeper paths like "/foo/" are meaningful — leave alone.
+        if components.path.isEmpty {
+            // no-op: URLComponents will render "https://example.com"
+        } else if components.path == "/" {
+            components.path = ""
+        }
+        return components.string ?? lowerTrim
+    }
+
+    /// True if the URL is a weak page-identity signal (blank/newtab)
+    /// that shouldn't drive matching by itself. The scorer treats
+    /// these as "match padding" rather than distinctive URLs.
+    static func isWeakSignalURL(_ normalized: String) -> Bool {
+        return normalized == "about:blank"
+            || normalized.hasPrefix("chrome://newtab")
+            || normalized.hasPrefix("chrome://new-tab-page")
+            || normalized.hasPrefix("edge://newtab")
+    }
 }
 

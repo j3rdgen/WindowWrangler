@@ -1197,14 +1197,24 @@ final class CascadeOrchestrator {
         return CGRect(x: x, y: y, width: frameSize.width, height: frameSize.height)
     }
 
-    /// True if `actual` matches `target` within ±4pt on each of x, y,
-    /// width, height. 4pt absorbs the rounding and sub-pixel noise we
-    /// see from AX readback.
+    /// True if `actual` matches `target` within ±10pt on each of x, y,
+    /// width, height. 10pt absorbs:
+    ///   - sub-pixel readback rounding (~1-2pt)
+    ///   - apps that snap to a character/row grid — Terminal has been
+    ///     observed clamping a requested 1302×798 to 1301×791 (7pt
+    ///     height offset = one row on its default font)
+    ///   - Xcode, IDEs, and other apps with hard minimum sizes that
+    ///     slightly exceed our requested size
+    /// The purpose of verify is to catch windows that failed to move
+    /// at all (dozens to hundreds of pixels off), not to detect
+    /// sub-window pixel drift. A tighter tolerance triggered false
+    /// "STILL not at target" errors + wasted rescue passes on every
+    /// cascade that included Terminal.
     private func frameMatches(_ actual: CGRect, target: CGRect) -> Bool {
         let xOff = abs(actual.minX - target.minX)
         let yOff = abs(actual.minY - target.minY)
         let wOff = abs(actual.width  - target.width)
         let hOff = abs(actual.height - target.height)
-        return xOff <= 4 && yOff <= 4 && wOff <= 4 && hOff <= 4
+        return xOff <= 10 && yOff <= 10 && wOff <= 10 && hOff <= 10
     }
 }

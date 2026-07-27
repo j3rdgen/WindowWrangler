@@ -410,10 +410,51 @@ final class CorralOrchestrator {
         // ends up on top.
         let ordered = corral.members.sorted { $0.zOrderIndex < $1.zOrderIndex }
 
+        // Plan browser assignments UP FRONT — before any move — per
+        // spec Part 5. Fetch one snapshot per browser bundleID,
+        // intersect with the current-Desktop on-screen inventory to
+        // filter out other-Desktop windows, then greedy-assign
+        // one-to-one by URL-overlap score. Chrome's AppleScript
+        // window indices can shift after `set bounds`, so all
+        // matching MUST complete before any window moves.
+        let browserBundleIDs: Set<String> = Set(
+            ordered
+                .filter { $0.tabs != nil && !($0.tabs?.isEmpty ?? true) }
+                .map(\.appBundleID)
+        )
+        // Assignments keyed by (bundleID, zOrderIndex) — unique per
+        // member within a corral. CorralMember isn't Hashable itself
+        // (it's a value type without an id), so we key on the fields
+        // that are guaranteed unique per member.
+        var browserAssignmentsByMember: [String: BrowserRestoreAssignment] = [:]
+        func assignmentKey(_ m: CorralMember) -> String {
+            "\(m.appBundleID)#\(m.zOrderIndex)"
+        }
+        var totalOffDesktopIgnored = 0
+        for bundleID in browserBundleIDs {
+            let membersForBundle = ordered.filter { $0.appBundleID == bundleID && !($0.tabs?.isEmpty ?? true) }
+            let snapshots = BrowserScripting.snapshotBrowserWindows(bundleID: bundleID) ?? []
+            let candidates = buildBrowserRestoreCandidates(bundleID: bundleID, snapshots: snapshots)
+            let asAppleScriptSaw = snapshots.count
+            let asLocallyEligible = candidates.count
+            let offDesktop = max(0, asAppleScriptSaw - asLocallyEligible)
+            totalOffDesktopIgnored += offDesktop
+            let assignments = planBrowserAssignments(members: membersForBundle, candidates: candidates)
+            for a in assignments {
+                browserAssignmentsByMember[assignmentKey(a.member)] = a
+            }
+            let reusedCount = assignments.filter { $0.candidate != nil }.count
+            let newCount = assignments.count - reusedCount
+            Log.corral.info(
+                "Browser restore plan: bundle=\(bundleID, privacy: .public) members=\(membersForBundle.count, privacy: .public) asWindows=\(asAppleScriptSaw, privacy: .public) locallyEligible=\(asLocallyEligible, privacy: .public) reused=\(reusedCount, privacy: .public) new=\(newCount, privacy: .public) offDesktopIgnored=\(offDesktop, privacy: .public)"
+            )
+        }
+
         // AX-tracked restores (non-browser windows we moved via
         // WindowMutator, plus browser windows we didn't need to touch
-        // at all because their frame already matched). These are the
-        // members that will participate in the AX z-order raise pass.
+        // at all because their frame already matched with tab-verified
+        // identity). These are the members that will participate in
+        // the AX z-order raise pass.
         var restoredForZOrder: [(member: CorralMember, axElement: AXUIElement)] = []
         // Browser members restored via AppleScript that don't have an
         // AX element to raise. They end up in the correct relative
@@ -421,48 +462,99 @@ final class CorralOrchestrator {
         // creation, and every subsequent AX raise on another member
         // pushes them one slot back.
         var restoredWithoutAX: Int = 0
+        var browserReusedCount: Int = 0
+        var browserOpenedCount: Int = 0
+        var browserAlreadyAtTarget: Int = 0
         var missing: [String] = []
         var axCache: [pid_t: [EnumeratedWindow]] = [:]
-
-        // Per bundle: decide once whether the URL-overlap snapshot is
-        // worth running. Sticky across the restore so subsequent
-        // members don't try to reuse a window we just created.
-        var browserStartedEmpty: [String: Bool] = [:]
-        for member in ordered where member.tabs != nil && !(member.tabs?.isEmpty ?? true) {
-            if browserStartedEmpty[member.appBundleID] == nil {
-                browserStartedEmpty[member.appBundleID] = !hasWindowOnCurrentDesktop(bundleID: member.appBundleID)
-            }
-        }
 
         for (idx, member) in ordered.enumerated() {
             Log.corral.info(
                 "Restore [\(idx + 1, privacy: .public)/\(ordered.count, privacy: .public)] '\(member.appName, privacy: .public)' (\(member.appBundleID, privacy: .public), slot \(member.zOrderIndex, privacy: .public))"
             )
-            // Idempotency: skip if a window with this bundleID is
-            // already at (approximately) the saved frame on the
-            // current Desktop. Prevents the retry pass from creating
-            // duplicate browser windows for members the first pass
-            // already restored.
-            if alreadyAtTarget(member: member) {
+            let isBrowser = member.tabs != nil && !(member.tabs?.isEmpty ?? true)
+            let assignment = browserAssignmentsByMember[assignmentKey(member)]
+
+            // Browser members: use browser-aware "already at target"
+            // — the candidate MUST both (a) be at the target frame
+            // AND (b) have tab match. Frame-only match is not
+            // enough for browser members per spec Part 4.
+            //
+            // Non-browser members: keep the existing frame-only
+            // idempotency check. A generic app window at the target
+            // frame is a legitimate "already restored" signal.
+            if isBrowser {
+                if let match = assignment?.candidate,
+                   Self.framesMatch(match.boundsCocoa, member.frame, tolerance: 30) {
+                    Log.corral.info("  → browser already at target with matching tabs — skipping (score \(assignment?.score ?? 0, privacy: .public))")
+                    browserAlreadyAtTarget += 1
+                    restoredWithoutAX += 1
+                    continue
+                }
+            } else if alreadyAtTarget(member: member) {
                 Log.corral.info("  → already at target — skipping")
                 restoredWithoutAX += 1
                 continue
             }
-            if let tabs = member.tabs, !tabs.isEmpty {
-                let skipOverlap = browserStartedEmpty[member.appBundleID] ?? false
-                let result = restoreBrowserMember(member: member, tabs: tabs, skipOverlapCheck: skipOverlap)
-                switch result {
-                case .movedExisting:
-                    Log.corral.info("  → matched & moved existing browser window")
-                    restoredWithoutAX += 1
-                case .openedNew:
-                    Log.corral.info("  → opened new browser window with \(tabs.count, privacy: .public) tab(s)")
-                    restoredWithoutAX += 1
-                case .failed:
-                    Log.corral.error("  → browser restore failed")
-                    missing.append(member.appName)
+
+            if isBrowser {
+                // Browser member: execute the planned assignment.
+                // Either move the assigned candidate or open new.
+                if let candidate = assignment?.candidate {
+                    let targetBoundsAX = CoordinateSpace.axRect(fromCocoa: member.frame)
+                    let moved = BrowserScripting.moveBrowserWindow(
+                        bundleID: member.appBundleID,
+                        windowID: candidate.appleScriptInternalID,
+                        boundsAX: targetBoundsAX
+                    )
+                    if moved {
+                        Log.corral.info("  → reused local browser window (score \(assignment?.score ?? 0, privacy: .public))")
+                        browserReusedCount += 1
+                        restoredWithoutAX += 1
+                    } else {
+                        // Move failed — fall through to open-new so
+                        // the member still gets restored somewhere.
+                        Log.corral.info("  → move-existing failed, opening new instead")
+                        let opened = BrowserScripting.openBrowserWindow(
+                            bundleID: member.appBundleID,
+                            tabs: member.tabs ?? [],
+                            boundsAX: targetBoundsAX
+                        )
+                        if opened {
+                            browserOpenedCount += 1
+                            restoredWithoutAX += 1
+                        } else if openBrowserURLsViaLaunchServices(bundleID: member.appBundleID, tabs: member.tabs ?? []) {
+                            browserOpenedCount += 1
+                            restoredWithoutAX += 1
+                        } else {
+                            missing.append(member.appName)
+                        }
+                    }
+                } else {
+                    // No local match — open new (spec Part 6:
+                    // "Never take a matching window from another
+                    // Desktop").
+                    let targetBoundsAX = CoordinateSpace.axRect(fromCocoa: member.frame)
+                    let opened = BrowserScripting.openBrowserWindow(
+                        bundleID: member.appBundleID,
+                        tabs: member.tabs ?? [],
+                        boundsAX: targetBoundsAX
+                    )
+                    if opened {
+                        Log.corral.info("  → opened new browser window with \(member.tabs?.count ?? 0, privacy: .public) tab(s)")
+                        browserOpenedCount += 1
+                        restoredWithoutAX += 1
+                    } else if openBrowserURLsViaLaunchServices(bundleID: member.appBundleID, tabs: member.tabs ?? []) {
+                        Log.corral.info("  → opened new browser window via LaunchServices")
+                        browserOpenedCount += 1
+                        restoredWithoutAX += 1
+                    } else {
+                        Log.corral.error("  → browser restore failed")
+                        missing.append(member.appName)
+                    }
                 }
             } else {
+                // Non-browser member: AX move.
                 if let axElement = findWindow(for: member, axCache: &axCache) {
                     WindowMutator.setFrame(member.frame, of: axElement)
                     Log.corral.info("  → moved via AX")
@@ -505,7 +597,7 @@ final class CorralOrchestrator {
         let scatterCount = countMembersOnOtherDesktops(restoredMembers)
 
         Log.corral.notice(
-            "Restore complete: \(totalRestored, privacy: .public)/\(corral.members.count, privacy: .public) restored, \(missing.count, privacy: .public) missing, \(scatterCount, privacy: .public) on other Desktops"
+            "Restore complete: \(totalRestored, privacy: .public)/\(corral.members.count, privacy: .public) restored — browserReused=\(browserReusedCount, privacy: .public), browserOpened=\(browserOpenedCount, privacy: .public), browserAlreadyAtTarget=\(browserAlreadyAtTarget, privacy: .public), offDesktopIgnored=\(totalOffDesktopIgnored, privacy: .public), missing=\(missing.count, privacy: .public), onOtherDesktops=\(scatterCount, privacy: .public)"
         )
 
         // Take down the "Restoring…" progress toast so it doesn't
@@ -529,10 +621,23 @@ final class CorralOrchestrator {
     /// tolerance is generous (30pt) because some apps clamp the
     /// requested frame slightly (Chrome's min-width, Notes' aspect
     /// preferences, etc.).
+    ///
+    /// Browser members are excluded from the audit: our restore
+    /// paths for browsers (AppleScript `make new window` /
+    /// `set bounds`, and the LaunchServices `open -b` fallback) all
+    /// spawn or move windows on the current Space by design.
+    /// Chrome/Safari frequently clamp or offset the requested frame
+    /// (min-width, missing chrome preserved from the last-used
+    /// window), so a frame-mismatch does NOT indicate the window
+    /// landed on another Desktop — it just indicates the browser
+    /// picked its own bounds. Counting browsers here produced false
+    /// "N on other Desktops" toasts on every browser restore.
     private func countMembersOnOtherDesktops(_ members: [CorralMember]) -> Int {
         let currentDesktopWindows = CrossAppWindowEnumerator.allVisibleWindows()
         return members.filter { member in
-            !currentDesktopWindows.contains(where: {
+            let isBrowser = member.tabs != nil && !(member.tabs?.isEmpty ?? true)
+            if isBrowser { return false }
+            return !currentDesktopWindows.contains(where: {
                 Self.framesMatch($0.frame, member.frame, tolerance: 30)
             })
         }.count
@@ -612,6 +717,36 @@ final class CorralOrchestrator {
         case failed
     }
 
+    // MARK: - Restore planning types
+
+    /// One reusable browser window from the current Desktop's
+    /// on-screen inventory intersected with the browser's AppleScript
+    /// snapshot. Windows that AppleScript reports but aren't in the
+    /// on-screen inventory (i.e. live on another Desktop) never
+    /// become candidates — spec Part 3.
+    private struct BrowserRestoreCandidate {
+        let bundleID: String
+        /// CGWindowID from CGWindowList — stable across the plan
+        /// (unlike Chrome's AppleScript window indices, which can
+        /// shift after `set bounds`).
+        let windowID: CGWindowID
+        /// The AppleScript-side identity, used by
+        /// `BrowserScripting.moveBrowserWindow`.
+        let appleScriptInternalID: Int
+        let boundsCocoa: CGRect
+        let tabs: [TabInfo]
+    }
+
+    /// One planned assignment. `candidate == nil` means "no valid
+    /// local reuse — open a new window."
+    private struct BrowserRestoreAssignment {
+        let member: CorralMember
+        let candidate: BrowserRestoreCandidate?
+        /// Match score in the winning assignment. Zero for
+        /// open-new (no candidate).
+        let score: Int
+    }
+
     /// Browser lookup. Snapshots the browser (uses cache if fresh),
     /// finds the window with the highest URL-set overlap against the
     /// saved tabs, and — if that overlap is meaningful (≥ 50% of
@@ -683,6 +818,227 @@ final class CorralOrchestrator {
             return .openedNew
         }
         return .failed
+    }
+
+    // MARK: - Restore planning helpers (browser members)
+
+    /// Currently-visible windows for the given bundle on the CURRENT
+    /// Desktop, keyed by CGWindowID. Uses `CGWindowListCopyWindowInfo`
+    /// with `.optionOnScreenOnly` so windows on other Spaces / other
+    /// Desktops (with "Displays have separate Spaces" on) are excluded.
+    /// This is what makes the restore planner refuse to reuse a
+    /// matching browser window that lives on another Desktop — spec
+    /// Part 3.
+    private func onScreenWindowsForBundle(_ bundleID: String) -> [CGWindowID: CGRect] {
+        // PIDs of all currently-running instances of this bundle.
+        let pids = Set(NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).map(\.processIdentifier))
+        guard !pids.isEmpty else { return [:] }
+        let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+        guard let raw = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] else {
+            return [:]
+        }
+        var out: [CGWindowID: CGRect] = [:]
+        for entry in raw {
+            guard let pid = entry[kCGWindowOwnerPID as String] as? pid_t,
+                  pids.contains(pid),
+                  let bounds = entry[kCGWindowBounds as String] as? [String: CGFloat],
+                  let winID = entry[kCGWindowNumber as String] as? CGWindowID else {
+                continue
+            }
+            // CGWindowList bounds are in AX-style top-left global.
+            let ax = CGRect(
+                x: bounds["X"] ?? 0, y: bounds["Y"] ?? 0,
+                width: bounds["Width"] ?? 0, height: bounds["Height"] ?? 0
+            )
+            out[winID] = CoordinateSpace.cocoaRect(fromAX: ax)
+        }
+        return out
+    }
+
+    /// Builds the pool of candidate windows for restore matching by
+    /// intersecting the browser's AppleScript snapshot with the
+    /// current-Desktop on-screen inventory. AppleScript-visible
+    /// windows that DON'T appear in the on-screen list are dropped —
+    /// they live on another Desktop and per spec must NOT be moved.
+    private func buildBrowserRestoreCandidates(
+        bundleID: String,
+        snapshots: [BrowserScripting.BrowserWindowSnapshot]
+    ) -> [BrowserRestoreCandidate] {
+        let onScreen = onScreenWindowsForBundle(bundleID)
+        guard !onScreen.isEmpty else { return [] }
+        // Match snapshots to CGWindowList entries by frame (both
+        // sides are in Cocoa global after conversion). AppleScript
+        // rounds bounds to integers; CGWindowList to floats — 30pt
+        // tolerance matches the existing framesMatch policy.
+        var candidates: [BrowserRestoreCandidate] = []
+        var usedCGWindowIDs: Set<CGWindowID> = []
+        for snap in snapshots {
+            let cocoaFrame = CoordinateSpace.cocoaRect(fromAX: snap.boundsAX)
+            let hit = onScreen.first(where: { (winID, frame) in
+                !usedCGWindowIDs.contains(winID)
+                    && Self.framesMatch(frame, cocoaFrame, tolerance: 30)
+            })
+            guard let (winID, frame) = hit else { continue }
+            usedCGWindowIDs.insert(winID)
+            candidates.append(BrowserRestoreCandidate(
+                bundleID: bundleID,
+                windowID: winID,
+                appleScriptInternalID: snap.internalID,
+                boundsCocoa: frame,
+                tabs: snap.tabs
+            ))
+        }
+        return candidates
+    }
+
+    /// Scores a (member, candidate) pair. Higher = better. Zero or
+    /// negative means "no meaningful match — prefer open-new."
+    ///
+    /// Scoring tiers (in decreasing weight):
+    /// 1. Full normalized-URL match:  100 pts each
+    /// 2. Hostname-only match:         20 pts each (fallback for
+    ///    URLs that redirected after load — Facebook, Google login
+    ///    flows, OAuth handoffs, etc. Saved URL and loaded URL
+    ///    share the host but not the path.)
+    /// 3. Frame closeness bonus:      up to 10 pts
+    ///
+    /// Weak-signal URLs (about:blank, chrome://newtab) never
+    /// contribute to either tier. Otherwise a random newtab window
+    /// could match any saved window with a blank tab.
+    ///
+    /// Zero-score → open-new. A pure hostname match (no full-URL
+    /// match) still returns a positive score if any distinctive host
+    /// overlaps — enough to reuse the just-opened-and-redirected
+    /// window on a follow-up restore of the same corral.
+    private static func browserMatchScore(
+        memberTabs: [TabInfo],
+        candidateTabs: [TabInfo],
+        memberFrame: CGRect,
+        candidateFrame: CGRect
+    ) -> Int {
+        // Full-URL match.
+        let savedFull = memberTabs.map { BrowserScripting.normalizedURL($0.url) }
+        let candidateFull = candidateTabs.map { BrowserScripting.normalizedURL($0.url) }
+        let savedFullSet = Set(savedFull)
+        let candidateFullSet = Set(candidateFull)
+        var fullOverlap = 0
+        for url in savedFullSet where candidateFullSet.contains(url) {
+            if BrowserScripting.isWeakSignalURL(url) { continue }
+            fullOverlap += 1
+        }
+
+        // Hostname-only fallback — for URLs that redirect after
+        // load. E.g. saved "https://www.facebook.com/", loaded
+        // becomes "https://www.facebook.com/?rdr=..." — full URL
+        // differs but host matches.
+        let savedHosts = Set(savedFull.compactMap { host(fromNormalized: $0) })
+        let candidateHosts = Set(candidateFull.compactMap { host(fromNormalized: $0) })
+        var hostOverlap = 0
+        for host in savedHosts where candidateHosts.contains(host) {
+            // Skip weak-signal hosts (chrome://, about: etc — treat
+            // as noise).
+            if host.contains(":") { continue }
+            hostOverlap += 1
+        }
+        // Don't double-count: URLs that already fully matched already
+        // implicitly matched their host. Subtract fullOverlap so
+        // hostOverlap only counts host-only matches.
+        let hostOnlyOverlap = max(0, hostOverlap - fullOverlap)
+
+        // Match VALIDITY gate — the score alone isn't enough to
+        // decide reuse-vs-open-new; we need substantial identity
+        // evidence to avoid hijacking an unrelated window that
+        // happens to share one common hostname (gmail.com, etc.).
+        //
+        // A candidate is a valid reuse target iff:
+        //   (a) at least one full-URL match — a canonical URL
+        //       collision is essentially proof of identity, OR
+        //   (b) hostname overlap covers ALL of the saved window's
+        //       meaningful tabs — the post-redirect case, where
+        //       every saved tab's host is still present in the
+        //       candidate even though the exact URLs have shifted
+        //       (Facebook, OAuth, single-page apps changing paths).
+        //
+        // A partial hostname overlap (e.g. 1 of 5 saved tabs) is
+        // explicitly NOT enough. Before this gate existed, a random
+        // Chrome window would be picked up and moved to the saved
+        // position on restore because its only overlap was a
+        // coincidental stale tab, which discarded the saved tabs
+        // entirely.
+        let meaningfulSavedTabCount = savedFullSet.filter { !BrowserScripting.isWeakSignalURL($0) }.count
+        let isValidMatch = fullOverlap > 0
+            || (meaningfulSavedTabCount > 0 && hostOverlap >= meaningfulSavedTabCount)
+        guard isValidMatch else { return 0 }
+
+        var score = fullOverlap * 100 + hostOnlyOverlap * 20
+
+        // Small frame-closeness tiebreaker (max 10 pts).
+        let dx = memberFrame.midX - candidateFrame.midX
+        let dy = memberFrame.midY - candidateFrame.midY
+        let dist = (dx * dx + dy * dy).squareRoot()
+        if dist < 200 {
+            score += Int(10 - min(10, dist / 20))
+        }
+        return score
+    }
+
+    /// Extracts the host portion from a normalized URL, or nil if
+    /// there isn't one (relative URLs, malformed). Used by
+    /// `browserMatchScore` for hostname-only fallback matching.
+    private static func host(fromNormalized normalized: String) -> String? {
+        guard let comp = URLComponents(string: normalized),
+              let host = comp.host, !host.isEmpty else {
+            return nil
+        }
+        return host
+    }
+
+    /// Plans one-to-one assignments between saved members and eligible
+    /// on-screen candidates. Greedy: repeatedly picks the
+    /// highest-scoring (member, candidate) pair, marks both consumed,
+    /// stops when no positive-score pair remains. Members with no
+    /// remaining match get `candidate = nil` (open new).
+    private func planBrowserAssignments(
+        members: [CorralMember],
+        candidates: [BrowserRestoreCandidate]
+    ) -> [BrowserRestoreAssignment] {
+        // Score every pair once. O(N*M) — fine for typical corral sizes.
+        struct Pair { let mi: Int; let ci: Int; let score: Int }
+        var pairs: [Pair] = []
+        for (mi, m) in members.enumerated() {
+            for (ci, c) in candidates.enumerated() {
+                let s = Self.browserMatchScore(
+                    memberTabs: m.tabs ?? [],
+                    candidateTabs: c.tabs,
+                    memberFrame: m.frame,
+                    candidateFrame: c.boundsCocoa
+                )
+                if s > 0 { pairs.append(Pair(mi: mi, ci: ci, score: s)) }
+            }
+        }
+        pairs.sort { $0.score > $1.score }
+        var assignedCandidate: [Int: Int] = [:]   // memberIndex → candidateIndex
+        var takenCandidates: Set<Int> = []
+        var takenMembers: Set<Int> = []
+        for p in pairs {
+            if takenMembers.contains(p.mi) || takenCandidates.contains(p.ci) { continue }
+            assignedCandidate[p.mi] = p.ci
+            takenMembers.insert(p.mi)
+            takenCandidates.insert(p.ci)
+        }
+        // Convert to output; every member gets an assignment (nil = open new).
+        return members.enumerated().map { (mi, m) in
+            if let ci = assignedCandidate[mi] {
+                let matchScore = pairs.first { $0.mi == mi && $0.ci == ci }?.score ?? 0
+                return BrowserRestoreAssignment(
+                    member: m,
+                    candidate: candidates[ci],
+                    score: matchScore
+                )
+            } else {
+                return BrowserRestoreAssignment(member: m, candidate: nil, score: 0)
+            }
+        }
     }
 
     /// Dispatches to the right `/usr/bin/open` invocation for the
@@ -861,14 +1217,30 @@ final class CorralOrchestrator {
 
     // MARK: - Member capture
 
+    /// Per-save browser-snapshot context. Holds one cache-warm
+    /// snapshot per bundleID and tracks which of its internal window
+    /// IDs have already been assigned to a selected window this save.
+    /// Prevents a single cached browser snapshot from satisfying two
+    /// selected windows.
+    private struct BrowserSaveCaptureContext {
+        var snapshotsByBundleID: [String: [BrowserScripting.BrowserWindowSnapshot]] = [:]
+        var consumedInternalIDsByBundleID: [String: Set<Int>] = [:]
+    }
+
     /// Turns each `VisibleWindow` into a fully-populated
     /// `CorralMember`. Titles are resolved via AX (single
-    /// enumeration cached per PID). Browser windows get their tab
-    /// lists via `BrowserScripting`, cached per bundle-ID so a
-    /// selection with three Chrome windows only pays for one
-    /// AppleScript round-trip.
+    /// enumeration cached per PID). Browser tabs are read from the
+    /// prefetched cache (populated by the lasso coordinator's idle
+    /// scheduler) — one cache read per browser bundleID for the
+    /// whole selection, versus the old path's one targeted
+    /// AppleScript pair per browser window.
+    ///
+    /// Falls back to `tabsForBrowserWindow` (targeted whose-filter)
+    /// only when the cache miss / no-match / stale case truly needs
+    /// a fresh fetch.
     private func captureMembers(from windows: [VisibleWindow]) -> [CorralMember] {
         var axCache: [pid_t: [EnumeratedWindow]] = [:]
+        var browserContext = buildBrowserSaveContext(for: windows)
         var members: [CorralMember] = []
 
         for (idx, win) in windows.enumerated() {
@@ -882,9 +1254,10 @@ final class CorralOrchestrator {
             let appName = runningApp.localizedName ?? win.ownerName
             let title = resolveTitle(for: win, axCache: &axCache)
 
-            let tabs = tabsForBrowserWindow(
+            let tabs = tabsForBrowserWindowUsingCache(
                 bundleID: bundleID,
-                cocoaFrame: win.frame
+                cocoaFrame: win.frame,
+                context: &browserContext
             )
 
             // Document path (for documents-based apps). Read from AX
@@ -968,6 +1341,90 @@ final class CorralOrchestrator {
         )
         guard result == .success, let title = titleValue as? String else { return "" }
         return title
+    }
+
+    /// Builds a per-save context by pulling one cache-warm snapshot
+    /// per unique browser bundleID in the selection. If the idle
+    /// prefetch has run (typical case when saving after a lasso
+    /// interaction), `snapshotBrowserWindows` returns immediately
+    /// from cache. If cache is cold, one synchronous AppleScript
+    /// fetch per bundleID runs here — still MUCH cheaper than one
+    /// per selected window.
+    private func buildBrowserSaveContext(
+        for windows: [VisibleWindow]
+    ) -> BrowserSaveCaptureContext {
+        var context = BrowserSaveCaptureContext()
+        var seenBundles: Set<String> = []
+        for win in windows {
+            guard let bundleID = NSRunningApplication(processIdentifier: win.ownerPID)?.bundleIdentifier,
+                  BrowserScripting.isSupportedBrowser(bundleID: bundleID) else { continue }
+            if seenBundles.contains(bundleID) { continue }
+            seenBundles.insert(bundleID)
+            if let snapshots = BrowserScripting.snapshotBrowserWindows(bundleID: bundleID),
+               !snapshots.isEmpty {
+                context.snapshotsByBundleID[bundleID] = snapshots
+                context.consumedInternalIDsByBundleID[bundleID] = []
+            }
+        }
+        return context
+    }
+
+    /// Tries the per-save browser snapshot cache first (built by
+    /// `buildBrowserSaveContext`). Matches `cocoaFrame` against
+    /// unconsumed cached snapshots by frame center + size tolerance.
+    /// Marks the matched snapshot consumed so no other selected
+    /// window can double-book it.
+    ///
+    /// Falls back to the targeted per-window
+    /// `snapshotBrowserWindowNearFrame` path (via
+    /// `tabsForBrowserWindow`) only when: no cache entry for this
+    /// bundle, no unconsumed match by frame, or the cache is stale
+    /// (would need re-fetch anyway).
+    private func tabsForBrowserWindowUsingCache(
+        bundleID: String,
+        cocoaFrame: CGRect,
+        context: inout BrowserSaveCaptureContext
+    ) -> [TabInfo]? {
+        guard BrowserScripting.isSupportedBrowser(bundleID: bundleID) else { return nil }
+        let targetAX = CoordinateSpace.axRect(fromCocoa: cocoaFrame)
+        // Try cache first.
+        if let snapshots = context.snapshotsByBundleID[bundleID] {
+            let consumed = context.consumedInternalIDsByBundleID[bundleID] ?? []
+            // Rank unconsumed cached windows by frame distance from
+            // target. Best match must be within tolerance to count.
+            let matchTolerance: CGFloat = 30  // matches existing framesMatch tolerance
+            var best: (snap: BrowserScripting.BrowserWindowSnapshot, distance: CGFloat)?
+            for snap in snapshots where !consumed.contains(snap.internalID) {
+                let dx = snap.boundsAX.midX - targetAX.midX
+                let dy = snap.boundsAX.midY - targetAX.midY
+                let dw = abs(snap.boundsAX.width  - targetAX.width)
+                let dh = abs(snap.boundsAX.height - targetAX.height)
+                // Only consider it a match if both center is close AND
+                // sizes are close (rules out huge windows that happen
+                // to sit near a small one's midpoint).
+                let centerDist = (dx * dx + dy * dy).squareRoot()
+                if centerDist < matchTolerance && dw < matchTolerance && dh < matchTolerance {
+                    if best == nil || centerDist < best!.distance {
+                        best = (snap, centerDist)
+                    }
+                }
+            }
+            if let match = best {
+                var consumedSet = context.consumedInternalIDsByBundleID[bundleID] ?? []
+                consumedSet.insert(match.snap.internalID)
+                context.consumedInternalIDsByBundleID[bundleID] = consumedSet
+                Log.corral.info(
+                    "Browser save: prefetched snapshot used (bundle=\(bundleID, privacy: .public) window=\(match.snap.internalID, privacy: .public) tabs=\(match.snap.tabs.count, privacy: .public))"
+                )
+                return match.snap.tabs
+            }
+        }
+        // Cache miss / no unconsumed match — fall back to targeted fetch.
+        let reason = context.snapshotsByBundleID[bundleID] == nil ? "no cache" : "no match"
+        Log.corral.info(
+            "Browser save: targeted fallback used (bundle=\(bundleID, privacy: .public) reason=\(reason, privacy: .public))"
+        )
+        return tabsForBrowserWindow(bundleID: bundleID, cocoaFrame: cocoaFrame)
     }
 
     /// Returns tabs for the browser window whose bounds match
