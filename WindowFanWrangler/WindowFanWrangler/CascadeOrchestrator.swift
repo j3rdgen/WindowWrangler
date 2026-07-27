@@ -83,6 +83,14 @@ final class CascadeOrchestrator {
     /// the windows to their new positions.
     var onWindowsMoved: (() -> Void)?
 
+    /// Last cascade direction the user triggered (via any path — DR
+    /// menu item, DL shortcut, all-apps DR, etc.). Multi-window
+    /// resize reads this to auto-cascade the resized windows in the
+    /// same direction so a fan stays a fan after the size change.
+    /// Defaults to `.downRight` at launch — matches the primary
+    /// menu item's ordering.
+    private(set) var lastCascadeDirection: CascadeDirection = .downRight
+
     init(
         resolveTargetApp: @escaping () -> NSRunningApplication?,
         isTrusted: @escaping () -> Bool
@@ -115,6 +123,7 @@ final class CascadeOrchestrator {
             Log.cascade.error("Aborted: AX permission not granted")
             return
         }
+        lastCascadeDirection = direction
 
         guard let targetApp = resolveTargetApp() else {
             Log.cascade.error("Aborted: no user app could be resolved")
@@ -244,11 +253,61 @@ final class CascadeOrchestrator {
     /// 120ms / 500ms / 1000ms that re-check each window against its
     /// expected target and re-apply any that drifted. Verify at +1.2s
     /// is diagnostic only.
+    /// Cascades a caller-supplied set of AX windows (typically the
+    /// lasso selection) in the given direction on the given display.
+    /// The window size passed to the cascade math is taken from the
+    /// FIRST window in the list — for the post-resize flow this is
+    /// the frontmost (target) size that every other selected window
+    /// already matches, so cascading with that size lays out a fan
+    /// with uniform, correct dimensions.
+    ///
+    /// Unlike `performCascade` / `performCascadeAllApps`, this does
+    /// NOT snapshot for Restore, does NOT run retry passes, and does
+    /// NOT re-enumerate — the caller has already resolved the AX
+    /// elements and the operation is intended to feel snappy right
+    /// after another interactive gesture (multi-window resize).
+    ///
+    /// No-op if the window list has fewer than 2 windows (cascade
+    /// needs at least 2 to make sense as a fan).
+    func performCascadeOnSelection(
+        _ windows: [EnumeratedWindow],
+        direction: CascadeDirection,
+        targetScreen: NSScreen
+    ) {
+        guard isTrusted() else {
+            Log.cascade.error("Selection cascade aborted: AX permission not granted")
+            return
+        }
+        guard windows.count > 1 else {
+            Log.cascade.info(
+                "Selection cascade no-op: \(windows.count, privacy: .public) window(s) — need at least 2"
+            )
+            return
+        }
+        lastCascadeDirection = direction
+        let screen = computeScreenFrame(visibleFrame: targetScreen.visibleFrame)
+        // Use the first window's size — after a multi-window resize
+        // every selected window is the same size as the frontmost,
+        // and the frontmost is what the caller places first.
+        let targetSize = windows[0].frame.size
+        let moved = applyCascadePass(
+            windows: windows,
+            screen: screen,
+            targetSize: targetSize,
+            direction: direction
+        )
+        Log.cascade.info(
+            "Selection cascade \(String(describing: direction), privacy: .public): \(moved, privacy: .public)/\(windows.count, privacy: .public) moved at size \(Int(targetSize.width), privacy: .public)×\(Int(targetSize.height), privacy: .public)"
+        )
+        if moved > 0 { onWindowsMoved?() }
+    }
+
     func performCascadeAllApps(direction: CascadeDirection, targetScreen: NSScreen? = nil) {
         guard isTrusted() else {
             Log.cascade.error("All-apps cascade aborted: AX permission not granted")
             return
         }
+        lastCascadeDirection = direction
 
         // Pick target display — caller-provided (mouse cursor's display
         // from shortcutCascade), then mouse cursor, then primary.

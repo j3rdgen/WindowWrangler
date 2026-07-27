@@ -2,232 +2,264 @@
 //  SelectionOverlay.swift
 //  Window Wrangler
 //
-//  Transparent overlay PANEL that draws the lasso rubber-band rectangle
-//  during an active drag and the highlight borders around currently-
-//  selected windows.
+//  Transparent overlay for the lasso rubber-band and selection
+//  outlines. Uses ONE PERMANENT NSPanel PER DISPLAY, each pinned to
+//  its display's frame — no panel ever moves or resizes during a
+//  drag.
 //
-//  Critical design choice: the panel is dynamically resized to JUST the
-//  bounding box of the active content (lasso rect + selection frames),
-//  plus a small padding for the stroke. It is NEVER full-screen.
+//  Why per-display panels: a single dynamically-resized panel that
+//  crossed the display seam forced WindowServer to re-register the
+//  panel with each display's compositor as its bounds transited,
+//  producing a visible position-jitter on 30-40% of cross-display
+//  drags. Per-display panels never transit anything — a global-coord
+//  outline that straddles two displays is drawn by both panels, each
+//  clipping to its own display bounds naturally.
 //
-//  Earlier full-screen overlay implementations caused both Chrome and
-//  TextEdit to visually disappear because macOS's window-occlusion
-//  detection sees a covering panel — even a transparent one — and many
-//  apps pause their rendering pipeline when fully covered. By limiting
-//  the panel to just the necessary area, the underlying apps remain
-//  visible everywhere except where our highlight border literally is.
-//
-//  NSPanel + .nonactivatingPanel is still used for the same reason it
-//  was tried before: it tells macOS this is a transient utility window
-//  that doesn't take focus or trigger app-activation behaviors.
+//  Panels are non-activating, non-key, ignore mouse events, floating
+//  level, and canJoinAllSpaces so they survive Space swipes on their
+//  own display without re-registration.
 //
 
 import AppKit
+
+private extension NSScreen {
+    /// `CGDirectDisplayID` from the screen's deviceDescription. Stable
+    /// per physical display even when `NSScreen.screens` reorders.
+    /// Zero on failure (only if screen is disconnecting).
+    var displayID: CGDirectDisplayID {
+        (deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value ?? 0
+    }
+}
 
 @MainActor
 final class SelectionOverlay {
 
     // MARK: - State
 
-    private var panel: NSPanel?
-    private var view: OverlayView?
+    /// Panels keyed by CGDirectDisplayID. Populated lazily on first
+    /// content update; kept alive for the app's entire lifetime and
+    /// rebuilt only when the display configuration changes (monitor
+    /// plugged/unplugged, resolution changed).
+    private var panelByDisplay: [CGDirectDisplayID: NSPanel] = [:]
+    private var viewByDisplay: [CGDirectDisplayID: OverlayView] = [:]
 
     /// Most recent lasso rectangle in Cocoa global coordinates.
-    /// nil while no drag is active.
+    /// nil while no rubber-band is active.
     private var currentLassoRect: CGRect?
 
     /// Frames of currently-selected windows in Cocoa global coordinates.
     private var selectionFrames: [CGRect] = []
 
-    /// Cached state at the start of an M6 group drag. While non-nil,
-    /// `updateGroupDrag(offset:)` moves the panel via `setFrameOrigin`
-    /// instead of going through `updateWindow()` — no redraw, just a
-    /// compositor pan. This is what keeps outlines locked to the moving
-    /// windows during a fast drag (see `updateGroupDrag` for the
-    /// rationale in detail).
-    private struct GroupDragBase {
-        let panelOrigin: CGPoint
-        let windowOriginInScreenCoords: CGPoint
-        let selectionFrames: [CGRect]
+    /// Frame of the last-interacted selected window (Cocoa global
+    /// coords). Nil suppresses the resize handles. Set by the
+    /// coordinator whenever the selection or last-interacted window
+    /// changes; cleared before any drag/resize interaction begins.
+    private var frontmostFrame: CGRect?
+
+    /// True while suspend is requested. All panels are ordered out
+    /// and no updates occur. Reserved for future integration; not
+    /// currently used by the coordinator.
+    private var suspended = false
+
+    /// Set once we've subscribed to screen-parameter change
+    /// notifications. Prevents duplicate subscriptions.
+    private var screenChangeObserver: NSObjectProtocol?
+
+    /// Resize-handle geometry, re-exported so LassoCoordinator's
+    /// hit-test can derive the same rects as the drawing code without
+    /// needing access to the private OverlayView.
+    static let handleVisualRadius: CGFloat = 9
+    static let handleHitRadius: CGFloat = 16
+
+    init() {
+        // Subscribe to display config changes (plug / unplug / resolution
+        // change). On change, tear all panels down and let the next
+        // update cycle recreate for the current NSScreen.screens.
+        screenChangeObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.rebuildPanelsForNewScreenConfig()
+            }
+        }
     }
-    private var groupDragBase: GroupDragBase?
+
+    deinit {
+        if let observer = screenChangeObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+    }
 
     // MARK: - Public API
 
     func showLassoRect(_ rect: CGRect) {
         currentLassoRect = rect
-        updateWindow()
+        updateAllPanels()
     }
 
     func hideLassoRect() {
         currentLassoRect = nil
-        updateWindow()
+        updateAllPanels()
     }
 
     func setSelectionFrames(_ frames: [CGRect]) {
         selectionFrames = frames
-        updateWindow()
+        updateAllPanels()
     }
 
-    /// Snapshots the panel + view state so subsequent `updateGroupDrag`
-    /// calls can shift the panel via `setFrameOrigin` relative to a
-    /// stable base. Call once at the start of an M6 group drag; pair
-    /// with `endGroupDrag()` at drag end / cancel.
-    ///
-    /// If the panel doesn't exist yet (no selection was drawn before
-    /// the drag started — shouldn't happen in the current flow, but
-    /// belt-and-suspenders), this is a no-op and updateGroupDrag falls
-    /// back to the normal `updateWindow` path.
-    func beginGroupDrag() {
-        guard let panel = panel, let view = view else { return }
-        groupDragBase = GroupDragBase(
-            panelOrigin: panel.frame.origin,
-            windowOriginInScreenCoords: view.windowOriginInScreenCoords,
-            selectionFrames: selectionFrames
-        )
+    /// Sets the frame whose bottom corners get the resize handles.
+    /// Pass nil to hide the handles (e.g. during any drag / resize
+    /// interaction, or when there is no selection).
+    func setFrontmostFrame(_ frame: CGRect?) {
+        frontmostFrame = frame
+        updateAllPanels()
     }
 
-    /// Pans the overlay panel by `offset` from the group-drag base
-    /// captured in `beginGroupDrag`. No view redraw is performed — the
-    /// panel's cached backing store is blitted at the new origin by
-    /// the compositor, which is a single VSync operation vs. the full
-    /// AppKit redraw path (`needsDisplay = true` + next-runloop draw +
-    /// orderFrontRegardless composite).
-    ///
-    /// The draw path CAN'T keep up with a fast drag: mouse events
-    /// arrive at 100–240Hz and each one only marks the view dirty; the
-    /// actual draw runs once per runloop cycle. When the event tap
-    /// callback saturates the main runloop, draws get starved and the
-    /// outlines visibly lag behind the moving windows.
-    ///
-    /// This fast path avoids the problem entirely: the view is never
-    /// re-drawn during the drag, its previously-rendered surface just
-    /// gets translated. Because every selected window moves by the
-    /// same delta (whole selection is dragged as one) and the panel
-    /// also moves by that delta, each rectangle's screen position
-    /// matches its owning window with zero drawing work.
-    ///
-    /// We keep `windowOriginInScreenCoords` and the stored
-    /// `selectionFrames` in sync with the pan so any future redraw
-    /// (post-drag) produces correct output.
-    func updateGroupDrag(offset: CGPoint) {
-        guard let base = groupDragBase,
-              let panel = panel,
-              let view = view else { return }
-        let newPanelOrigin = CGPoint(
-            x: base.panelOrigin.x + offset.x,
-            y: base.panelOrigin.y + offset.y
-        )
-        panel.setFrameOrigin(newPanelOrigin)
-        view.windowOriginInScreenCoords = CGPoint(
-            x: base.windowOriginInScreenCoords.x + offset.x,
-            y: base.windowOriginInScreenCoords.y + offset.y
-        )
-        selectionFrames = base.selectionFrames.map {
-            $0.offsetBy(dx: offset.x, dy: offset.y)
-        }
-        // Deliberately NO needsDisplay, NO orderFrontRegardless — the
-        // whole point is to skip redraw during the drag.
-    }
-
-    /// Exits group-drag fast-path mode. The next `setSelectionFrames`
-    /// call will go through the normal `updateWindow` flow and redraw
-    /// the panel at fresh, accurate frames.
+    /// Kept for API compatibility with existing callers (stop(),
+    /// escape handler). No-op in the per-display architecture — no
+    /// fast-path pan state to tear down.
     func endGroupDrag() {
-        groupDragBase = nil
+        // No-op.
     }
 
-    /// Tear down the underlying `NSPanel` so the next `updateWindow()`
-    /// creates a fresh one on whatever Space is currently active.
-    /// Called by the coordinator whenever the active Space changes —
-    /// the panel is intentionally NOT flagged `canJoinAllSpaces`, so
-    /// it lives on the Space it was created on and animates off with
-    /// that Space during a swipe. Once the swipe completes on a new
-    /// Space, we destroy the old panel and let the next action
-    /// recreate a fresh one there.
+    /// Kept for API compatibility. In the per-display architecture
+    /// each panel is pinned to its display's frame and marked
+    /// canJoinAllSpaces, so Mission Control swipes on that display
+    /// don't strand it on the previous Space. Rebuilds are only
+    /// necessary on screen-parameter change, which we observe
+    /// directly.
     func spaceDidChange() {
-        panel?.orderOut(nil)
-        panel = nil
-        view = nil
+        // No-op.
     }
 
-    // MARK: - Window lifecycle
+    // MARK: - Panel lifecycle
 
-    /// Recomputes the bounding box of all visible content, resizes the
-    /// panel to match, and either shows or hides it.
-    private func updateWindow() {
-        // Compute union of all content. nil = nothing to show → hide.
-        var union: CGRect? = nil
-        if let lasso = currentLassoRect {
-            union = lasso
+    /// Ensures a panel + view exist for every currently-connected
+    /// screen. Idempotent — called on every update.
+    private func ensurePanelsForCurrentScreens() {
+        let currentIDs = Set(NSScreen.screens.map(\.displayID))
+        // Add missing.
+        for screen in NSScreen.screens {
+            let id = screen.displayID
+            if panelByDisplay[id] == nil {
+                let (panel, view) = makePanel(for: screen)
+                panelByDisplay[id] = panel
+                viewByDisplay[id] = view
+            }
         }
-        for frame in selectionFrames {
-            union = union.map { $0.union(frame) } ?? frame
+        // Remove stale (screen disconnected).
+        for cachedID in panelByDisplay.keys where !currentIDs.contains(cachedID) {
+            panelByDisplay[cachedID]?.orderOut(nil)
+            panelByDisplay.removeValue(forKey: cachedID)
+            viewByDisplay.removeValue(forKey: cachedID)
         }
-
-        guard let contentBox = union, !contentBox.isEmpty else {
-            panel?.orderOut(nil)
-            return
-        }
-
-        // Pad for stroke widths (2pt highlight border, 1.5pt lasso
-        // border, plus a safety pixel).
-        let panelFrame = contentBox.insetBy(dx: -5, dy: -5)
-
-        if panel == nil {
-            createPanel(initialFrame: panelFrame)
-        } else {
-            panel?.setFrame(panelFrame, display: false)
-            view?.frame = NSRect(origin: .zero, size: panelFrame.size)
-        }
-
-        view?.windowOriginInScreenCoords = panelFrame.origin
-        view?.lassoRect = currentLassoRect
-        view?.selectionFrames = selectionFrames
-        view?.needsDisplay = true
-        panel?.orderFrontRegardless()
     }
 
-    private func createPanel(initialFrame: CGRect) {
-        let newPanel = NSPanel(
-            contentRect: initialFrame,
+    /// Rebuild everything when the display configuration changes.
+    /// Called from the screen-parameter observer.
+    private func rebuildPanelsForNewScreenConfig() {
+        for panel in panelByDisplay.values {
+            panel.orderOut(nil)
+        }
+        panelByDisplay.removeAll(keepingCapacity: true)
+        viewByDisplay.removeAll(keepingCapacity: true)
+        updateAllPanels()
+    }
+
+    private func makePanel(for screen: NSScreen) -> (NSPanel, OverlayView) {
+        let panel = NSPanel(
+            contentRect: screen.frame,
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
         )
-        newPanel.isOpaque = false
-        newPanel.backgroundColor = .clear
-        newPanel.hasShadow = false
-        newPanel.ignoresMouseEvents = true
-        newPanel.level = .floating
-        newPanel.hidesOnDeactivate = false
-        // Deliberately NOT `canJoinAllSpaces`: the panel is pinned to
-        // the Space it's created on. That's what we want — when the
-        // user swipes to a different Space, the overlay animates off
-        // with the Space (no lingering outlines on the new Space, no
-        // catch-up delay from waiting for a Space-change notification).
-        // The coordinator calls `spaceDidChange()` on Space change to
-        // destroy this panel; the next lasso or selection action
-        // creates a fresh panel on the now-active Space.
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = false
+        panel.ignoresMouseEvents = true
+        panel.level = .floating
+        panel.hidesOnDeactivate = false
+        // canJoinAllSpaces: appears on every Space of this display,
+        // so Mission Control swipes don't strand it.
         // stationary: don't slide during Mission Control transitions.
         // ignoresCycle: don't show up in Cmd-Tab.
-        // fullScreenAuxiliary: coexist with full-screen apps without
-        // forcing a Space change.
-        newPanel.collectionBehavior = [
+        // fullScreenAuxiliary: coexist with full-screen apps.
+        panel.collectionBehavior = [
+            .canJoinAllSpaces,
             .stationary,
             .ignoresCycle,
             .fullScreenAuxiliary,
         ]
-        newPanel.sharingType = .none
+        panel.sharingType = .none
+        // Suppress AppKit's implicit window animations.
+        panel.animationBehavior = .none
 
-        let newView = OverlayView(
-            frame: NSRect(origin: .zero, size: initialFrame.size)
+        // Pin panel to display's full frame — never moves, never
+        // resizes for the lifetime of this display.
+        panel.setFrame(screen.frame, display: false)
+
+        let view = OverlayView(
+            frame: NSRect(origin: .zero, size: screen.frame.size)
         )
-        newView.windowOriginInScreenCoords = initialFrame.origin
-        newPanel.contentView = newView
+        view.windowOriginInScreenCoords = screen.frame.origin
+        panel.contentView = view
 
-        panel = newPanel
-        view = newView
+        return (panel, view)
+    }
+
+    // MARK: - Update
+
+    /// Distributes current content (lasso rect + selection frames +
+    /// frontmost frame) to each display's panel. Each panel only
+    /// receives content that intersects its display bounds. Panels
+    /// with no content this update are ordered out; panels with
+    /// content are shown (idempotent — no reorder churn if already
+    /// visible).
+    private func updateAllPanels() {
+        if suspended {
+            for panel in panelByDisplay.values {
+                panel.orderOut(nil)
+            }
+            return
+        }
+        ensurePanelsForCurrentScreens()
+        for screen in NSScreen.screens {
+            let id = screen.displayID
+            guard let panel = panelByDisplay[id],
+                  let view = viewByDisplay[id] else { continue }
+            let displayFrame = screen.frame
+
+            // Filter content to what intersects this display.
+            let framesForDisplay = selectionFrames.filter { $0.intersects(displayFrame) }
+            let lassoForDisplay: CGRect? = {
+                guard let rect = currentLassoRect, rect.intersects(displayFrame) else { return nil }
+                return rect
+            }()
+            let frontmostForDisplay: CGRect? = {
+                guard let rect = frontmostFrame, rect.intersects(displayFrame) else { return nil }
+                return rect
+            }()
+            let hasContent = !framesForDisplay.isEmpty
+                || lassoForDisplay != nil
+                || frontmostForDisplay != nil
+
+            view.selectionFrames = framesForDisplay
+            view.lassoRect = lassoForDisplay
+            view.frontmostFrame = frontmostForDisplay
+            view.needsDisplay = true
+
+            if hasContent {
+                if !panel.isVisible {
+                    panel.orderFrontRegardless()
+                }
+            } else {
+                if panel.isVisible {
+                    panel.orderOut(nil)
+                }
+            }
+        }
     }
 }
 
@@ -243,55 +275,38 @@ private final class OverlayView: NSView {
     var lassoRect: CGRect?
     var selectionFrames: [CGRect] = []
 
+    /// The last-interacted window's frame (Cocoa global coords).
+    /// When set, we render two circular grab handles at its bottom
+    /// corners for the multi-window resize feature. Nil when no
+    /// selection exists or during an active drag / resize.
+    var frontmostFrame: CGRect?
+
+    static let handleVisualRadius: CGFloat = 9
+    static let handleHitRadius: CGFloat = 16
+
     override var isFlipped: Bool { false }
 
-    /// Approximate corner radius of macOS system windows (Big Sur+).
-    /// Browser and most native app windows use ~10pt; matching this
-    /// makes the highlight feel native rather than mechanical.
     private let windowCornerRadius: CGFloat = 10.0
 
     override func draw(_ dirtyRect: NSRect) {
         let accent = NSColor.controlAccentColor
 
-        // Highlight borders, drawn first so the lasso rectangle (if
-        // any) layers on top. Rounded-rect bezier paths so the outlines
-        // match the actual window chrome. Dashed stroke (matching the
-        // lasso rubber-band's dash pattern) reinforces the "lasso
-        // capture" feel — these are selected windows, not permanent
-        // chrome. Very subtle fill so overlapping selections don't
-        // accumulate into dense blue regions.
+        // Highlight borders — dashed rounded-rect outlines around each
+        // selected window frame, drawn in local coords by subtracting
+        // the panel's origin.
         let strokeColor = accent.withAlphaComponent(0.57)
-        let fillColor = accent.withAlphaComponent(0.0308)  // barely there
-        // Dash pattern: 6pt on, 4pt off — slightly chunkier than the
-        // lasso rubber-band so it reads at a different scale on larger
-        // window outlines.
+        let fillColor = accent.withAlphaComponent(0.0308)
         let dashPattern: [CGFloat] = [6, 4]
         let strokeWidth: CGFloat = 3.0
         let halfStroke = strokeWidth / 2
-        // Total inset of the path from the reported window frame.
-        // Greater than halfStroke (1.5pt) so the OUTER edge of the
-        // stroke sits clearly INSIDE the window border rather than
-        // straddling or extending past it. The extra `insidePadding`
-        // is the visible gap between the window edge and the dashed
-        // line.
         let insidePadding: CGFloat = 0.5
-        let totalInset = halfStroke + insidePadding  // 2pt
+        let totalInset = halfStroke + insidePadding
         for globalFrame in selectionFrames {
             let local = globalFrame.offsetBy(
                 dx: -windowOriginInScreenCoords.x,
                 dy: -windowOriginInScreenCoords.y
             )
-            // Symmetric inset on all four sides. Result: the dashed
-            // outline is fully inside the visible window border with
-            // a uniform ~0.5pt gap to the edge on every side.
             let strokeRect = local.insetBy(dx: totalInset, dy: totalInset)
-            // Path corner radius reduced by halfStroke (not by
-            // totalInset) so that the OUTER edge of the stroke traces
-            // an arc of exactly `windowCornerRadius` (10pt) — the
-            // native macOS window corner radius. This means the
-            // visible curvature of the highlight corner matches the
-            // window's own corner curvature exactly; the inset just
-            // shifts that curve inward by `insidePadding`.
             let cornerRadius = max(0, windowCornerRadius - halfStroke)
             let path = NSBezierPath(
                 roundedRect: strokeRect,
@@ -311,9 +326,6 @@ private final class OverlayView: NSView {
                 dx: -windowOriginInScreenCoords.x,
                 dy: -windowOriginInScreenCoords.y
             )
-            // The lasso rubber-band stays square-cornered to read as a
-            // selection gesture (matches Finder's lasso) rather than a
-            // window highlight.
             guard let ctx = NSGraphicsContext.current?.cgContext else { return }
             ctx.setFillColor(accent.withAlphaComponent(0.12).cgColor)
             ctx.fill(local)
@@ -322,6 +334,64 @@ private final class OverlayView: NSView {
             ctx.setLineDash(phase: 0, lengths: [5, 3])
             ctx.stroke(local)
             ctx.setLineDash(phase: 0, lengths: [])
+        }
+
+        // Resize handles — drawn LAST so they sit on top.
+        if let frontmost = frontmostFrame {
+            let localFrame = frontmost.offsetBy(
+                dx: -windowOriginInScreenCoords.x,
+                dy: -windowOriginInScreenCoords.y
+            )
+            let bl = CGPoint(x: localFrame.minX, y: localFrame.minY)
+            let br = CGPoint(x: localFrame.maxX, y: localFrame.minY)
+            let radius = OverlayView.handleVisualRadius
+            let fill = accent
+            let outline = NSColor.white.withAlphaComponent(0.9)
+            let corners: [(center: CGPoint, symbolName: String)] = [
+                (bl, "arrow.up.right.and.arrow.down.left"),
+                (br, "arrow.up.left.and.arrow.down.right"),
+            ]
+            for (center, symbolName) in corners {
+                let rect = CGRect(
+                    x: center.x - radius,
+                    y: center.y - radius,
+                    width: radius * 2,
+                    height: radius * 2
+                )
+                let path = NSBezierPath(ovalIn: rect)
+                fill.setFill()
+                path.fill()
+                outline.setStroke()
+                path.lineWidth = 1.5
+                path.stroke()
+
+                let sizeConfig = NSImage.SymbolConfiguration(
+                    pointSize: radius * 1.15,
+                    weight: .bold
+                )
+                let colorConfig = NSImage.SymbolConfiguration(
+                    paletteColors: [.white]
+                )
+                let combined = sizeConfig.applying(colorConfig)
+                if let baseImage = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil),
+                   let glyph = baseImage.withSymbolConfiguration(combined) {
+                    let glyphSize = glyph.size
+                    let glyphRect = NSRect(
+                        x: center.x - glyphSize.width / 2,
+                        y: center.y - glyphSize.height / 2,
+                        width: glyphSize.width,
+                        height: glyphSize.height
+                    )
+                    glyph.draw(
+                        in: glyphRect,
+                        from: .zero,
+                        operation: .sourceOver,
+                        fraction: 1.0,
+                        respectFlipped: true,
+                        hints: [.interpolation: NSImageInterpolation.high.rawValue]
+                    )
+                }
+            }
         }
     }
 }

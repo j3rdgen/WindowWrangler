@@ -132,6 +132,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
             self?.lassoCoordinator.refreshSelectionOverlay()
         }
 
+        // After a multi-window resize, re-cascade the resized
+        // windows using the most-recent cascade direction so a
+        // fan-arranged group stays a fan at the new size. Uses the
+        // resized windows' own display as the cascade target.
+        lassoCoordinator.onResizeCompleted = { [weak self] windows in
+            guard let self, let first = windows.first,
+                  let screen = CoordinateSpace.screen(containing: first.frame) else { return }
+            self.cascadeOrchestrator.performCascadeOnSelection(
+                windows,
+                direction: self.cascadeOrchestrator.lastCascadeDirection,
+                targetScreen: screen
+            )
+        }
+
         // Menu must also rebuild whenever the corral list changes
         // (save / overwrite / delete / rename) so the "Release ▸"
         // submenu stays fresh — same pattern as the snapshot hook.

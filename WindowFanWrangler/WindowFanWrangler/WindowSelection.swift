@@ -28,6 +28,28 @@ final class WindowSelection {
     var count: Int { windows.count }
     var isEmpty: Bool { windows.isEmpty }
 
+    /// The most-recently-interacted-with window inside the current
+    /// selection. Used by the multi-window resize feature to decide
+    /// which window's bottom corners get the resize handles. Updated
+    /// via `markInteracted(_:)` on mouse-down against a selected
+    /// window (regardless of whether it's a click or a drag).
+    ///
+    /// Returns nil when no interaction has ever happened OR when the
+    /// referenced window is no longer in the selection. The caller
+    /// is responsible for its own fallback (typically: visually
+    /// topmost visible selected window — a z-order fallback the
+    /// coordinator can do because it has `CGWindowList` access;
+    /// this class deliberately doesn't reach for it).
+    ///
+    /// Cleared when the referenced window leaves the selection.
+    var lastInteractedWindowID: CGWindowID? {
+        guard let id = _lastInteractedWindowID, windows[id] != nil else {
+            return nil
+        }
+        return id
+    }
+    private var _lastInteractedWindowID: CGWindowID?
+
     func contains(_ id: CGWindowID) -> Bool {
         windows[id] != nil
     }
@@ -68,7 +90,22 @@ final class WindowSelection {
     func clear() {
         guard !windows.isEmpty else { return }
         windows.removeAll()
+        _lastInteractedWindowID = nil
         onChange?()
+    }
+
+    /// Records `id` as the most-recently-interacted window. No-op if
+    /// `id` isn't currently in the selection. Fires `onChange` only
+    /// if this actually shifted the resolved value — the overlay's
+    /// resize-handle position depends on it, so any real change needs
+    /// a redraw.
+    func markInteracted(_ id: CGWindowID) {
+        guard windows[id] != nil else { return }
+        let previous = lastInteractedWindowID
+        _lastInteractedWindowID = id
+        if previous != lastInteractedWindowID {
+            onChange?()
+        }
     }
 
     /// All currently-selected window frames in Cocoa coordinates,

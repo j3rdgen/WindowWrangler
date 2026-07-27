@@ -73,6 +73,27 @@ enum BrowserScripting {
     /// margin. Stale entries fall back to a synchronous fetch.
     private static let cacheMaxAge: CFAbsoluteTime = 15
 
+    /// Bundle IDs currently being prefetched. Prevents duplicate
+    /// concurrent AppleScript fetches for the same browser when the
+    /// coordinator reschedules a prefetch back-to-back.
+    @MainActor
+    private static var prefetchesInFlight: Set<String> = []
+
+    /// When true, prefetch completions stash their results in
+    /// `pendingPrefetchResults` rather than writing directly to the
+    /// snapshot cache. Set by LassoCoordinator during an active
+    /// interaction so the completion's main-thread cache write can't
+    /// stall an in-progress drag redraw. Cleared (and pending
+    /// results flushed) by `flushPendingPrefetchResults()` at
+    /// interaction end.
+    @MainActor
+    static var deferPrefetchCommits: Bool = false
+
+    /// Prefetch completions that arrived while `deferPrefetchCommits`
+    /// was true. Committed via `flushPendingPrefetchResults()`.
+    @MainActor
+    private static var pendingPrefetchResults: [String: [BrowserWindowSnapshot]] = [:]
+
     /// Bundle IDs that respond to the standard Chromium AppleScript
     /// dictionary. All five commercial Chromium-based browsers use
     /// the same command set, so one script serves them all.
@@ -474,6 +495,88 @@ enum BrowserScripting {
                 }
             }
         }
+    }
+
+    /// Targeted prefetch — only the given bundle IDs. Skips browsers
+    /// that are (a) unsupported, (b) not running, (c) already fresh
+    /// in the cache, or (d) already in-flight.
+    ///
+    /// Never requests Automation permission — assumes onboarding
+    /// handled it. Callers pass this from the LassoCoordinator's
+    /// idle-aware scheduler; it fires shortly after a lasso
+    /// interaction ends and only for browsers whose windows are
+    /// actually in the current selection.
+    ///
+    /// Why not just call `prefetchAllBrowsers`: that function
+    /// prefetches every running browser AND runs the automation-
+    /// permission prompt path, which can prompt macOS to display a
+    /// TCC dialog. Neither is appropriate for the mid-lasso idle
+    /// scheduler.
+    @MainActor
+    static func prefetchBrowsers(bundleIDs: Set<String>) {
+        var toFetch: [String] = []
+        for bundleID in bundleIDs {
+            guard isSupportedBrowser(bundleID: bundleID) else { continue }
+            if prefetchesInFlight.contains(bundleID) { continue }
+            if let cached = cachedSnapshot(for: bundleID), !cached.isEmpty { continue }
+            guard NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first != nil else { continue }
+            toFetch.append(bundleID)
+        }
+        guard !toFetch.isEmpty else { return }
+        Log.corral.info(
+            "Targeted prefetch: \(toFetch.count, privacy: .public) browser(s)"
+        )
+        for bundleID in toFetch {
+            prefetchesInFlight.insert(bundleID)
+            DispatchQueue.global(qos: .userInitiated).async {
+                let snapshot = fetchSnapshot(bundleID: bundleID)
+                DispatchQueue.main.async {
+                    prefetchesInFlight.remove(bundleID)
+                    guard let snapshot, !snapshot.isEmpty else {
+                        Log.corral.info(
+                            "Targeted prefetch \(bundleID, privacy: .public) returned empty — not cached"
+                        )
+                        return
+                    }
+                    // Defer cache write during active interactions —
+                    // a main-thread dictionary write here can stall
+                    // an in-progress drag redraw (this is exactly
+                    // the class of "AppleScript completion touches
+                    // main mid-drag" jitter we're avoiding).
+                    if deferPrefetchCommits {
+                        pendingPrefetchResults[bundleID] = snapshot
+                        Log.corral.info(
+                            "Prefetch \(bundleID, privacy: .public) deferred (interaction in progress) — \(snapshot.count, privacy: .public) window(s)"
+                        )
+                    } else {
+                        snapshotCache[bundleID] = (
+                            snapshot: snapshot,
+                            capturedAt: CFAbsoluteTimeGetCurrent()
+                        )
+                        Log.corral.info(
+                            "Prefetched \(bundleID, privacy: .public) — \(snapshot.count, privacy: .public) window(s)"
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    /// Commits any prefetch results that arrived while
+    /// `deferPrefetchCommits` was true. Called by the coordinator at
+    /// interaction end (after clearing `deferPrefetchCommits`).
+    /// Unconditional — safe to call even with nothing pending.
+    @MainActor
+    static func flushPendingPrefetchResults() {
+        guard !pendingPrefetchResults.isEmpty else { return }
+        let now = CFAbsoluteTimeGetCurrent()
+        for (bundleID, snapshot) in pendingPrefetchResults {
+            snapshotCache[bundleID] = (snapshot: snapshot, capturedAt: now)
+        }
+        Log.corral.info(
+            "Flushed \(pendingPrefetchResults.count, privacy: .public) deferred prefetch(es) to cache"
+        )
+        pendingPrefetchResults.removeAll(keepingCapacity: true)
     }
 
     // MARK: - Restore
@@ -980,3 +1083,4 @@ enum BrowserScripting {
         return nil
     }
 }
+
