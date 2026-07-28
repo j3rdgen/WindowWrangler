@@ -61,6 +61,7 @@ final class CascadeOrchestrator {
 
     private let useIntentBasedCascadeAnchor = true
     private let useObservedCascadeResizeCapability = true
+    private let useFixedSizeSlotAdjustment = true          // Stage 2.5
     private let useExplicitCascadeZOrder = true            // Stage 3 (not yet implemented)
 
     // MARK: - State
@@ -775,13 +776,63 @@ final class CascadeOrchestrator {
                 let plannedTarget = shiftedTargets[idx]
                 let isSettable = WindowMutator.isSizeSettable(window.axElement)
                 let naturalSize = window.frame.size
-                let frameSize = isSettable ? plannedTarget.size : naturalSize
-                let target = fitFrame(
-                    plannedOrigin: plannedTarget.origin,
-                    frameSize: frameSize,
-                    naturalSize: naturalSize,
-                    bounds: screen
-                )
+
+                // STAGE 2.5: right-edge alignment for narrow fixed-size
+                // windows in downRight cascades. Existing code already
+                // right-aligns the ANCHOR when it's non-settable (see
+                // anchorEffectiveWidth above); this extends the same
+                // principle to every non-anchor window.
+                //
+                // Gate — only when we're confident the window will
+                // stay narrower than the slot:
+                //   - !isSettable: definitely won't resize (Zoom
+                //     pre-login, About This Mac, some Info panels).
+                //   - Settable but naturalWidth < 60% of target:
+                //     strong signal it's a fixed-size dialog that
+                //     reports settable=true but clamps at write time
+                //     (Get Info at 34% of typical target).
+                // A settable window at 60–99% of target is probably a
+                // normal window the user shrunk — it'll grow back to
+                // target after cascade, so left-alignment is correct.
+                //
+                // downLeft cascades don't need this — the LEFT edge of
+                // every window aligns with the slot origin, which is
+                // already the correct reveal direction.
+                let willStayNarrow = useFixedSizeSlotAdjustment
+                    && naturalSize.width < plannedTarget.size.width
+                    && (!isSettable || naturalSize.width < plannedTarget.size.width * 0.6)
+
+                let target: CGRect
+                if willStayNarrow && direction == .downRight {
+                    // Right-align by shifting the origin so the
+                    // window's right edge lands at the slot's right
+                    // edge. CRITICAL: pass `naturalSize` as fitFrame's
+                    // frameSize argument so its clamp uses the actual
+                    // narrow width — otherwise fitFrame's default
+                    // clamp (max(frameSize, naturalSize) = the wide
+                    // planned width) would drag x back to the anchor
+                    // position and undo the shift entirely.
+                    let shiftedOrigin = CGPoint(
+                        x: plannedTarget.origin.x
+                            + plannedTarget.size.width
+                            - naturalSize.width,
+                        y: plannedTarget.origin.y
+                    )
+                    target = fitFrame(
+                        plannedOrigin: shiftedOrigin,
+                        frameSize: naturalSize,
+                        naturalSize: naturalSize,
+                        bounds: screen
+                    )
+                } else {
+                    let frameSize = isSettable ? plannedTarget.size : naturalSize
+                    target = fitFrame(
+                        plannedOrigin: plannedTarget.origin,
+                        frameSize: frameSize,
+                        naturalSize: naturalSize,
+                        bounds: screen
+                    )
+                }
                 allMoves.append((window.axElement, target))
                 appPlanFrames.append((window.axElement, target))
                 snapshotEntries.append(
