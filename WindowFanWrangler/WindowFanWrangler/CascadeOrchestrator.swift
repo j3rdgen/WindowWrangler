@@ -61,7 +61,8 @@ final class CascadeOrchestrator {
 
     private let useIntentBasedCascadeAnchor = true
     private let useObservedCascadeResizeCapability = true
-    private let useFixedSizeSlotAdjustment = true          // Stage 2.5
+    private let useFixedSizeSlotAdjustment = false         // Stage 2.5 (disabled — see Stage 2.7)
+    private let useAccessoryAppCascade = true              // Stage 2.6
     private let useExplicitCascadeZOrder = true            // Stage 3 (not yet implemented)
 
     // MARK: - State
@@ -443,9 +444,40 @@ final class CascadeOrchestrator {
         }
         let frontApp = resolveTargetApp()
         let frontPID = frontApp?.processIdentifier
+        // STAGE 2.6: also include `.accessory` (LSUIElement=YES) apps.
+        // The default filter (.regular only) drops About This Mac,
+        // which is owned by System Information (com.apple.SystemProfiler)
+        // — an accessory app that never appears in the cascade even
+        // though its window is clearly visible. Blocklist known system
+        // accessory apps whose "windows" aren't real user windows:
+        // Dock (Mission Control panels), SystemUIServer, Control Center,
+        // Notification Center, Stage Manager (WindowManager), wallpaper
+        // agents, Spotlight, loginwindow, screencapture overlay.
+        //
+        // Downstream filters (window count > 0, subrole in allowlist,
+        // size >= 200×100) drop anything the blocklist misses. If some
+        // other system app leaks through with unwanted windows, add
+        // its bundleID here.
+        let systemAccessoryBlocklist: Set<String> = [
+            "com.apple.dock",
+            "com.apple.systemuiserver",
+            "com.apple.controlcenter",
+            "com.apple.notificationcenterui",
+            "com.apple.WindowManager",
+            "com.apple.wallpaper.WallpaperAgent",
+            "com.apple.Spotlight",
+            "com.apple.loginwindow",
+            "com.apple.screencaptureui",
+        ]
         let runningApps = NSWorkspace.shared.runningApplications.filter { app in
-            app.activationPolicy == .regular
-                && app.bundleIdentifier != myBundle
+            guard app.bundleIdentifier != myBundle else { return false }
+            let policy = app.activationPolicy
+            if useAccessoryAppCascade {
+                let allowed = policy == .regular || policy == .accessory
+                return allowed && !systemAccessoryBlocklist.contains(app.bundleIdentifier ?? "")
+            } else {
+                return policy == .regular
+            }
         }.sorted { lhs, rhs in
             // Rule 2: frontmost app wins the anchor position.
             if let frontPID {
