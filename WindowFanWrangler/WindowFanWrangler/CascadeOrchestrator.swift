@@ -59,8 +59,8 @@ final class CascadeOrchestrator {
     // `false`, the old Rule 1 (non-resizable auto-anchor + A→Z
     // tail sort) runs unchanged.
 
-    private let useIntentBasedCascadeAnchor = false
-    private let useObservedCascadeResizeCapability = true  // Stage 2 (not yet implemented)
+    private let useIntentBasedCascadeAnchor = true
+    private let useObservedCascadeResizeCapability = true
     private let useExplicitCascadeZOrder = true            // Stage 3 (not yet implemented)
 
     // MARK: - State
@@ -96,6 +96,60 @@ final class CascadeOrchestrator {
     /// this to detect stable-clamped windows. Reset at the start of
     /// each all-apps cascade.
     private var previousRetryFrames: [(axElement: AXUIElement, frame: CGRect)] = []
+
+    // MARK: - Stage 2 cascade-local resize capability
+    //
+    // Per-cascade classification of what each window's resize
+    // actually did, observed from the frame it ended up at after
+    // pass 1's write. Distinct from the project-wide
+    // `WindowMutator.isSizeSettable` (single boolean) — this is a
+    // richer four-state model that lets us:
+    //   - accept Terminal's character-grid snap without treating it
+    //     as a laggard (constrainedResizable)
+    //   - stop retrying Get Info / About This Mac size writes
+    //     (fixedSize)
+    //   - keep the fast path for normal windows (resizable)
+    //   - fall back safely when AX gives us garbage (unknown)
+    //
+    // Feature-flagged behind `useObservedCascadeResizeCapability`.
+    // When the flag is off, all Stage 2 logic is bypassed and the
+    // Stage 1 stable-clamp tracking handles retry suppression on
+    // its own.
+
+    /// One window's classified resize behavior for the current
+    /// cascade. Never cached across cascades — an app can change
+    /// its resize policy between cascades (Xcode with different
+    /// documents open, Chrome with DevTools attached, etc.).
+    private enum CascadeResizeCapability {
+        /// App accepted the write exactly (within ±4pt rounding).
+        case resizable
+        /// App snapped or clamped to a nearby size — Terminal
+        /// character grid, Xcode minimum size, etc. Verify with a
+        /// larger tolerance and don't retry.
+        case constrainedResizable
+        /// Size unchanged from the pre-cascade natural size. The
+        /// app rejected the resize entirely — Get Info, About This
+        /// Mac, most alert-style panels.
+        case fixedSize
+        /// AX error, transient failure, or classification hasn't
+        /// happened yet. Treated conservatively (uses the tight
+        /// tolerance, still retries).
+        case unknown
+    }
+
+    /// Per-cascade capability lookup keyed by AX element. Populated
+    /// during retry passes by comparing the observed frame against
+    /// the requested target and the pre-cascade size. Reset at the
+    /// start of each all-apps cascade.
+    private var cascadeCapabilityByElement: [(axElement: AXUIElement, capability: CascadeResizeCapability)] = []
+
+    /// Per-cascade cache of each window's size BEFORE pass 1
+    /// wrote to it. Needed for classification: to distinguish
+    /// "app snapped to a nearby constrained size" (returned size
+    /// differs from BOTH requested and original) from "app rejected
+    /// the resize entirely" (returned size equals original).
+    /// Reset at the start of each all-apps cascade.
+    private var preCascadeSizeByElement: [(axElement: AXUIElement, size: CGSize)] = []
 
     // MARK: - Injected dependencies
 
@@ -412,6 +466,14 @@ final class CascadeOrchestrator {
         stableClampedWindows.removeAll()
         previousRetryFrames.removeAll()
 
+        // Stage 2: reset per-cascade capability classification.
+        // preCascadeSizeByElement gets populated below during the
+        // pendingGroups loop (from each window's pre-cascade
+        // frame). cascadeCapabilityByElement starts empty and gets
+        // filled in as retry passes observe post-write frames.
+        cascadeCapabilityByElement.removeAll()
+        preCascadeSizeByElement.removeAll()
+
         let screen = computeScreenFrame(visibleFrame: chosenScreen.visibleFrame)
         let targetSize = CGSize(
             width: screen.width * cascadeWindowSizeFraction,
@@ -433,6 +495,16 @@ final class CascadeOrchestrator {
             let allWindowsForApp = AXWindowEnumerator.windows(of: app)
             let displayWindows = windowsOnDisplay(allWindowsForApp, display: chosenScreen)
             guard !displayWindows.isEmpty else { continue }
+
+            // Stage 2: record every window's pre-cascade size so
+            // the retry loop can classify each window's resize
+            // behavior. Populated regardless of the anchor flag —
+            // it's a lookup table, not a behavior change.
+            if useObservedCascadeResizeCapability {
+                for w in displayWindows {
+                    recordPreCascadeSize(w.frame.size, for: w.axElement)
+                }
+            }
 
             if useIntentBasedCascadeAnchor {
                 // NEW PATH: preserve AX z-order within each group.
@@ -1203,19 +1275,78 @@ final class CascadeOrchestrator {
                     }
                     currentObservations.append((axElement, current.frame))
 
-                    // Already confirmed stable-clamped in an earlier pass.
+                    if self.useObservedCascadeResizeCapability {
+                        // STAGE 2 PATH: classify observed capability
+                        // once (from the readback of pass 1's write),
+                        // then apply capability-aware tolerance.
+                        //
+                        // - resizable / unknown → tight tolerance
+                        //   (±4pt size) — must reach target exactly.
+                        // - constrainedResizable → loose tolerance
+                        //   (±10pt size) — Terminal's grid snap is
+                        //   fine, not a laggard.
+                        // - fixedSize → size ignored entirely;
+                        //   position must still match (a fixed-size
+                        //   window at the wrong slot IS a laggard).
+                        //
+                        // Position and size verify independently so a
+                        // constrained-size accept doesn't hide a
+                        // real position error.
+                        if self.cascadeCapability(for: axElement) == .unknown,
+                           let originalSize = self.preCascadeSize(for: axElement) {
+                            let cap = self.classifyResizeOutcome(
+                                originalSize: originalSize,
+                                requestedSize: target.size,
+                                returnedSize: current.frame.size
+                            )
+                            self.setCascadeCapability(cap, for: axElement)
+                        }
+                        let cap = self.cascadeCapability(for: axElement)
+                        let posOK = self.positionMatches(current.frame, target: target)
+                        let sizeOK = self.sizeMatches(
+                            current.frame.size,
+                            target: target.size,
+                            capability: cap
+                        )
+                        if posOK && sizeOK {
+                            continue
+                        }
+
+                        // Belt-and-suspenders backstop from Stage 1:
+                        // even when the capability-aware check says
+                        // "still not at target," don't keep hammering
+                        // the same doomed write. If a window's frame
+                        // is unchanged from the previous retry pass,
+                        // the app has settled at what it's willing to
+                        // give us — mark stable and stop nudging. This
+                        // is what prevents the Terminal-flicker case:
+                        // repeated laggard writes each fire
+                        // enforceCascadeZOrder below, re-raising every
+                        // window and producing visible flash.
+                        if self.axElementIsInList(self.stableClampedWindows, axElement) {
+                            continue
+                        }
+                        if let previousFrame = self.axElementFrame(in: self.previousRetryFrames, for: axElement),
+                           self.frameMatches(current.frame, target: previousFrame) {
+                            self.stableClampedWindows.append((axElement, current.frame))
+                            continue
+                        }
+
+                        // Real laggard — frame changed since last
+                        // observation AND still doesn't meet the
+                        // capability tolerance. Worth one more nudge.
+                        laggardMoves.append((axElement, target))
+                        continue
+                    }
+
+                    // OLD PATH (flag off): Stage 1 stable-clamp
+                    // detection only. Kept intact for rollback.
                     if self.axElementIsInList(self.stableClampedWindows, axElement) {
                         continue
                     }
-                    // Converged to target.
                     if self.frameMatches(current.frame, target: target) {
                         continue
                     }
-                    // Unchanged since previous retry → mark stable
-                    // and skip. Only detectable from pass 3 onward
-                    // (pass 2 has no previous observation to compare
-                    // against; pass 2 will still nudge once, which is
-                    // fine — it's a single z-order re-enforcement).
                     if let previousFrame = self.axElementFrame(in: self.previousRetryFrames, for: axElement),
                        self.frameMatches(current.frame, target: previousFrame) {
                         self.stableClampedWindows.append((axElement, current.frame))
@@ -1224,7 +1355,8 @@ final class CascadeOrchestrator {
                     laggardMoves.append((axElement, target))
                 }
             }
-            // Update baseline for the next retry pass.
+            // Update baseline for the next retry pass (used by the
+            // OLD path stable-clamp detection).
             self.previousRetryFrames = currentObservations
 
             guard !laggardMoves.isEmpty else {
@@ -1271,6 +1403,34 @@ final class CascadeOrchestrator {
                 guard let current = refreshed.first(where: { CFEqual($0.axElement, axElement) }) else {
                     continue
                 }
+                if self.useObservedCascadeResizeCapability {
+                    // Capability-aware verify: fixed-size windows
+                    // never count as size failures; constrained-
+                    // resizable use ±10pt for size; position always
+                    // uses the tight ±4pt.
+                    //
+                    // Also exclude windows the retry loop marked as
+                    // stable-clamped — they never reached the
+                    // capability-aware target either, but the app
+                    // has settled and we chose to stop nudging.
+                    // Counting them as "STILL not at target" would
+                    // log a false failure.
+                    if self.axElementIsInList(self.stableClampedWindows, axElement) {
+                        continue
+                    }
+                    let cap = self.cascadeCapability(for: axElement)
+                    let posOK = self.positionMatches(current.frame, target: target)
+                    let sizeOK = self.sizeMatches(
+                        current.frame.size,
+                        target: target.size,
+                        capability: cap
+                    )
+                    if !posOK || !sizeOK {
+                        stillFailing += 1
+                    }
+                    continue
+                }
+                // OLD PATH: Stage 1 stable-clamp exclusion only.
                 if self.axElementIsInList(self.stableClampedWindows, axElement) {
                     continue
                 }
@@ -1514,6 +1674,117 @@ final class CascadeOrchestrator {
     ) -> CGRect? {
         for entry in list where CFEqual(entry.axElement, element) { return entry.frame }
         return nil
+    }
+
+    // MARK: - Stage 2 capability helpers
+
+    /// Records the pre-cascade size of a window. Called during
+    /// pendingGroups construction so retry passes have a baseline
+    /// to compare returned sizes against.
+    private func recordPreCascadeSize(_ size: CGSize, for element: AXUIElement) {
+        for i in preCascadeSizeByElement.indices where CFEqual(preCascadeSizeByElement[i].axElement, element) {
+            preCascadeSizeByElement[i].size = size
+            return
+        }
+        preCascadeSizeByElement.append((element, size))
+    }
+
+    /// Looks up the pre-cascade size for a window. Returns nil for
+    /// windows we've never seen (defensive — every cascade member
+    /// should have been recorded in performCascadeAllApps).
+    private func preCascadeSize(for element: AXUIElement) -> CGSize? {
+        for entry in preCascadeSizeByElement where CFEqual(entry.axElement, element) {
+            return entry.size
+        }
+        return nil
+    }
+
+    /// Stores a window's classified resize capability. Called once
+    /// per window on the first retry pass that observes it.
+    private func setCascadeCapability(
+        _ capability: CascadeResizeCapability,
+        for element: AXUIElement
+    ) {
+        for i in cascadeCapabilityByElement.indices where CFEqual(cascadeCapabilityByElement[i].axElement, element) {
+            cascadeCapabilityByElement[i].capability = capability
+            return
+        }
+        cascadeCapabilityByElement.append((element, capability))
+    }
+
+    /// Returns the classified capability for a window. `.unknown`
+    /// if we haven't classified it yet (retry pass hasn't
+    /// observed it) or the element isn't in the cache.
+    private func cascadeCapability(for element: AXUIElement) -> CascadeResizeCapability {
+        for entry in cascadeCapabilityByElement where CFEqual(entry.axElement, element) {
+            return entry.capability
+        }
+        return .unknown
+    }
+
+    /// Classifies the observed resize outcome from three
+    /// measurements: what the window was before, what we asked
+    /// for, and what we got back. See CascadeResizeCapability
+    /// docs for the case semantics.
+    ///
+    /// Tolerances:
+    ///   - normal: ±4pt (sub-pixel AX readback noise)
+    ///   - meaningful delta: ±2pt (below this we consider size
+    ///     unchanged for the "moved from original" test)
+    private func classifyResizeOutcome(
+        originalSize: CGSize,
+        requestedSize: CGSize,
+        returnedSize: CGSize
+    ) -> CascadeResizeCapability {
+        let normalTolerance: CGFloat = 4
+        let meaningfulDelta: CGFloat = 2
+
+        // Reached target within tight tolerance → resizable.
+        let matchesRequest =
+            abs(returnedSize.width - requestedSize.width) <= normalTolerance &&
+            abs(returnedSize.height - requestedSize.height) <= normalTolerance
+        if matchesRequest { return .resizable }
+
+        // Didn't reach target — did it move meaningfully from the
+        // pre-cascade size? If yes, the app took the write and
+        // clamped it (Terminal's grid snap, Xcode's minimum size).
+        // If no, the app rejected the write entirely (Get Info).
+        let movedFromOriginal =
+            abs(returnedSize.width - originalSize.width) > meaningfulDelta ||
+            abs(returnedSize.height - originalSize.height) > meaningfulDelta
+        return movedFromOriginal ? .constrainedResizable : .fixedSize
+    }
+
+    /// Capability-aware size comparison. Fixed-size windows always
+    /// "match" — their actual size IS their correct size. Constrained
+    /// windows accept ±10pt (Terminal-class snap). Resizable and
+    /// unknown windows require the tight ±4pt.
+    private func sizeMatches(
+        _ current: CGSize,
+        target: CGSize,
+        capability: CascadeResizeCapability
+    ) -> Bool {
+        switch capability {
+        case .fixedSize:
+            return true
+        case .constrainedResizable:
+            let tol: CGFloat = 10
+            return abs(current.width - target.width) <= tol &&
+                   abs(current.height - target.height) <= tol
+        case .resizable, .unknown:
+            let tol: CGFloat = 4
+            return abs(current.width - target.width) <= tol &&
+                   abs(current.height - target.height) <= tol
+        }
+    }
+
+    /// Position comparison, capability-independent. Fixed-size
+    /// windows still need to land at the correct origin — being
+    /// non-resizable doesn't mean position doesn't matter.
+    private func positionMatches(_ current: CGRect, target: CGRect) -> Bool {
+        let tol: CGFloat = 4
+        return abs(current.minX - target.minX) <= tol &&
+               abs(current.minY - target.minY) <= tol
     }
 
     /// True if `actual` matches `target` within ±10pt on each of x, y,
