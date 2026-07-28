@@ -46,6 +46,23 @@ final class CascadeOrchestrator {
     /// typical 1200pt-wide cascade window.
     private let interAppLateralOffset: CGFloat = 220
 
+    // MARK: - Cascade behavior feature flags
+    //
+    // Independently switchable knobs for the three-stage cascade
+    // improvement (see brief 2026-07-27). Each defaults to `true`
+    // (new behavior). Set to `false` to fall back to the exact
+    // previous behavior — no additional AX calls, no additional
+    // logging, no reordering that didn't happen before.
+    //
+    // Stage 1 (this session): intent-based anchor selection +
+    // auxiliary-window handling for the all-apps cascade. When
+    // `false`, the old Rule 1 (non-resizable auto-anchor + A→Z
+    // tail sort) runs unchanged.
+
+    private let useIntentBasedCascadeAnchor = false
+    private let useObservedCascadeResizeCapability = true  // Stage 2 (not yet implemented)
+    private let useExplicitCascadeZOrder = true            // Stage 3 (not yet implemented)
+
     // MARK: - State
 
     /// Pre-cascade snapshot for Restore Previous Layout. nil until the
@@ -61,6 +78,24 @@ final class CascadeOrchestrator {
     /// This is how Restore (or a follow-up Cascade in another direction)
     /// cleanly cancels in-flight passes from the prior operation.
     private var cascadeGeneration: UInt64 = 0
+
+    /// Per-cascade cache for the all-apps retry loop. Windows added
+    /// here are excluded from further retry writes — their app has
+    /// clamped them to a natural size that doesn't match the cascade
+    /// target, and additional writes would just re-trigger z-order
+    /// enforcement (which re-raises every window and produces the
+    /// visible flicker the user reported for Get Info / About boxes).
+    /// Populated when a retry pass observes a window whose current
+    /// frame is unchanged from the previous retry — evidence the app
+    /// has settled at its size constraint. Reset at the start of
+    /// each all-apps cascade.
+    private var stableClampedWindows: [(axElement: AXUIElement, frame: CGRect)] = []
+
+    /// Per-cascade cache of each tracked window's frame at the
+    /// PREVIOUS retry pass. The next retry pass compares against
+    /// this to detect stable-clamped windows. Reset at the start of
+    /// each all-apps cascade.
+    private var previousRetryFrames: [(axElement: AXUIElement, frame: CGRect)] = []
 
     // MARK: - Injected dependencies
 
@@ -369,6 +404,14 @@ final class CascadeOrchestrator {
         cascadeGeneration &+= 1
         let myGen = cascadeGeneration
 
+        // Reset per-cascade retry state — fixes the "1-2 seconds of
+        // flicker" issue where fixed-size windows (Get Info, About
+        // This Mac) would trip retry-pass laggard detection on every
+        // pass and each retry would re-fire enforceCascadeZOrder →
+        // every window raised again → visible flash.
+        stableClampedWindows.removeAll()
+        previousRetryFrames.removeAll()
+
         let screen = computeScreenFrame(visibleFrame: chosenScreen.visibleFrame)
         let targetSize = CGSize(
             width: screen.width * cascadeWindowSizeFraction,
@@ -391,41 +434,109 @@ final class CascadeOrchestrator {
             let displayWindows = windowsOnDisplay(allWindowsForApp, display: chosenScreen)
             guard !displayWindows.isEmpty else { continue }
 
-            // Within each app's window list, promote non-resizable
-            // windows to the front. Combined with the group-level
-            // promotion below, this makes any non-resizable window the
-            // AUTO-ANCHOR of the cascade — flush against the anchor
-            // corner at its natural size, frontmost in z-order.
-            let nonResizable = displayWindows.filter { !WindowMutator.isSizeSettable($0.axElement) }
-            let resizable = displayWindows.filter { WindowMutator.isSizeSettable($0.axElement) }
-            pendingGroups.append(PendingGroup(app: app, windows: nonResizable + resizable))
-        }
-
-        // Rule 1: promote non-resizable app groups to the front. When
-        // any auto-anchor is present, drop the frontmost priority for
-        // the tail — everything (both promoted and non-promoted
-        // groups) sorts A→Z. The anchor came from non-resizability,
-        // not from user attention, so users expect Acrobat before
-        // Google Chrome regardless of which app they last clicked.
-        var withNonResizable: [PendingGroup] = []
-        var withoutNonResizable: [PendingGroup] = []
-        for group in pendingGroups {
-            if group.windows.contains(where: { !WindowMutator.isSizeSettable($0.axElement) }) {
-                withNonResizable.append(group)
+            if useIntentBasedCascadeAnchor {
+                // NEW PATH: preserve AX z-order within each group.
+                // No non-resizable promotion — a stray Finder Get Info
+                // (or similar auxiliary that reports non-settable size)
+                // must not jump ahead of the app's real main window,
+                // and must not steal the global anchor slot. The
+                // intent-based reorder below picks the anchor within
+                // the frontmost app's group; other apps keep AX order.
+                pendingGroups.append(PendingGroup(app: app, windows: displayWindows))
             } else {
-                withoutNonResizable.append(group)
+                // OLD PATH: within each app's window list, promote
+                // non-resizable windows to the front. Combined with the
+                // group-level promotion below, this makes any
+                // non-resizable window the AUTO-ANCHOR of the cascade —
+                // flush against the anchor corner at its natural size,
+                // frontmost in z-order.
+                let nonResizable = displayWindows.filter { !WindowMutator.isSizeSettable($0.axElement) }
+                let resizable = displayWindows.filter { WindowMutator.isSizeSettable($0.axElement) }
+                pendingGroups.append(PendingGroup(app: app, windows: nonResizable + resizable))
             }
         }
-        if !withNonResizable.isEmpty {
-            withNonResizable.sort { alphabeticalByAppName($0.app, $1.app) }
-            withoutNonResizable.sort { alphabeticalByAppName($0.app, $1.app) }
-        }
-        pendingGroups = withNonResizable + withoutNonResizable
-        if !withNonResizable.isEmpty {
-            let names = withNonResizable.map { $0.app.localizedName ?? "?" }.joined(separator: ", ")
-            Log.cascade.info(
-                "All-apps cascade: auto-anchoring non-resizable window group(s) — apps: [\(names, privacy: .public)]"
-            )
+
+        if useIntentBasedCascadeAnchor {
+            // NEW PATH: intent-based anchor selection.
+            //
+            // 1. Find the frontmost app's group (already sorted first
+            //    by the runningApps sort above via Rule 2).
+            // 2. Within it, pick the intended anchor window using AX
+            //    metadata: main → focused → first non-auxiliary →
+            //    largest. Auxiliaries (dialogs, modals, floating
+            //    panels) are demoted regardless of z-order — a Get
+            //    Info panel that's currently frontmost still doesn't
+            //    steal the anchor from its parent folder browser.
+            // 3. Move that window to index 0 within the frontmost
+            //    group so the cascade's slot 0 (the anchor position)
+            //    receives it.
+            // 4. Frontmost group stays at pendingGroups index 0 (the
+            //    runningApps sort already put it there).
+            // 5. Other apps keep enumeration order (frontmost-priority
+            //    was the input; retaining that order preserves visual
+            //    stability across cascade runs). No A→Z reshuffling.
+            //
+            // Additional AX reads scoped to the frontmost app's
+            // windows only (4 attrs × N frontmost-app windows,
+            // typically <10 windows). All other apps take zero extra
+            // AX calls — the fast path is preserved.
+            if let frontPID,
+               let frontmostGroupIdx = pendingGroups.firstIndex(where: { $0.app.processIdentifier == frontPID }) {
+                let frontmostGroup = pendingGroups[frontmostGroupIdx]
+                let pick = pickAnchorWindow(from: frontmostGroup.windows)
+                var reorderedWindows = frontmostGroup.windows
+                if pick.index != 0 {
+                    let anchor = reorderedWindows.remove(at: pick.index)
+                    reorderedWindows.insert(anchor, at: 0)
+                }
+                pendingGroups[frontmostGroupIdx] = PendingGroup(
+                    app: frontmostGroup.app,
+                    windows: reorderedWindows
+                )
+                if frontmostGroupIdx != 0 {
+                    let moved = pendingGroups.remove(at: frontmostGroupIdx)
+                    pendingGroups.insert(moved, at: 0)
+                }
+                let anchorTitle = axTitle(of: reorderedWindows[0].axElement) ?? "?"
+                let appName = frontmostGroup.app.localizedName ?? "?"
+                Log.cascade.info(
+                    "Cascade anchor: [\(appName, privacy: .public)] / [\(anchorTitle, privacy: .public)] — reason: \(pick.reason, privacy: .public)"
+                )
+            } else {
+                // No frontmost app resolvable — leave enumeration
+                // order, log for diagnostics.
+                Log.cascade.info(
+                    "Cascade anchor: no frontmost app resolved — using enumeration order"
+                )
+            }
+        } else {
+            // OLD PATH: Rule 1 — promote non-resizable app groups to
+            // the front. When any auto-anchor is present, drop the
+            // frontmost priority for the tail — everything (both
+            // promoted and non-promoted groups) sorts A→Z. The anchor
+            // came from non-resizability, not from user attention, so
+            // users expect Acrobat before Google Chrome regardless of
+            // which app they last clicked.
+            var withNonResizable: [PendingGroup] = []
+            var withoutNonResizable: [PendingGroup] = []
+            for group in pendingGroups {
+                if group.windows.contains(where: { !WindowMutator.isSizeSettable($0.axElement) }) {
+                    withNonResizable.append(group)
+                } else {
+                    withoutNonResizable.append(group)
+                }
+            }
+            if !withNonResizable.isEmpty {
+                withNonResizable.sort { alphabeticalByAppName($0.app, $1.app) }
+                withoutNonResizable.sort { alphabeticalByAppName($0.app, $1.app) }
+            }
+            pendingGroups = withNonResizable + withoutNonResizable
+            if !withNonResizable.isEmpty {
+                let names = withNonResizable.map { $0.app.localizedName ?? "?" }.joined(separator: ", ")
+                Log.cascade.info(
+                    "All-apps cascade: auto-anchoring non-resizable window group(s) — apps: [\(names, privacy: .public)]"
+                )
+            }
         }
 
         // Diagnostic: cascade order so we can spot ordering bugs when
@@ -1068,9 +1179,20 @@ final class CascadeOrchestrator {
                 return
             }
 
-            // Walk every app's plan, collect laggards.
+            // Walk every app's plan, collect laggards. Skip windows
+            // we've already confirmed as stable-clamped (e.g. Get
+            // Info, About This Mac) — retrying them wastes AX writes
+            // AND triggers the enforceCascadeZOrder pass below, which
+            // re-raises every window and produces visible flicker.
+            //
+            // Stable-clamped detection: if a window's current frame
+            // is identical (within tolerance) to what it was at the
+            // previous retry pass, and it still doesn't match target,
+            // the app has settled at its size constraint — further
+            // writes won't change anything.
             var laggardMoves: [(axWindow: AXUIElement, target: CGRect)] = []
             var totalChecked = 0
+            var currentObservations: [(axElement: AXUIElement, frame: CGRect)] = []
             for plan in plans {
                 let refreshed = AXWindowEnumerator.windows(of: plan.app)
                 for (axElement, target) in plan.expectedFrames {
@@ -1079,11 +1201,31 @@ final class CascadeOrchestrator {
                         // Window disappeared (closed, minimized, etc.) — skip.
                         continue
                     }
-                    if !self.frameMatches(current.frame, target: target) {
-                        laggardMoves.append((axElement, target))
+                    currentObservations.append((axElement, current.frame))
+
+                    // Already confirmed stable-clamped in an earlier pass.
+                    if self.axElementIsInList(self.stableClampedWindows, axElement) {
+                        continue
                     }
+                    // Converged to target.
+                    if self.frameMatches(current.frame, target: target) {
+                        continue
+                    }
+                    // Unchanged since previous retry → mark stable
+                    // and skip. Only detectable from pass 3 onward
+                    // (pass 2 has no previous observation to compare
+                    // against; pass 2 will still nudge once, which is
+                    // fine — it's a single z-order re-enforcement).
+                    if let previousFrame = self.axElementFrame(in: self.previousRetryFrames, for: axElement),
+                       self.frameMatches(current.frame, target: previousFrame) {
+                        self.stableClampedWindows.append((axElement, current.frame))
+                        continue
+                    }
+                    laggardMoves.append((axElement, target))
                 }
             }
+            // Update baseline for the next retry pass.
+            self.previousRetryFrames = currentObservations
 
             guard !laggardMoves.isEmpty else {
                 Log.cascade.info(
@@ -1114,6 +1256,11 @@ final class CascadeOrchestrator {
     /// Final diagnostic for the all-apps cascade. Re-checks every
     /// window against its expected target and logs success or failure.
     /// Purely informational — no rescue round.
+    ///
+    /// Excludes windows confirmed as stable-clamped from the failure
+    /// count. Those windows never reached target size because their
+    /// app enforces a fixed size (Get Info, About This Mac, etc.) —
+    /// not a cascade failure, just an app-imposed constraint.
     private func verifyAllAppsCascade(plans: [AppCascadePlan]) {
         var stillFailing = 0
         var totalChecked = 0
@@ -1122,6 +1269,9 @@ final class CascadeOrchestrator {
             for (axElement, target) in plan.expectedFrames {
                 totalChecked += 1
                 guard let current = refreshed.first(where: { CFEqual($0.axElement, axElement) }) else {
+                    continue
+                }
+                if self.axElementIsInList(self.stableClampedWindows, axElement) {
                     continue
                 }
                 if !self.frameMatches(current.frame, target: target) {
@@ -1195,6 +1345,175 @@ final class CascadeOrchestrator {
             y = bounds.minY
         }
         return CGRect(x: x, y: y, width: frameSize.width, height: frameSize.height)
+    }
+
+    // MARK: - Intent-based anchor helpers (Stage 1)
+    //
+    // These helpers are cascade-local. They read a small set of AX
+    // attributes ONLY for the windows of the frontmost app during
+    // anchor picking. Other apps take zero additional AX calls.
+    // No caching across cascades — every helper is called at most
+    // once per window per cascade invocation.
+
+    /// AX metadata subset needed to pick a sensible anchor. Reads
+    /// four attributes on one window (subrole, main, focused, modal).
+    /// Missing attributes default to a conservative "not a signal"
+    /// value — a nil subrole is treated as standard (matches the
+    /// existing AXWindowEnumerator convention), missing bools as
+    /// false.
+    private struct WindowMeta {
+        let subrole: String?
+        let isMain: Bool
+        let isFocused: Bool
+        let isModal: Bool
+    }
+
+    /// Fetches WindowMeta for a single window. Four AX reads per call.
+    /// Called only during anchor picking for the frontmost app's
+    /// windows — <10 windows in the typical case, so <40 AX reads
+    /// total added to a cascade. Not called for other apps.
+    private func fetchWindowMeta(for element: AXUIElement) -> WindowMeta {
+        var subroleValue: CFTypeRef?
+        _ = AXUIElementCopyAttributeValue(element, kAXSubroleAttribute as CFString, &subroleValue)
+        let subrole = subroleValue as? String
+
+        func readBool(_ attr: String) -> Bool {
+            var value: CFTypeRef?
+            _ = AXUIElementCopyAttributeValue(element, attr as CFString, &value)
+            return (value as? Bool) ?? false
+        }
+
+        return WindowMeta(
+            subrole: subrole,
+            isMain: readBool(kAXMainAttribute as String),
+            isFocused: readBool(kAXFocusedAttribute as String),
+            isModal: readBool(kAXModalAttribute as String)
+        )
+    }
+
+    /// True if this window should be considered an auxiliary for
+    /// ANCHOR-SELECTION purposes only. Auxiliary windows are still
+    /// cascade participants — they just don't get the anchor slot
+    /// unless they're the only candidate.
+    ///
+    /// Modal → always auxiliary.
+    /// Subrole:
+    ///   nil                    → standard (some real main windows
+    ///                            return nil; do not exclude).
+    ///   AXStandardWindow       → standard.
+    ///   AXDialog               → auxiliary (Get Info, Preferences,
+    ///                            most alert-style panels).
+    ///   AXFloatingWindow       → auxiliary (utility panels).
+    ///   AXSystemDialog / other → auxiliary.
+    private func isAuxiliaryForAnchoring(_ meta: WindowMeta) -> Bool {
+        if meta.isModal { return true }
+        guard let sub = meta.subrole else { return false }
+        if sub == (kAXStandardWindowSubrole as String) { return false }
+        return true
+    }
+
+    /// Picks the intended anchor window from an app's window list.
+    ///
+    /// Two-tier scan. The first tier requires the candidate to be
+    /// resizable in addition to standard+non-auxiliary. This uses
+    /// resizability as a TIEBREAKER only — not a global determinant.
+    /// Rationale: Finder Get Info reports `AXStandardWindow` +
+    /// `isMain=true` when it's the frontmost Finder window, so the
+    /// subrole+main filter alone can't distinguish it from a folder
+    /// browser. Preferring resizable main lets a real folder browser
+    /// win the anchor when both are present. A fixed-size main window
+    /// still anchors when it's the only standard candidate — the
+    /// second tier catches Zoom pre-login and similar apps that
+    /// legitimately have only a fixed-size window.
+    ///
+    /// Priority (first match wins):
+    ///   Tier 1 — prefers resizable standard windows:
+    ///     1a. Main + non-auxiliary + resizable
+    ///     1b. Focused + non-auxiliary + resizable
+    ///     1c. First non-auxiliary + resizable (AX z-order fallback)
+    ///   Tier 2 — accept fixed-size standard when nothing else fits:
+    ///     2a. Main + non-auxiliary
+    ///     2b. Focused + non-auxiliary
+    ///     2c. First non-auxiliary
+    ///   Tier 3 — final fallback: largest window (only when every
+    ///     candidate is an auxiliary).
+    ///
+    /// Reads AX metadata (4 attrs) + one `isSizeSettable` per window
+    /// in the group. Kept local to the frontmost app's group; caller
+    /// does not invoke this per-app.
+    private func pickAnchorWindow(
+        from windows: [EnumeratedWindow]
+    ) -> (index: Int, reason: String) {
+        let metas = windows.map { fetchWindowMeta(for: $0.axElement) }
+        let resizable = windows.map { WindowMutator.isSizeSettable($0.axElement) }
+
+        // Tier 1: prefer resizable candidates.
+        for (i, m) in metas.enumerated()
+            where m.isMain && !isAuxiliaryForAnchoring(m) && resizable[i] {
+            return (i, "main frontmost")
+        }
+        for (i, m) in metas.enumerated()
+            where m.isFocused && !isAuxiliaryForAnchoring(m) && resizable[i] {
+            return (i, "focused frontmost")
+        }
+        for (i, m) in metas.enumerated()
+            where !isAuxiliaryForAnchoring(m) && resizable[i] {
+            return (i, "visual-order fallback")
+        }
+
+        // Tier 2: accept fixed-size main/standard windows (Zoom
+        // pre-login, About This Mac, etc. — genuine fixed-size apps).
+        for (i, m) in metas.enumerated()
+            where m.isMain && !isAuxiliaryForAnchoring(m) {
+            return (i, "main frontmost (fixed-size)")
+        }
+        for (i, m) in metas.enumerated()
+            where m.isFocused && !isAuxiliaryForAnchoring(m) {
+            return (i, "focused frontmost (fixed-size)")
+        }
+        for (i, m) in metas.enumerated()
+            where !isAuxiliaryForAnchoring(m) {
+            return (i, "visual-order fallback (fixed-size)")
+        }
+
+        // Tier 3: largest window (all candidates are auxiliaries).
+        var largestIdx = 0
+        var largestArea: CGFloat = -1
+        for (i, w) in windows.enumerated() {
+            let area = w.frame.width * w.frame.height
+            if area > largestArea {
+                largestArea = area
+                largestIdx = i
+            }
+        }
+        return (largestIdx, "largest window fallback")
+    }
+
+    /// Reads the AX title of a window. Used only for the debug
+    /// anchor-selection log line. One AX read per call.
+    private func axTitle(of element: AXUIElement) -> String? {
+        var value: CFTypeRef?
+        _ = AXUIElementCopyAttributeValue(element, kAXTitleAttribute as CFString, &value)
+        return value as? String
+    }
+
+    /// AXUIElement isn't Hashable, so cascade-local caches keyed by
+    /// element use a linear-scan pair-list. Small n (<20 in typical
+    /// cascades), so O(n) per lookup is fine.
+    private func axElementIsInList(
+        _ list: [(axElement: AXUIElement, frame: CGRect)],
+        _ element: AXUIElement
+    ) -> Bool {
+        for entry in list where CFEqual(entry.axElement, element) { return true }
+        return false
+    }
+
+    private func axElementFrame(
+        in list: [(axElement: AXUIElement, frame: CGRect)],
+        for element: AXUIElement
+    ) -> CGRect? {
+        for entry in list where CFEqual(entry.axElement, element) { return entry.frame }
+        return nil
     }
 
     /// True if `actual` matches `target` within ±10pt on each of x, y,
