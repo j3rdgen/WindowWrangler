@@ -61,7 +61,7 @@ final class CascadeOrchestrator {
 
     private let useIntentBasedCascadeAnchor = true
     private let useObservedCascadeResizeCapability = true
-    private let useFixedSizeSlotAdjustment = false         // Stage 2.5 (disabled — see Stage 2.7)
+    private let useFixedSizeSlotAdjustment = true          // Stage 2.5 — right-align narrow non-anchor windows (matches anchor treatment)
     private let useAccessoryAppCascade = true              // Stage 2.6
     private let useExplicitCascadeZOrder = true            // Stage 3 (not yet implemented)
 
@@ -700,20 +700,25 @@ final class CascadeOrchestrator {
             )
         }
 
-        // Master anchor position. For downRight the anchor's right
-        // edge is aligned with `screen.maxX`; use the anchor's ACTUAL
-        // width so a non-resizable anchor (like the Zoom pre-login
-        // window) sits flush against the padded right edge instead of
-        // leaving a `targetSize.width - naturalWidth` gap on the right.
-        // For downLeft the anchor's left edge is at `screen.minX`
-        // regardless of size.
-        let anchorEffectiveWidth: CGFloat = {
-            guard let first = pendingGroups.first?.windows.first else { return targetSize.width }
-            return WindowMutator.isSizeSettable(first.axElement) ? targetSize.width : first.frame.width
-        }()
+        // Master anchor position. Slots are computed as if EVERY window
+        // is `targetSize.width` wide — that keeps the right-edge cascade
+        // math consistent for subsequent windows (each slot's right edge
+        // sits `lateralStep` pt inside the previous slot's right edge).
+        //
+        // A narrow anchor (System Settings About = 723pt, Get Info = 400pt,
+        // Zoom pre-login) that doesn't fill its 1168pt slot is right-
+        // aligned within that slot down in the per-window loop below,
+        // so its right edge still lands flush at `screen.maxX` in DR.
+        //
+        // Earlier attempt: use the anchor's natural width for `masterAnchorX`
+        // itself so the anchor slot is narrower. That desynced the
+        // subsequent-slot cascade — slot 1's `targetSize.width` rect then
+        // extended past `screen.maxX`, and Phase 2's rigid shift pulled
+        // the whole fan left by (targetWidth - naturalWidth), reintroducing
+        // the same gap on the right that the change was meant to remove.
         let masterAnchorX: CGFloat = (direction == .downLeft)
             ? screen.minX
-            : screen.maxX - anchorEffectiveWidth
+            : screen.maxX - targetSize.width
         let masterAnchorY = screen.minY
 
         var naturalTargets: [CGRect] = []
@@ -808,31 +813,39 @@ final class CascadeOrchestrator {
                 let plannedTarget = shiftedTargets[idx]
                 let isSettable = WindowMutator.isSizeSettable(window.axElement)
                 let naturalSize = window.frame.size
+                let isAnchor = (idx == 0)
 
                 // STAGE 2.5: right-edge alignment for narrow fixed-size
-                // windows in downRight cascades. Existing code already
-                // right-aligns the ANCHOR when it's non-settable (see
-                // anchorEffectiveWidth above); this extends the same
-                // principle to every non-anchor window.
+                // windows in downRight cascades. Currently gated to the
+                // ANCHOR only — non-anchor narrow windows (e.g. the small
+                // "About This Mac" system dialog at 280pt) stay left-
+                // aligned in their slot because right-aligning them
+                // detaches them visually from the fan.
                 //
-                // Gate — only when we're confident the window will
-                // stay narrower than the slot:
-                //   - !isSettable: definitely won't resize (Zoom
-                //     pre-login, About This Mac, some Info panels).
-                //   - Settable but naturalWidth < 60% of target:
+                // Gate — only when we're confident the window will stay
+                // narrower than the slot:
+                //   - `!isSettable`: definitely won't resize (Zoom
+                //     pre-login).
+                //   - Settable but `naturalWidth < 70% of target`:
                 //     strong signal it's a fixed-size dialog that
                 //     reports settable=true but clamps at write time
-                //     (Get Info at 34% of typical target).
-                // A settable window at 60–99% of target is probably a
+                //     (Get Info at 34% of target, System Settings About
+                //     panel at 62% of target).
+                // A settable window at 70–99% of target is probably a
                 // normal window the user shrunk — it'll grow back to
                 // target after cascade, so left-alignment is correct.
                 //
                 // downLeft cascades don't need this — the LEFT edge of
                 // every window aligns with the slot origin, which is
                 // already the correct reveal direction.
-                let willStayNarrow = useFixedSizeSlotAdjustment
+                let anchorStaysNarrow = isAnchor
+                    && (!isSettable || naturalSize.width < plannedTarget.size.width * 0.7)
                     && naturalSize.width < plannedTarget.size.width
-                    && (!isSettable || naturalSize.width < plannedTarget.size.width * 0.6)
+                let nonAnchorStaysNarrow = useFixedSizeSlotAdjustment
+                    && !isAnchor
+                    && naturalSize.width < plannedTarget.size.width
+                    && (!isSettable || naturalSize.width < plannedTarget.size.width * 0.7)
+                let willStayNarrow = anchorStaysNarrow || nonAnchorStaysNarrow
 
                 let target: CGRect
                 if willStayNarrow && direction == .downRight {
