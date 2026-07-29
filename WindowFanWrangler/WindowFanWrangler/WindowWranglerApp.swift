@@ -136,13 +136,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
         // windows using the most-recent cascade direction so a
         // fan-arranged group stays a fan at the new size. Uses the
         // resized windows' own display as the cascade target.
-        lassoCoordinator.onResizeCompleted = { [weak self] windows in
+        //
+        // `intendedSize` is the user's drag-target size (before any
+        // per-app clamping); passing it as the cascade's slot width
+        // avoids the "stuck frontmost inflates the whole fan" case,
+        // and preserveWindowSizes=true keeps the cascade from
+        // re-writing sizes the apps have already refused (which
+        // otherwise showed up as a visible "extra shrink" 200ms
+        // after mouseUp).
+        lassoCoordinator.onResizeCompleted = { [weak self] windows, intendedSize in
             guard let self, let first = windows.first,
                   let screen = CoordinateSpace.screen(containing: first.frame) else { return }
             self.cascadeOrchestrator.performCascadeOnSelection(
                 windows,
                 direction: self.cascadeOrchestrator.lastCascadeDirection,
-                targetScreen: screen
+                targetScreen: screen,
+                overrideTargetSize: intendedSize,
+                preserveWindowSizes: true
             )
         }
 

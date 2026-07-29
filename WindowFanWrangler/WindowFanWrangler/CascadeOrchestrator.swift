@@ -363,7 +363,9 @@ final class CascadeOrchestrator {
     func performCascadeOnSelection(
         _ windows: [EnumeratedWindow],
         direction: CascadeDirection,
-        targetScreen: NSScreen
+        targetScreen: NSScreen,
+        overrideTargetSize: CGSize? = nil,
+        preserveWindowSizes: Bool = false
     ) {
         guard isTrusted() else {
             Log.cascade.error("Selection cascade aborted: AX permission not granted")
@@ -377,18 +379,21 @@ final class CascadeOrchestrator {
         }
         lastCascadeDirection = direction
         let screen = computeScreenFrame(visibleFrame: targetScreen.visibleFrame)
-        // Use the first window's size — after a multi-window resize
-        // every selected window is the same size as the frontmost,
-        // and the frontmost is what the caller places first.
-        let targetSize = windows[0].frame.size
+        // Slot width defaults to the frontmost's current size (used by
+        // the normal path where sizes are being written to match the
+        // anchor). The auto-cascade after multi-window resize passes
+        // `overrideTargetSize` = the user's drag target, so slot width
+        // reflects intent rather than the frontmost's post-clamp size.
+        let targetSize = overrideTargetSize ?? windows[0].frame.size
         let moved = applyCascadePass(
             windows: windows,
             screen: screen,
             targetSize: targetSize,
-            direction: direction
+            direction: direction,
+            preserveWindowSizes: preserveWindowSizes
         )
         Log.cascade.info(
-            "Selection cascade \(String(describing: direction), privacy: .public): \(moved, privacy: .public)/\(windows.count, privacy: .public) moved at size \(Int(targetSize.width), privacy: .public)×\(Int(targetSize.height), privacy: .public)"
+            "Selection cascade \(String(describing: direction), privacy: .public): \(moved, privacy: .public)/\(windows.count, privacy: .public) moved at size \(Int(targetSize.width), privacy: .public)×\(Int(targetSize.height), privacy: .public)\(preserveWindowSizes ? " (positions only)" : "")"
         )
         if moved > 0 { onWindowsMoved?() }
     }
@@ -1003,15 +1008,50 @@ final class CascadeOrchestrator {
         windows: [EnumeratedWindow],
         screen: CGRect,
         targetSize: CGSize,
-        direction: CascadeDirection
+        direction: CascadeDirection,
+        preserveWindowSizes: Bool = false
     ) -> Int {
         let currentFrames = windows.map(\.frame)
-        let targetFrames = FanGeometry.computeCascade(
+        var targetFrames = FanGeometry.computeCascade(
             windows: currentFrames,
             screen: screen,
             targetSize: targetSize,
             direction: direction
         )
+        if preserveWindowSizes {
+            // Each write becomes position-only: keep each window's
+            // ACTUAL current size (from the fresh AX read the caller
+            // passed in) and reposition into the fan slot.
+            //
+            // Fan-direction edge alignment:
+            //   DR — right edge of the window matches slot.right, so
+            //        wider-than-slot windows extend leftward, narrower
+            //        ones sit against the fan's reveal edge. Preserves
+            //        the right-edge cascade the direction implies.
+            //   DL — left edge matches slot.left (FanGeometry's default).
+            //
+            // Writing the SAME size the window already has (vs writing
+            // targetSize and letting the app clamp) also eliminates the
+            // visible post-release "extra shrink" — the cascade phase
+            // was chasing a rounded target size and re-forcing the write.
+            for i in 0..<targetFrames.count {
+                let slot = targetFrames[i]
+                let actualSize = windows[i].frame.size
+                let originX: CGFloat
+                switch direction {
+                case .downRight:
+                    originX = slot.maxX - actualSize.width
+                case .downLeft:
+                    originX = slot.origin.x
+                }
+                targetFrames[i] = CGRect(
+                    x: originX,
+                    y: slot.origin.y,
+                    width: actualSize.width,
+                    height: actualSize.height
+                )
+            }
+        }
         let moves = zip(windows, targetFrames).map { window, target in
             (axWindow: window.axElement, target: target)
         }
