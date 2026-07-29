@@ -28,39 +28,6 @@ final class LassoCoordinator {
     /// mouseUp / Escape / stop.
     private var currentDrag: DragState?
 
-    /// Non-nil only during an active corner-resize drag. Coalesces
-    /// mid-drag AX size/position writes to the frontmost window onto
-    /// a dedicated background serial queue so the main thread doesn't
-    /// block on cross-app AX IPC while the user is dragging. Without
-    /// this, each mouseDragged event synchronously waits for the
-    /// target app's runloop to process the setFrame call (~20–50ms
-    /// for slow apps like Chrome / System Settings), which lets the
-    /// cursor race ahead of the visibly-resizing window. See
-    /// `ResizeWriter` at the bottom of this file for the coalescing
-    /// contract.
-    private var resizeWriter: ResizeWriter?
-
-    /// When true, corner-resize gestures show a cursor-speed outline
-    /// preview during the drag and perform ZERO AX writes until
-    /// mouse-up — real application windows remain stationary. On
-    /// release, the existing authoritative-resize pipeline runs
-    /// unchanged (setFrame → per-window preflight → per-PID parallel
-    /// writes → settle → readback → toast → onResizeCompleted →
-    /// positions-only recascade).
-    ///
-    /// The visible chunky updates on slow apps like Chrome were an
-    /// artifact of trying to live-resize their windows mid-drag over
-    /// AX IPC. Deferring the real work to release removes that
-    /// bottleneck from the interactive path entirely — the drag is
-    /// now just local AppKit overlay drawing.
-    ///
-    /// Set to `false` to restore the legacy ResizeWriter-based path
-    /// exactly: `ResizeWriter` is created at mouse-down, outlines +
-    /// handles hide, mouseDragged coalesces AX writes on a background
-    /// queue, and `flush()` drains at mouse-up before the final
-    /// synchronous write.
-    private let usePreviewOnlyCornerResizeDrag = true
-
     /// Fires after a multi-window resize completes and the windows
     /// have settled. Callback receives the AX elements + fresh frames
     /// of the resized windows (frontmost first) AND the user's INTENDED
@@ -414,10 +381,6 @@ final class LassoCoordinator {
         resizeToast = nil
         modeHint.hide()
         currentDrag = nil
-        // Drop the writer reference. Any in-flight background write
-        // completes harmlessly against the AX element it already
-        // captured — no need to block main to wait for it.
-        resizeWriter = nil
         if isLassoModeActive {
             isLassoModeActive = false
             onLassoModeChanged?(false)
@@ -453,35 +416,20 @@ final class LassoCoordinator {
                     frontmost: frontmost,
                     others: others
                 )
-                if self.usePreviewOnlyCornerResizeDrag {
-                    // PREVIEW-ONLY MODE: no writer, no AX writes during
-                    // the drag. Real windows stay put; the interactive
-                    // surface is the overlay outline + handles, both of
-                    // which stay visible and follow the cursor at
-                    // AppKit speed via `setResizePreview` on every
-                    // mouseDragged event. Authoritative resize happens
-                    // once, on mouse-up, through the unchanged release
-                    // pipeline (which will find resizeWriter == nil and
-                    // no-op the flush).
-                    self.resizeWriter = nil
-                    var previewFrames = [frontmost.originalFrame]
-                    previewFrames.append(contentsOf: others.map(\.originalFrame))
-                    self.overlay.setResizePreview(
-                        selectionFrames: previewFrames,
-                        frontmostFrame: frontmost.originalFrame
-                    )
-                } else {
-                    self.resizeWriter = ResizeWriter(element: frontmost.axElement)
-                    // Hide outlines AND handles for the duration of the
-                    // resize — same rationale as group drag: nothing on
-                    // screen means nothing to drift. Frontmost window
-                    // itself is live-resized so the user sees the size
-                    // changing; other windows stay put until release.
-                    self.overlay.setFrontmostFrame(nil)
-                    self.overlay.setSelectionFrames([])
-                }
+                // Seed the overlay preview. During the drag the
+                // frontmost outline follows the cursor via
+                // `setResizePreview` on every mouseDragged; secondary
+                // outlines stay at their captured original frames.
+                // No AX writes occur until mouse-up — the authoritative
+                // resize pipeline runs once, on release.
+                var previewFrames = [frontmost.originalFrame]
+                previewFrames.append(contentsOf: others.map(\.originalFrame))
+                self.overlay.setResizePreview(
+                    selectionFrames: previewFrames,
+                    frontmostFrame: frontmost.originalFrame
+                )
                 Log.lasso.info(
-                    "Corner resize began on window \(frontmost.windowID, privacy: .public) ('\(frontmost.ownerName, privacy: .public)') via \(handle == .bottomLeft ? "BL" : "BR", privacy: .public) — \(others.count + 1, privacy: .public) window(s) will resize on release (\(self.usePreviewOnlyCornerResizeDrag ? "preview-only" : "live", privacy: .public))"
+                    "Corner resize began on window \(frontmost.windowID, privacy: .public) ('\(frontmost.ownerName, privacy: .public)') via \(handle == .bottomLeft ? "BL" : "BR", privacy: .public) — \(others.count + 1, privacy: .public) window(s) will resize on release"
                 )
                 return
             }
@@ -541,33 +489,23 @@ final class LassoCoordinator {
                 self.overlay.showLassoRect(rect)
                 self.updateSelection(forLassoRect: rect)
             case .cornerResize(let handle, let anchor, let frontmost, let others):
-                // Compute the frontmost's target frame purely from the
-                // cursor delta — same math regardless of preview vs.
-                // legacy mode.
+                // Update the overlay outline for the frontmost window
+                // and keep every other window at its captured original
+                // frame. Zero AX reads, zero AX writes — the drag is
+                // pure local drawing. Real resize happens once, on
+                // mouse-up.
                 let delta = CGPoint(x: point.x - anchor.x, y: point.y - anchor.y)
                 let target = Self.resizedFrame(
                     from: frontmost.originalFrame,
                     handle: handle,
                     cursorDelta: delta
                 )
-                if self.usePreviewOnlyCornerResizeDrag {
-                    // Preview-only: update the overlay outline for the
-                    // frontmost window and keep every other window at
-                    // its captured original frame. Zero AX reads, zero
-                    // AX writes — the drag is pure local drawing. Real
-                    // resize happens once on mouse-up.
-                    var previewFrames = [target]
-                    previewFrames.append(contentsOf: others.map(\.originalFrame))
-                    self.overlay.setResizePreview(
-                        selectionFrames: previewFrames,
-                        frontmostFrame: target
-                    )
-                } else {
-                    // Legacy live-resize: hand the target to the
-                    // coalescing background writer. See ResizeWriter
-                    // for the last-write-wins contract.
-                    self.resizeWriter?.request(target)
-                }
+                var previewFrames = [target]
+                previewFrames.append(contentsOf: others.map(\.originalFrame))
+                self.overlay.setResizePreview(
+                    selectionFrames: previewFrames,
+                    frontmostFrame: target
+                )
             case .groupDrag(let anchor, _, let snapshots):
                 // Outline-follows model: update the overlay with
                 // fresh per-window target frames every drag event.
@@ -696,20 +634,11 @@ final class LassoCoordinator {
                     handle: handle,
                     cursorDelta: delta
                 )
-                // Drain any pending mid-drag background writes before
-                // the authoritative final write. Without this, a late
-                // background write could land AFTER our synchronous
-                // final setFrame and clobber the exact release-point
-                // frame with a stale mid-drag target. flush() blocks
-                // main for at most one in-flight setFrame call
-                // (~20–50ms on slow apps) — imperceptible at release.
-                self.resizeWriter?.flush()
-                self.resizeWriter = nil
-
-                // Final write to the frontmost — the last mouseDragged
-                // event may not have landed exactly at the release
-                // point, so reaffirm here to make sure it matches
-                // what we'll apply to the others.
+                // Authoritative final write to the frontmost using the
+                // exact mouse-up point. The drag itself never touched
+                // any real window (overlay preview only), so this is
+                // the first and only mid-gesture AX write for the
+                // frontmost.
                 WindowMutator.setFrame(frontmostTarget, of: frontmost.axElement)
 
                 // Compute each OTHER window's target frame: same
@@ -858,7 +787,6 @@ final class LassoCoordinator {
                 Log.lasso.notice("Escape pressed — exiting lasso, clearing selection")
                 self.selection.clear()
                 self.currentDrag = nil
-                self.resizeWriter = nil
                 self.overlay.hideLassoRect()
                 // If we were in a group-drag fast path, exit it so the
                 // overlay hides via the normal `updateWindow` flow (a
@@ -878,17 +806,11 @@ final class LassoCoordinator {
                 // mouse release with nothing visible to show for it).
                 if wasDragging {
                     self.eventMonitor.cancelDrag()
-                    // If the drag was a corner resize:
-                    // - Preview-only mode (`usePreviewOnlyCornerResizeDrag`):
-                    //   no real window was touched during the drag, so
-                    //   Escape simply drops the overlay preview and
-                    //   every real window remains at its original
-                    //   frame. Nothing to restore.
-                    // - Legacy live-resize mode: the frontmost window
-                    //   is now at some intermediate size — leave it
-                    //   as-is (matches drag's "stops where cancelled"
-                    //   spec). Others weren't touched, so no cleanup
-                    //   needed for them either.
+                    // If the drag was a corner resize, no real window
+                    // was touched — the drag is overlay-preview-only,
+                    // so Escape just drops the preview. Group drag is
+                    // live and stops where cancelled; no restore
+                    // needed there either.
                 }
                 if wasActive {
                     self.isLassoModeActive = false
@@ -1533,90 +1455,3 @@ final class LassoCoordinator {
     }
 }
 
-/// Coalesces mid-drag AX writes to a single window onto a background
-/// serial queue so the main thread never blocks on cross-app AX IPC
-/// while the user is dragging a resize handle.
-///
-/// Contract:
-///
-/// - `request(_:)` records the latest target frame. If no write is
-///   currently in flight on the background queue, it schedules a
-///   drain. Returns to the caller immediately — the actual AX round-
-///   trip (~20–50ms for slow apps like Chrome / System Settings) does
-///   not block the caller.
-/// - The background drain pulls the latest pending frame, writes it
-///   via `WindowMutator.setFrame` (synchronous AX IPC on the background
-///   thread), then checks for a newer pending frame and loops. Fast
-///   drags therefore collapse to "the most recent target the drain
-///   hasn't picked up yet" — last-write-wins with no unbounded queue.
-/// - `flush()` blocks the caller until the drain has processed every
-///   request submitted so far. Used at mouseUp so an authoritative
-///   synchronous final write on main can't be clobbered by a late
-///   background write.
-///
-/// Thread safety: AX APIs are already used from background threads
-/// elsewhere (group-drag parallel-per-PID writes) — the framework
-/// serializes internally. `WindowMutator.setFrame` is a nonisolated
-/// static function, safe to call off-main. `element` and `queue` are
-/// let-constants set at init and never mutated. `pendingFrame` and
-/// `isWriting` are guarded by `lock`. This type is intentionally
-/// `fileprivate` and not @MainActor so its background closures can
-/// call `drain()` without hopping to main.
-fileprivate final class ResizeWriter {
-    private let element: AXUIElement
-    private let queue = DispatchQueue(
-        label: "com.jmw3.WindowWrangler.resize-writer",
-        qos: .userInteractive
-    )
-    private var pendingFrame: CGRect?
-    private var isWriting = false
-    private let lock = NSLock()
-
-    init(element: AXUIElement) {
-        self.element = element
-    }
-
-    /// Record the latest target frame for the resize gesture. Kicks
-    /// off a background drain if none is currently in flight.
-    func request(_ frame: CGRect) {
-        lock.lock()
-        pendingFrame = frame
-        let shouldSchedule = !isWriting
-        if shouldSchedule { isWriting = true }
-        lock.unlock()
-        if shouldSchedule {
-            queue.async { [weak self] in self?.drain() }
-        }
-    }
-
-    /// Background: pull the latest pending frame, write it, repeat
-    /// until nothing is pending. Guards the read of `pendingFrame`
-    /// AND the clear of `isWriting` under the same lock so a request
-    /// arriving right as we exit either sees `isWriting == true`
-    /// (and defers to us) or `isWriting == false` (and schedules a
-    /// fresh drain) — no dropped writes.
-    private func drain() {
-        while true {
-            lock.lock()
-            guard let frame = pendingFrame else {
-                isWriting = false
-                lock.unlock()
-                return
-            }
-            pendingFrame = nil
-            lock.unlock()
-            // Full `setFrame` with the size → position → size
-            // clamp-defeat dance. Legacy path only — the current
-            // preview-only corner-resize mode never reaches this
-            // drain because it doesn't create a ResizeWriter in
-            // the first place.
-            WindowMutator.setFrame(frame, of: element)
-        }
-    }
-
-    /// Block until the background queue has processed every request
-    /// submitted so far. Returns with no writes in flight.
-    func flush() {
-        queue.sync {}
-    }
-}
