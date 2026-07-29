@@ -117,6 +117,21 @@ final class SelectionOverlay {
         updateAllPanels()
     }
 
+    /// Atomic update of both stored overlay properties in a single
+    /// panel refresh. The preview-only corner-resize drag calls this
+    /// on every mouseDragged event; using the two separate setters
+    /// would double the number of full-panel updates per pointer
+    /// event. Both values are written before `updateAllPanels()` runs
+    /// so the redraw sees a consistent state.
+    func setResizePreview(
+        selectionFrames: [CGRect],
+        frontmostFrame: CGRect?
+    ) {
+        self.selectionFrames = selectionFrames
+        self.frontmostFrame = frontmostFrame
+        updateAllPanels()
+    }
+
     /// Kept for API compatibility with existing callers (stop(),
     /// escape handler). No-op in the per-display architecture — no
     /// fast-path pan state to tear down.
