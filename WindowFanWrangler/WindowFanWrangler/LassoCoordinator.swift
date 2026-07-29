@@ -1605,17 +1605,11 @@ fileprivate final class ResizeWriter {
             }
             pendingFrame = nil
             lock.unlock()
-            // Full setFrame with the size→position→size clamp-defeat
-            // dance. `setFrameFast` (2 AX calls, no trailing size)
-            // was tried here for throughput but produced a visible
-            // "sticky / fighting the drag" feel: on apps that
-            // clamp size mid-frame (Chrome below its minimum),
-            // dropping the trailing size call left the window at
-            // whatever intermediate size the position write
-            // triggered, and the drain moved on to the next target
-            // before the mismatch could be corrected. Steady 5–6fps
-            // Chrome updates from the full dance read as smoother
-            // than the fast path's stuttering.
+            // Full `setFrame` with the size → position → size
+            // clamp-defeat dance. Legacy path only — the current
+            // preview-only corner-resize mode never reaches this
+            // drain because it doesn't create a ResizeWriter in
+            // the first place.
             WindowMutator.setFrame(frame, of: element)
         }
     }
