@@ -30,11 +30,17 @@ final class LassoCoordinator {
 
     /// Fires after a multi-window resize completes and the windows
     /// have settled. Callback receives the AX elements + fresh frames
-    /// of the resized windows (frontmost first, per spec — cascade
-    /// math anchors on the first window's size). WindowWranglerApp
-    /// wires this to CascadeOrchestrator so a fan-arranged group
-    /// stays a fan after the size change.
-    var onResizeCompleted: (([EnumeratedWindow]) -> Void)?
+    /// of the resized windows (frontmost first) AND the user's INTENDED
+    /// drag-target size — the size the user actually released the
+    /// corner at, before any per-app clamping. The cascade uses that
+    /// as its slot width so a stuck frontmost (System Settings won't
+    /// go below 723pt, Chrome clamps up to 1000pt) doesn't inflate
+    /// the whole fan to accommodate itself.
+    ///
+    /// WindowWranglerApp wires this to CascadeOrchestrator with
+    /// preserveWindowSizes=true so the re-cascade only repositions
+    /// and doesn't try to re-force sizes the apps have already refused.
+    var onResizeCompleted: (([EnumeratedWindow], CGSize) -> Void)?
 
     /// Kind of drag currently in progress and its bookkeeping.
     private enum DragState {
@@ -410,13 +416,18 @@ final class LassoCoordinator {
                     frontmost: frontmost,
                     others: others
                 )
-                // Hide outlines AND handles for the duration of the
-                // resize — same rationale as group drag: nothing on
-                // screen means nothing to drift. Frontmost window
-                // itself is live-resized so the user sees the size
-                // changing; other windows stay put until release.
-                self.overlay.setFrontmostFrame(nil)
-                self.overlay.setSelectionFrames([])
+                // Seed the overlay preview. During the drag the
+                // frontmost outline follows the cursor via
+                // `setResizePreview` on every mouseDragged; secondary
+                // outlines stay at their captured original frames.
+                // No AX writes occur until mouse-up — the authoritative
+                // resize pipeline runs once, on release.
+                var previewFrames = [frontmost.originalFrame]
+                previewFrames.append(contentsOf: others.map(\.originalFrame))
+                self.overlay.setResizePreview(
+                    selectionFrames: previewFrames,
+                    frontmostFrame: frontmost.originalFrame
+                )
                 Log.lasso.info(
                     "Corner resize began on window \(frontmost.windowID, privacy: .public) ('\(frontmost.ownerName, privacy: .public)') via \(handle == .bottomLeft ? "BL" : "BR", privacy: .public) — \(others.count + 1, privacy: .public) window(s) will resize on release"
                 )
@@ -477,18 +488,24 @@ final class LassoCoordinator {
                 let rect = Self.rectBetween(anchor, point)
                 self.overlay.showLassoRect(rect)
                 self.updateSelection(forLassoRect: rect)
-            case .cornerResize(let handle, let anchor, let frontmost, _):
-                // Live-resize the frontmost only — the user sees the
-                // one window's size changing so they know what target
-                // dimensions they're picking. Other windows stay put
-                // and adopt these dimensions on release.
+            case .cornerResize(let handle, let anchor, let frontmost, let others):
+                // Update the overlay outline for the frontmost window
+                // and keep every other window at its captured original
+                // frame. Zero AX reads, zero AX writes — the drag is
+                // pure local drawing. Real resize happens once, on
+                // mouse-up.
                 let delta = CGPoint(x: point.x - anchor.x, y: point.y - anchor.y)
                 let target = Self.resizedFrame(
                     from: frontmost.originalFrame,
                     handle: handle,
                     cursorDelta: delta
                 )
-                WindowMutator.setFrame(target, of: frontmost.axElement)
+                var previewFrames = [target]
+                previewFrames.append(contentsOf: others.map(\.originalFrame))
+                self.overlay.setResizePreview(
+                    selectionFrames: previewFrames,
+                    frontmostFrame: target
+                )
             case .groupDrag(let anchor, _, let snapshots):
                 // Outline-follows model: update the overlay with
                 // fresh per-window target frames every drag event.
@@ -617,10 +634,11 @@ final class LassoCoordinator {
                     handle: handle,
                     cursorDelta: delta
                 )
-                // Final write to the frontmost — the last mouseDragged
-                // event may not have landed exactly at the release
-                // point, so reaffirm here to make sure it matches
-                // what we'll apply to the others.
+                // Authoritative final write to the frontmost using the
+                // exact mouse-up point. The drag itself never touched
+                // any real window (overlay preview only), so this is
+                // the first and only mid-gesture AX write for the
+                // frontmost.
                 WindowMutator.setFrame(frontmostTarget, of: frontmost.axElement)
 
                 // Compute each OTHER window's target frame: same
@@ -628,12 +646,18 @@ final class LassoCoordinator {
                 // top-left corner fixed. Skip windows that AX refuses
                 // to resize, and windows whose new frame would push
                 // off-screen.
-                var skipped: [String] = []
+                // Track skipped windows by windowID (not ownerName). Two
+                // windows of the same app can have different outcomes —
+                // one may be resizable while another (e.g. an Info panel
+                // vs. a browser window under Finder) refuses. Filtering
+                // by name later would drop BOTH from the auto-cascade
+                // whenever any single window of an app failed.
+                var skippedIDs: Set<CGWindowID> = []
                 var toApply: [ResizeSnapshot] = []
                 let targetSize = frontmostTarget.size
                 for snap in others {
                     if !WindowMutator.isSizeSettable(snap.axElement) {
-                        skipped.append(snap.ownerName)
+                        skippedIDs.insert(snap.windowID)
                         continue
                     }
                     let newFrame = Self.resizedFrameKeepingTopLeft(
@@ -641,7 +665,7 @@ final class LassoCoordinator {
                         to: targetSize
                     )
                     if !Self.frameFitsOnScreen(newFrame) {
-                        skipped.append(snap.ownerName)
+                        skippedIDs.insert(snap.windowID)
                         continue
                     }
                     toApply.append(snap)
@@ -674,43 +698,80 @@ final class LassoCoordinator {
                 // multi-window resize the fan geometry no longer fits
                 // the new size, so re-cascade preserves the fan
                 // pattern the user was already working with.
-                let settleDelay: TimeInterval = 0.20
+                //
+                // 100ms is enough padding for most apps to finish
+                // clamping (empirically 50–80ms on Chrome/System
+                // Settings, the slowest we see). 200ms was safety
+                // margin that showed up as a visible post-release
+                // pause before the fan appeared. If we ever catch a
+                // mid-clamp size, the cascade uses `preserveWindowSizes`
+                // (no size writes) so the worst case is ~1–2pt off,
+                // not visible.
+                let settleDelay: TimeInterval = 0.10
                 let frontmostSnapshot = frontmost
                 let othersSnapshots = others
                 DispatchQueue.main.asyncAfter(deadline: .now() + settleDelay) { [weak self] in
                     guard let self else { return }
                     self.refreshOverlayAtRest()
-                    let clamped = self.detectClampedWindows(
+                    let clampedIDs = self.detectClampedWindowIDs(
                         toApply: toApply,
                         target: targetSize
                     )
-                    let allSkipped = Array(Set(skipped + clamped)).sorted()
-                    if !allSkipped.isEmpty {
-                        let resized = (others.count + 1) - allSkipped.count
+                    let allSkippedIDs = skippedIDs.union(clampedIDs)
+                    // Toast wants a deduped, sorted list of APP names —
+                    // "Xcode kept original size" reads better than
+                    // "one Xcode window kept original size". Deriving
+                    // names from IDs here (instead of collecting names
+                    // above) keeps the per-window filter authoritative
+                    // and the display concerns local to this hop.
+                    if !allSkippedIDs.isEmpty {
+                        let names = othersSnapshots
+                            .filter { allSkippedIDs.contains($0.windowID) }
+                            .map(\.ownerName)
+                        let uniqueNames = Array(Set(names)).sorted()
+                        let resized = (others.count + 1) - allSkippedIDs.count
                         self.showResizeToast(
                             resizedCount: resized,
-                            skippedNames: allSkipped
+                            skippedNames: uniqueNames
                         )
                     }
                     // Auto-cascade — frontmost first so the cascade
-                    // math uses its size (which every other resized
-                    // window matches). Skip windows that were flagged
-                    // as skipped-or-clamped: they don't share the
-                    // frontmost's size, so lumping them into a fan
-                    // built on that size would misplace them.
-                    let skippedSet = Set(allSkipped)
-                    let frontmostFresh = self.readFreshEnumeratedWindow(from: frontmostSnapshot)
-                    let othersFresh = othersSnapshots
-                        .filter { !skippedSet.contains($0.ownerName) }
-                        .compactMap { self.readFreshEnumeratedWindow(from: $0) }
-                    let cascadeList = [frontmostFresh].compactMap { $0 } + othersFresh
+                    // math uses its size as the slot target. Include
+                    // EVERY window in the selection, even ones that
+                    // refused the resize or clamped: cascade already
+                    // handles narrow-in-slot layout (right-alignment)
+                    // and the user's whole selection should rearrange
+                    // together after a resize gesture — leaving four
+                    // scattered windows in place while the other six
+                    // fan out looks like the cascade never fired.
+                    // Parallel AX reads — each `readFreshEnumeratedWindow`
+                    // is a cross-app AX IPC blocked on the target app's
+                    // runloop (~5–8ms each). Serially across 9+ windows
+                    // that's ~50–70ms of dead time on the main thread
+                    // between mouseUp settle and cascade fire. Running
+                    // them concurrently drops the whole batch to roughly
+                    // one AX round-trip.
+                    //
+                    // Safety: `readFreshEnumeratedWindow` is nonisolated
+                    // and touches no shared mutable state. Each
+                    // iteration writes to a distinct buffer index via
+                    // `UnsafeMutableBufferPointer`, so there's no data
+                    // race on the results collection.
+                    let allSnapshots: [ResizeSnapshot] = [frontmostSnapshot] + othersSnapshots
+                    var freshResults = [EnumeratedWindow?](repeating: nil, count: allSnapshots.count)
+                    freshResults.withUnsafeMutableBufferPointer { buffer in
+                        DispatchQueue.concurrentPerform(iterations: allSnapshots.count) { i in
+                            buffer[i] = self.readFreshEnumeratedWindow(from: allSnapshots[i])
+                        }
+                    }
+                    let cascadeList = freshResults.compactMap { $0 }
                     if cascadeList.count > 1 {
-                        self.onResizeCompleted?(cascadeList)
+                        self.onResizeCompleted?(cascadeList, targetSize)
                     }
                 }
 
                 Log.lasso.info(
-                    "Corner resize ended; frontmost now \(Int(frontmostTarget.width), privacy: .public)×\(Int(frontmostTarget.height), privacy: .public), applied to \(toApply.count, privacy: .public) other(s), skipped \(skipped.count, privacy: .public) pre-flight"
+                    "Corner resize ended; frontmost now \(Int(frontmostTarget.width), privacy: .public)×\(Int(frontmostTarget.height), privacy: .public), applied to \(toApply.count, privacy: .public) other(s), skipped \(skippedIDs.count, privacy: .public) pre-flight"
                 )
             }
             self.currentDrag = nil
@@ -745,11 +806,11 @@ final class LassoCoordinator {
                 // mouse release with nothing visible to show for it).
                 if wasDragging {
                     self.eventMonitor.cancelDrag()
-                    // If the drag was a corner resize, the frontmost
-                    // window is now at some intermediate size — leave
-                    // it as-is (matches drag's "stops where cancelled"
-                    // spec). Others weren't touched, so no cleanup
-                    // needed for them.
+                    // If the drag was a corner resize, no real window
+                    // was touched — the drag is overlay-preview-only,
+                    // so Escape just drops the preview. Group drag is
+                    // live and stops where cancelled; no restore
+                    // needed there either.
                 }
                 if wasActive {
                     self.isLassoModeActive = false
@@ -1154,7 +1215,13 @@ final class LassoCoordinator {
     /// Reads the current AX frame for a resize snapshot's element and
     /// wraps it in an `EnumeratedWindow` for the cascade path. Nil
     /// if the AX read fails (element pointer went stale, app died).
-    private func readFreshEnumeratedWindow(from snap: ResizeSnapshot) -> EnumeratedWindow? {
+    ///
+    /// `nonisolated` because the body touches no actor state — just an
+    /// AX IPC and a pure coordinate conversion. Callers (specifically
+    /// the batched post-resize read below) use `concurrentPerform` to
+    /// run several instances of this in parallel across the AX
+    /// dispatcher; each one is otherwise ~5–8ms of blocked wait.
+    nonisolated private func readFreshEnumeratedWindow(from snap: ResizeSnapshot) -> EnumeratedWindow? {
         guard let axFrame = AXWindowEnumerator.currentFrame(of: snap.axElement) else {
             return nil
         }
@@ -1165,20 +1232,24 @@ final class LassoCoordinator {
     }
 
     /// After a resize, reads back each attempted window's actual size
-    /// and returns the app names of any that ended up meaningfully
-    /// different from the target (>4pt difference in either dimension).
-    /// These are windows the app "accepted" the write on but clamped
-    /// to its own minimum — Xcode, some IDEs, Terminal.
-    private func detectClampedWindows(
+    /// and returns the IDs of any that ended up meaningfully different
+    /// from the target (>4pt difference in either dimension). These are
+    /// windows the app "accepted" the write on but clamped to its own
+    /// minimum — Xcode, some IDEs, Terminal.
+    ///
+    /// Returns IDs (not names) so the caller can filter per-window: two
+    /// windows of the same app may have different outcomes, and filtering
+    /// by name drops both from the auto-cascade whenever any one clamps.
+    private func detectClampedWindowIDs(
         toApply: [ResizeSnapshot],
         target: CGSize
-    ) -> [String] {
-        var clamped: [String] = []
+    ) -> Set<CGWindowID> {
+        var clamped: Set<CGWindowID> = []
         for snap in toApply {
             guard let actualAX = AXWindowEnumerator.currentFrame(of: snap.axElement) else { continue }
             let actual = CoordinateSpace.cocoaRect(fromAX: actualAX)
             if abs(actual.width - target.width) > 4 || abs(actual.height - target.height) > 4 {
-                clamped.append(snap.ownerName)
+                clamped.insert(snap.windowID)
             }
         }
         return clamped
@@ -1383,3 +1454,4 @@ final class LassoCoordinator {
         return CGRect(x: x, y: y, width: w, height: h)
     }
 }
+
