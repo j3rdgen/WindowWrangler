@@ -147,9 +147,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
         lassoCoordinator.onResizeCompleted = { [weak self] windows, intendedSize in
             guard let self, let first = windows.first,
                   let screen = CoordinateSpace.screen(containing: first.frame) else { return }
+            // Infer cascade direction from the anchor's current x
+            // position relative to the other selected windows, NOT
+            // from lastCascadeDirection. A stale last-direction can
+            // flip the fan (e.g. user cascaded DR then DL then
+            // resized — resize would inherit DL even though the fan
+            // was already re-arranged). Comparing geometry preserves
+            // whatever visual layout the user is actually looking at.
+            // Fully app-agnostic.
+            let others = windows.dropFirst().map { $0.frame.origin.x }
+            let inferredDirection: CascadeDirection
+            if others.isEmpty {
+                inferredDirection = self.cascadeOrchestrator.lastCascadeDirection
+            } else {
+                let anchorX = first.frame.origin.x
+                let othersAverageX = others.reduce(0, +) / CGFloat(others.count)
+                inferredDirection = anchorX > othersAverageX ? .downRight : .downLeft
+            }
             self.cascadeOrchestrator.performCascadeOnSelection(
                 windows,
-                direction: self.cascadeOrchestrator.lastCascadeDirection,
+                direction: inferredDirection,
                 targetScreen: screen,
                 overrideTargetSize: intendedSize,
                 preserveWindowSizes: true
