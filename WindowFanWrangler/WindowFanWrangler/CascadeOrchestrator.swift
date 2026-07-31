@@ -63,7 +63,7 @@ final class CascadeOrchestrator {
     private let useObservedCascadeResizeCapability = true
     private let useFixedSizeSlotAdjustment = true          // Stage 2.5 — right-align narrow non-anchor windows (matches anchor treatment)
     private let useAccessoryAppCascade = true              // Stage 2.6
-    private let useExplicitCascadeZOrder = true            // Stage 3 (not yet implemented)
+    private let useExplicitCascadeZOrder = true            // Stage 3 — deterministic reverse-walk raise pass on single-app + selection cascade paths (all-apps already had `enforceCascadeZOrder`, now with rich logging).
 
     // MARK: - State
 
@@ -289,6 +289,18 @@ final class CascadeOrchestrator {
             "\(String(describing: direction), privacy: .public) on '\(targetAppName, privacy: .public)' pass 1: \(count1, privacy: .public)/\(windows.count, privacy: .public) windows moved"
         )
         if count1 > 0 { onWindowsMoved?() }
+        // Stage 3: deterministic z-order. Raise back-to-front so the
+        // anchor (windows[0]) ends up on top instead of leaving stack
+        // order to whatever ambient behavior the setFrame writes
+        // triggered. Fires once, only if pass 1 actually moved
+        // something — retry passes don't re-raise, matching the flicker
+        // mitigations documented in `stableClampedWindows`.
+        if useExplicitCascadeZOrder && count1 > 0 {
+            raiseCascadedWindows(
+                orderedFrontFirst: windows,
+                context: "\(targetAppName) pass 1"
+            )
+        }
 
         scheduleCascadePass(generation: myGen, after: 0.12, label: "pass 2",
                             app: targetApp, name: targetAppName,
@@ -396,6 +408,16 @@ final class CascadeOrchestrator {
             "Selection cascade \(String(describing: direction), privacy: .public): \(moved, privacy: .public)/\(windows.count, privacy: .public) moved at size \(Int(targetSize.width), privacy: .public)×\(Int(targetSize.height), privacy: .public)\(preserveWindowSizes ? " (positions only)" : "")"
         )
         if moved > 0 { onWindowsMoved?() }
+        // Stage 3: deterministic z-order. Raise back-to-front so the
+        // anchor (windows[0], which the caller — LassoCoordinator's
+        // resize-completion — puts at index 0) ends up on top. Fires
+        // once, only if writes actually happened.
+        if useExplicitCascadeZOrder && moved > 0 {
+            raiseCascadedWindows(
+                orderedFrontFirst: windows,
+                context: "selection"
+            )
+        }
     }
 
     func performCascadeAllApps(direction: CascadeDirection, targetScreen: NSScreen? = nil) {
@@ -919,7 +941,25 @@ final class CascadeOrchestrator {
         // intent: the anchor (first window in cascade order, the most
         // recently used app's window) is FRONT-most, and successive
         // windows are layered BEHIND it.
-        enforceCascadeZOrder(plans: plans)
+        enforceCascadeZOrder(plans: plans, context: "all-apps pass 1")
+
+        // STAGE 3: single delayed re-raise to defeat asynchronous
+        // auto-raise from apps like Chrome and Messages, which raise
+        // themselves in response to their frame set — well after our
+        // synchronous pass 1 raise completes. 300ms is comfortably past
+        // the auto-raise storm on typical hardware but early enough
+        // that the temporary wrong z-order is barely perceptible.
+        // One extra fire (2 total per cascade) means Terminal briefly
+        // flashes to front twice — visible but tolerable, and the
+        // trade for stable z-order at rest.
+        if useExplicitCascadeZOrder {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.30) { [weak self] in
+                guard let self else { return }
+                guard self.cascadeGeneration == myGen else { return }
+                guard self.isTrusted() else { return }
+                self.enforceCascadeZOrder(plans: plans, context: "all-apps +300ms re-raise")
+            }
+        }
 
         // Retry passes.
         scheduleAllAppsRetry(generation: myGen, after: 0.12, label: "pass 2", direction: direction, plans: plans)
@@ -1129,7 +1169,21 @@ final class CascadeOrchestrator {
             Log.cascade.info(
                 "\(String(describing: direction), privacy: .public) on '\(name, privacy: .public)' \(label, privacy: .public): \(count, privacy: .public)/\(refreshed.count, privacy: .public) windows moved"
             )
-            if count > 0 { self.onWindowsMoved?() }
+            if count > 0 {
+                self.onWindowsMoved?()
+                // Stage 3: any setFrame write triggers macOS's ambient
+                // raise-on-write for the touched window, which clobbers
+                // the pass-1 z-order. Re-raise the FULL fan (not just
+                // the laggards) in reverse order so the anchor is back
+                // on top. Fires only when writes happened — mirrors the
+                // all-apps retry loop's flicker mitigation.
+                if self.useExplicitCascadeZOrder {
+                    self.raiseCascadedWindows(
+                        orderedFrontFirst: refreshed,
+                        context: "\(name) \(label)"
+                    )
+                }
+            }
         }
     }
 
@@ -1227,6 +1281,18 @@ final class CascadeOrchestrator {
         Log.cascade.info(
             "Rescue round \(rescueRound, privacy: .public): \(count, privacy: .public)/\(rescueMoves.count, privacy: .public) laggards nudged"
         )
+        // Stage 3: rescue writes touch only laggards but each write's
+        // ambient raise-on-write disturbs z-order for the whole fan.
+        // Re-raise ALL cascade windows (`verification`, not just the
+        // laggards) so the anchor lands back on top. Same reason the
+        // all-apps retry loop passes full `plans` into its own
+        // enforceCascadeZOrder call after any laggard write.
+        if count > 0 && useExplicitCascadeZOrder {
+            raiseCascadedWindows(
+                orderedFrontFirst: verification,
+                context: "\(name) rescue \(rescueRound)"
+            )
+        }
 
         // After this round's rescue: wait 0.4s, then either start
         // another rescue round (if budget remains) or log the final
@@ -1333,21 +1399,196 @@ final class CascadeOrchestrator {
     }
 
     /// After cascading, raises each window via AX `kAXRaiseAction` so
-    /// the visual z-order matches the cascade's intent. Without this,
-    /// macOS keeps the pre-cascade z-order and windows positioned at
-    /// the back of the cascade can render visually in front of the
-    /// anchor windows they're supposed to be peeking out from behind.
+    /// the visual z-order matches the cascade's intent. Used by the
+    /// all-apps path. Thin wrapper — the observation-based repair logic
+    /// lives in `raiseWithObservation`.
+    private func enforceCascadeZOrder(plans: [AppCascadePlan], context: String) {
+        // Build front-to-back slot list from the plan. Targets are in
+        // Cocoa (bottom-left per-screen); convert to AX (top-left
+        // global) so match keys line up with CGWindow bounds.
+        let slots: [(app: NSRunningApplication, axElement: AXUIElement, axOrigin: CGPoint, target: CGRect)] =
+            plans.flatMap { plan in
+                plan.expectedFrames.map {
+                    (plan.app, $0.axElement, CoordinateSpace.axRect(fromCocoa: $0.target).origin, $0.target)
+                }
+            }
+        raiseWithObservation(slots, context: context)
+    }
+
+    /// Shared helper: observation-based minimum-prefix raise, with
+    /// tight-loop full-walk fallback. Used by both `enforceCascadeZOrder`
+    /// (all-apps) and `raiseCascadedWindows` (single-app + selection).
     ///
-    /// Iteration order is reverse-of-reverse: last app first, last
-    /// window within each app first. Each raise brings that window
-    /// to the front of the current stack; the very last raise (anchor
-    /// window of the first app) ends up globally on top.
-    private func enforceCascadeZOrder(plans: [AppCascadePlan]) {
-        for plan in plans.reversed() {
-            for (axElement, _) in plan.expectedFrames.reversed() {
-                AXUIElementPerformAction(axElement, kAXRaiseAction as CFString)
+    /// Strategy:
+    ///   1. Read current on-screen z-order via `CGWindowListCopyWindowInfo`
+    ///      (public, metadata-only — no Screen Recording permission).
+    ///   2. Match observed windows to `slots` by (pid, ax-origin) with
+    ///      a ±4pt tolerance (matches the codebase's standard frame
+    ///      tolerance and absorbs character-grid snapping).
+    ///   3. Determine the smallest front-prefix whose intended order
+    ///      does NOT already match observation. Everything deeper than
+    ///      that prefix is already in place and is left untouched.
+    ///   4. Raise the prefix back-to-front in a tight loop. Deeper
+    ///      windows are not touched — they cannot visibly flash on
+    ///      this pass.
+    ///   5. If observation fails or is incomplete, fall back to the
+    ///      previously-approved full walk. Correctness is never
+    ///      sacrificed for the optimization.
+    ///
+    /// `slots` is expected front-to-back: anchor first, deepest last.
+    private func raiseWithObservation(
+        _ slots: [(app: NSRunningApplication, axElement: AXUIElement, axOrigin: CGPoint, target: CGRect)],
+        context: String
+    ) {
+        guard !slots.isEmpty else { return }
+        let anchor = slots[0]
+        let n = slots.count
+
+        // Tight-loop full-walk fallback. Raises back-to-front, so the
+        // anchor (slots[0]) lands on top.
+        let fallbackFullWalk: (String) -> Void = { reason in
+            for slot in slots.reversed() {
+                AXUIElementPerformAction(slot.axElement, kAXRaiseAction as CFString)
+            }
+            Log.cascade.info(
+                "Stage 3 z-order (\(context, privacy: .public)) [fallback: \(reason, privacy: .public)]: full walk — \(n, privacy: .public) raise(s), anchor='\(anchor.app.localizedName ?? "?", privacy: .public)' pid=\(anchor.app.processIdentifier, privacy: .public) origin=(\(Int(anchor.target.origin.x), privacy: .public),\(Int(anchor.target.origin.y), privacy: .public))"
+            )
+            for (raiseOrder, slot) in slots.reversed().enumerated() {
+                let isAnchor = raiseOrder == n - 1
+                Log.cascade.info(
+                    "  raise[\(raiseOrder, privacy: .public)] \(slot.app.localizedName ?? "?", privacy: .public) pid=\(slot.app.processIdentifier, privacy: .public) origin=(\(Int(slot.target.origin.x), privacy: .public),\(Int(slot.target.origin.y), privacy: .public))\(isAnchor ? " ← anchor" : "", privacy: .public)"
+                )
             }
         }
+
+        // Read current on-screen z-order (front-to-back per Apple docs).
+        let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+        guard let raw = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] else {
+            fallbackFullWalk("CGWindowListCopyWindowInfo returned nil")
+            return
+        }
+
+        // Walk the observed list in z-order, recording the intended
+        // slot index of each entry we recognize. Unrelated windows are
+        // skipped. The `assigned` set prevents a second observed window
+        // with the same (pid, origin) from being credited to a slot
+        // already claimed by an earlier entry.
+        var observedIndices: [Int] = []
+        observedIndices.reserveCapacity(n)
+        var assigned = Set<Int>()
+        for info in raw {
+            guard let pid = info[kCGWindowOwnerPID as String] as? pid_t,
+                  let boundsDict = info[kCGWindowBounds as String] as? NSDictionary
+            else { continue }
+            var bounds = CGRect.zero
+            guard CGRectMakeWithDictionaryRepresentation(boundsDict, &bounds) else { continue }
+            for i in 0..<n where !assigned.contains(i) {
+                let s = slots[i]
+                if s.app.processIdentifier == pid
+                    && abs(s.axOrigin.x - bounds.origin.x) <= 4
+                    && abs(s.axOrigin.y - bounds.origin.y) <= 4 {
+                    observedIndices.append(i)
+                    assigned.insert(i)
+                    break
+                }
+            }
+        }
+
+        // If any planned window wasn't confidently matched (frame write
+        // still in flight, unexpected clamp), fall back rather than
+        // raise a partial prefix based on stale data.
+        guard observedIndices.count == n else {
+            fallbackFullWalk("matched \(observedIndices.count)/\(n) planned window(s)")
+            return
+        }
+
+        // Find how far back the front-to-back order is already correct.
+        // Walk from the deepest position toward position 0. The first
+        // position whose observed slot index doesn't equal its own
+        // index defines the boundary.
+        var correctTo = 0
+        for i in stride(from: n - 1, through: 0, by: -1) {
+            if observedIndices[i] != i {
+                correctTo = i + 1
+                break
+            }
+        }
+
+        guard correctTo > 0 else {
+            Log.cascade.info(
+                "Stage 3 z-order (\(context, privacy: .public)): observed order already matches intent — 0 raise(s), \(n, privacy: .public) window(s) untouched"
+            )
+            return
+        }
+
+        // Raise slots[0..correctTo-1] back-to-front. Windows deeper
+        // than `correctTo` are already at rest and are not touched.
+        let prefixBackToFront = Array(slots.prefix(correctTo).reversed())
+        for slot in prefixBackToFront {
+            AXUIElementPerformAction(slot.axElement, kAXRaiseAction as CFString)
+        }
+
+        Log.cascade.info(
+            "Stage 3 z-order (\(context, privacy: .public)): correcting front-prefix — \(correctTo, privacy: .public)/\(n, privacy: .public) raise(s), \(n - correctTo, privacy: .public) deeper window(s) untouched, anchor='\(anchor.app.localizedName ?? "?", privacy: .public)' pid=\(anchor.app.processIdentifier, privacy: .public) origin=(\(Int(anchor.target.origin.x), privacy: .public),\(Int(anchor.target.origin.y), privacy: .public))"
+        )
+        for (raiseOrder, slot) in prefixBackToFront.enumerated() {
+            let isAnchor = raiseOrder == prefixBackToFront.count - 1
+            Log.cascade.info(
+                "  raise[\(raiseOrder, privacy: .public)] \(slot.app.localizedName ?? "?", privacy: .public) pid=\(slot.app.processIdentifier, privacy: .public) origin=(\(Int(slot.target.origin.x), privacy: .public),\(Int(slot.target.origin.y), privacy: .public))\(isAnchor ? " ← anchor" : "", privacy: .public)"
+            )
+        }
+    }
+
+    /// Raises the given windows in reverse of their input order so the
+    /// first element (the intended anchor) lands globally on top. Each
+    /// `kAXRaiseAction` also activates the window's owning application
+    /// as a side effect, so the anchor's app ends up frontmost — but
+    /// that's incidental, not enforced (`NSRunningApplication.activate`
+    /// would be the explicit lever; we don't call it here to avoid the
+    /// Sequoia+ activation-policy edge cases).
+    ///
+    /// Emits a summary line plus one line per raise (in actual raise
+    /// order) at `info` level so a `log stream` tail can visually
+    /// confirm z-order is being enforced deterministically. The
+    /// per-window lines are labeled by owner + windowID; the very last
+    /// raise is marked `← anchor` so it's obvious which window ended
+    /// on top.
+    ///
+    /// Called from the single-app and selection cascade entry points
+    /// after pass 1, and from the single-app retry / rescue paths
+    /// whenever writes moved something.
+    ///
+    /// Thin wrapper: builds a front-to-back slot list by reading each
+    /// window's CURRENT frame via AX (post-write, this equals the
+    /// intended target within tolerance) and delegates to the shared
+    /// observation-based helper. Any window that can't be re-read is
+    /// dropped from the slot list, which triggers the helper's
+    /// full-walk fallback — never a partial raise on stale data.
+    private func raiseCascadedWindows(orderedFrontFirst windows: [EnumeratedWindow], context: String) {
+        guard !windows.isEmpty else { return }
+        var appByPID: [pid_t: NSRunningApplication] = [:]
+        var slots: [(app: NSRunningApplication, axElement: AXUIElement, axOrigin: CGPoint, target: CGRect)] = []
+        slots.reserveCapacity(windows.count)
+        for window in windows {
+            var pid: pid_t = 0
+            AXUIElementGetPid(window.axElement, &pid)
+            let app: NSRunningApplication
+            if let cached = appByPID[pid] {
+                app = cached
+            } else if let looked = NSRunningApplication(processIdentifier: pid) {
+                app = looked
+                appByPID[pid] = looked
+            } else {
+                continue
+            }
+            // Fresh AX read gives the actual current frame post-write.
+            // Fall back to the input frame if AX refuses.
+            let axRect = AXWindowEnumerator.currentFrame(of: window.axElement)
+                ?? CoordinateSpace.axRect(fromCocoa: window.frame)
+            let target = CoordinateSpace.cocoaRect(fromAX: axRect)
+            slots.append((app, window.axElement, axRect.origin, target))
+        }
+        raiseWithObservation(slots, context: context)
     }
 
     /// One app's planned cascade as part of an all-apps cascade. Captures
@@ -1516,7 +1757,7 @@ final class CascadeOrchestrator {
             // between cascade runs. Re-enforce z-order now so the retry
             // doesn't break the stacking pass 1 established.
             if count > 0 {
-                self.enforceCascadeZOrder(plans: plans)
+                self.enforceCascadeZOrder(plans: plans, context: "all-apps \(label) (post-write)")
             }
         }
     }
