@@ -26,7 +26,8 @@ macOS window management utility. Sits alongside apps like Rectangle, Magnet, Moo
 
 - **User-facing name:** Window Wrangler
 - **Bundle identifier:** `com.jmw3.WindowWrangler`
-- **Repo / project folder / Xcode target:** `WindowFan` / `WindowFanWrangler` (legacy from an earlier working name; a handoff developer can rename during production polish)
+- **GitHub repo:** `WindowWrangler`
+- **Local folder / Xcode target:** `WindowFan` / `WindowFanWrangler` (legacy from an earlier working name; a handoff developer can rename during production polish)
 
 Any customer-facing surface uses "Window Wrangler."
 

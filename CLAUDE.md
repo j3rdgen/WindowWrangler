@@ -1,7 +1,7 @@
 Window Wrangler (working folder: WindowFan)
 Project overview
 A macOS menu bar utility for arranging windows. Two core mechanics: (1) cascade — stagger a set of windows in a fan layout that preserves title bar and tab visibility; (2) lasso — hold Option+W and click-drag to rubber-band-select windows across apps, then operate on them as a group (apply cascade, or drag them as one). This is a personal prototype phase — NOT for distribution yet. Goal is to validate the core mechanics on my own machine before hiring a developer for production polish.
-The product name everywhere user-facing is "Window Wrangler". The repo folder, Xcode project internals, and bundle identifier still say "WindowFan" or "WindowFanWrangler" for legacy reasons; the handoff developer can collapse these later with proper tooling.
+The product name everywhere user-facing is "Window Wrangler". The GitHub repo is `WindowWrangler`. The bundle identifier is already `com.jmw3.WindowWrangler`. The local folder and Xcode project internals still say "WindowFan" or "WindowFanWrangler" for legacy reasons; the handoff developer can collapse these later with proper tooling.
 My profile
 I am a non-developer using AI as the primary code author. I can read code at a high level, run commands you give me, and describe behavior I observe — but I cannot debug Swift errors on my own. When something doesn't work, I'll describe what I see and you'll diagnose. Be explicit and step-by-step.
 Tech stack
