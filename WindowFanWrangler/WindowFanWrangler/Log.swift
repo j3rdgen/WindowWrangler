@@ -59,4 +59,7 @@ enum Log {
 
     /// Corral feature — save/restore of named window workspaces.
     static let corral     = Logger(subsystem: subsystem, category: "corral")
+
+    /// Plot feature — single-window snap-to-drawn-area mode.
+    static let plot       = Logger(subsystem: subsystem, category: "plot")
 }

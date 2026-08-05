@@ -120,6 +120,364 @@ enum BrowserScripting {
         return chromiumBundleIDs.contains(bundleID) || bundleID == safariBundleID
     }
 
+    // MARK: - Native window-bounds transport (Plot + Cascade)
+    //
+    // Public entry points used by PlotCoordinator and CascadeOrchestrator
+    // to set a Chromium-family browser window's frame via AppleScript
+    // `set bounds` instead of AX. Rationale: Chrome (and other Chromium
+    // browsers) asynchronously revert AX size writes on their next
+    // runloop tick, restoring their persisted preferred size. The
+    // AppleScript `bounds` write goes through the browser's Apple
+    // Event handler and — per the codebase's production usage in
+    // Corral restore (see `moveBrowserWindow`) — is not subject to
+    // the same revert loop.
+    //
+    // This is a TRANSPORT — not a geometry decision, not a rewrite of
+    // Plot or Cascade. Callers pass the target frame they already
+    // computed; this module handles browser identification and the
+    // AppleScript round-trip. Callers must gate on
+    // `supportsNativeWindowBounds` first and be prepared to fall back
+    // to AX on any structured failure.
+
+    /// Interactive timeout for a Plot / Cascade native-bounds call.
+    /// Shorter than Corral's 5s: these paths are interactive and a
+    /// hung script must not stall the user's next action. Callers
+    /// may pass a smaller value when nested inside a tighter budget.
+    /// `nonisolated` so it can be used as a default parameter value
+    /// on @MainActor methods without an isolation-inheritance warning.
+    nonisolated static let nativeBoundsTimeout: TimeInterval = 1.5
+
+    /// Center-distance tolerance used by the pure matcher. Matches
+    /// `snapshotBrowserWindowNearFrame`'s tolerance (12pt); consistent
+    /// AX-vs-AppleScript rounding drift absorption. Multiplied by 4
+    /// to derive the accept threshold (~48pt center distance =
+    /// ~34pt per axis at 45°).
+    nonisolated static let nativeBoundsMatchTolerance: CGFloat = 12
+
+    /// If the second-best candidate is within this margin of the
+    /// best, the match is rejected as ambiguous. Prevents moving
+    /// the wrong Chrome window when two are close together.
+    nonisolated static let nativeBoundsAmbiguityMargin: CGFloat = 6
+
+    /// Centralized supported-browser check. PlotCoordinator and
+    /// CascadeOrchestrator MUST NOT duplicate `chromiumBundleIDs` —
+    /// call this instead. Safari intentionally excluded: Safari's
+    /// AX writes are already reliable, so no native fallback is
+    /// needed and the same behavior would only add code paths.
+    static func supportsNativeWindowBounds(bundleID: String) -> Bool {
+        return chromiumBundleIDs.contains(bundleID)
+    }
+
+    /// Outcome of a single-window native bounds write. Callers switch
+    /// on this rather than parse log strings.
+    enum BrowserBoundsMoveResult: Sendable, Equatable {
+        case success(elapsed: TimeInterval)
+        case unsupported
+        case automationDenied
+        case permissionUnavailable
+        case browserNotRunning
+        case noMatch
+        case ambiguousMatch
+        case timedOut
+        case targetDisappeared
+        case scriptError(String)
+    }
+
+    /// Pure-matcher outcome — separate from BrowserBoundsMoveResult
+    /// so the matcher stays unit-testable without the async transport
+    /// surface. Kept internal to the module.
+    enum BrowserBoundsMatch: Equatable {
+        case confident(index: Int)
+        case noMatch
+        case ambiguous
+    }
+
+    /// PURE matcher — no AX calls, no AppleScript, no I/O. Given a
+    /// requested AX frame and the browser's fresh bounds list, returns
+    /// a confident single match, ambiguous, or noMatch. Testable in
+    /// isolation.
+    ///
+    /// Rules (all four must pass for a confident match):
+    ///   1. At least one candidate exists.
+    ///   2. The best (nearest center-distance) candidate is within
+    ///      `nativeBoundsMatchTolerance * 4` of the request.
+    ///   3. The second-best candidate is either absent, beyond
+    ///      threshold, OR farther than the best by at least
+    ///      `nativeBoundsAmbiguityMargin`.
+    ///   4. No two candidates within threshold have indistinguishable
+    ///      bounds — if they do, we cannot tell them apart even by
+    ///      index and MUST reject as ambiguous.
+    ///
+    /// Duplicate-detection is scoped to "candidates within accept
+    /// threshold" — two identical windows far from the request don't
+    /// contaminate a clear single match closer to it.
+    static func matchBrowserWindow(
+        requestedAX: CGRect,
+        candidates: [(index: Int, boundsAX: CGRect)]
+    ) -> BrowserBoundsMatch {
+        guard !candidates.isEmpty else { return .noMatch }
+        let threshold = max(nativeBoundsMatchTolerance * 4, 50)
+        // Score every candidate.
+        let scored = candidates
+            .map { (index: $0.index, bounds: $0.boundsAX,
+                    distance: nativeBoundsCenterDistance($0.boundsAX, requestedAX)) }
+            .sorted { $0.distance < $1.distance }
+        let withinThreshold = scored.filter { $0.distance <= threshold }
+        // Rule 4: duplicate bounds inside the accept set → ambiguous.
+        for i in 0..<withinThreshold.count {
+            for j in (i+1)..<withinThreshold.count {
+                if nativeBoundsRectsIndistinguishable(withinThreshold[i].bounds,
+                                                     withinThreshold[j].bounds) {
+                    return .ambiguous
+                }
+            }
+        }
+        guard let best = scored.first, best.distance <= threshold else {
+            return .noMatch
+        }
+        if scored.count >= 2 {
+            let second = scored[1]
+            if second.distance <= threshold
+                && (second.distance - best.distance) < nativeBoundsAmbiguityMargin {
+                return .ambiguous
+            }
+        }
+        return .confident(index: best.index)
+    }
+
+    /// One requested move for a batch native-bounds call. Kept
+    /// deliberately narrow — callers pass AX frames, not AX elements,
+    /// so the transport layer never touches AX.
+    struct BrowserBoundsMove: Sendable {
+        /// Fresh AX-space current frame of the AX window to move.
+        /// MUST be captured just before the batch call; a stale frame
+        /// will match the wrong browser window or nothing at all.
+        let currentBoundsAX: CGRect
+        /// AX-space target frame to write.
+        let targetBoundsAX: CGRect
+        /// Opaque caller-owned tag returned in the per-move outcome
+        /// so the caller correlates results back to their planned
+        /// target without depending on our matching internals.
+        let clientTag: Int
+    }
+
+    /// Per-move outcome for a batch call.
+    struct BrowserBoundsMoveOutcome: Sendable {
+        let clientTag: Int
+        let result: BrowserBoundsMoveResult
+    }
+
+    /// Sets a single Chromium browser window's bounds via AppleScript.
+    /// Non-blocking (dispatches AppleScript to a background thread via
+    /// `runScriptAsync`). Returns a structured result — callers must
+    /// NOT parse the diagnostic logs.
+    ///
+    /// Contract (each guard fails-safe, returning a distinct result):
+    ///   1. Bundle must be supported (chromiumBundleIDs).
+    ///   2. Automation permission must be `granted` (checked with
+    ///      askIfNeeded=false — will NOT prompt).
+    ///   3. Browser must be running.
+    ///   4. Fresh bounds-only enumeration (bypasses the 15s snapshot
+    ///      cache used by Corral) matches the caller's current AX
+    ///      frame to exactly one browser window (rejects ambiguity).
+    ///   5. Confident match → apply bounds via AppleScript in the
+    ///      same contained operation. The positional browser index
+    ///      is used within THIS call only — never retained across
+    ///      delays or exposed as a durable identity.
+    ///
+    /// Does NOT:
+    ///   - Fetch tabs (bounds only).
+    ///   - Read from or write to the snapshot cache.
+    ///   - Mutate AX.
+    ///   - Block the main thread.
+    ///   - Prompt for permission.
+    @MainActor
+    static func setBrowserWindowBoundsNearFrame(
+        bundleID: String,
+        currentBoundsAX: CGRect,
+        targetBoundsAX: CGRect,
+        timeout: TimeInterval = nativeBoundsTimeout
+    ) async -> BrowserBoundsMoveResult {
+        let start = CFAbsoluteTimeGetCurrent()
+
+        // Guard 1: bundle support.
+        guard supportsNativeWindowBounds(bundleID: bundleID) else {
+            return .unsupported
+        }
+
+        // Guard 2: Automation permission — do NOT prompt at Plot /
+        // Cascade time. Onboarding requests permission for every
+        // installed browser; if the user denied then, we degrade
+        // gracefully instead of surfacing a modal mid-interaction.
+        switch AutomationPermission.check(bundleID: bundleID, askIfNeeded: false) {
+        case .granted:
+            break
+        case .denied:
+            return .automationDenied
+        case .notAvailable, .other:
+            return .permissionUnavailable
+        }
+
+        // Guard 3: browser process running.
+        guard NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first != nil else {
+            return .browserNotRunning
+        }
+
+        // Enumerate. Try the whose-filter shortcut first (evaluated
+        // server-side in the browser — no client-side iteration). Fall
+        // back to a bounds-only walk if the shortcut misses. Both
+        // scripts fetch NO tabs and NO cache is consulted.
+        let candidates = await freshBoundsEnumeration(
+            bundleID: bundleID,
+            targetAX: currentBoundsAX,
+            deadline: start + timeout
+        )
+        let elapsedAfterEnum = CFAbsoluteTimeGetCurrent() - start
+        if elapsedAfterEnum >= timeout {
+            return .timedOut
+        }
+        guard let list = candidates else {
+            return .scriptError("bounds enumeration returned nil")
+        }
+        guard !list.isEmpty else {
+            return .noMatch
+        }
+
+        // Pure match — rejects ambiguous.
+        let match = matchBrowserWindow(
+            requestedAX: currentBoundsAX,
+            candidates: list
+        )
+        let windowIndex: Int
+        switch match {
+        case .confident(let idx):
+            windowIndex = idx
+        case .noMatch:
+            #if DEBUG
+            Log.corral.debug("Native bounds match=noMatch bundle=\(bundleID, privacy: .public) requested=(\(Int(currentBoundsAX.minX)),\(Int(currentBoundsAX.minY)) \(Int(currentBoundsAX.width))×\(Int(currentBoundsAX.height))) candidates=\(list.count, privacy: .public)")
+            #endif
+            return .noMatch
+        case .ambiguous:
+            #if DEBUG
+            Log.corral.debug("Native bounds match=ambiguous bundle=\(bundleID, privacy: .public) requested=(\(Int(currentBoundsAX.minX)),\(Int(currentBoundsAX.minY)) \(Int(currentBoundsAX.width))×\(Int(currentBoundsAX.height))) candidates=\(list.count, privacy: .public)")
+            #endif
+            return .ambiguousMatch
+        }
+
+        // Write bounds. Positional index scoped to this call only.
+        let writeSource = nativeBoundsWriteScript(
+            bundleID: bundleID,
+            windowIndex: windowIndex,
+            targetAX: targetBoundsAX
+        )
+        let elapsedBeforeWrite = CFAbsoluteTimeGetCurrent() - start
+        let writeBudget = max(0.2, timeout - elapsedBeforeWrite)
+        let writeResult = await runScriptAsync(
+            source: writeSource,
+            timeoutSeconds: writeBudget
+        )
+        let totalElapsed = CFAbsoluteTimeGetCurrent() - start
+        if writeResult == nil {
+            return totalElapsed >= timeout ? .timedOut : .scriptError("bounds write returned nil")
+        }
+        Log.corral.info("Native bounds write ok bundle=\(bundleID, privacy: .public) windowIndex=\(windowIndex, privacy: .public) in \(Int(totalElapsed * 1000), privacy: .public)ms")
+        return .success(elapsed: totalElapsed)
+    }
+
+    /// Convenience batch entry point. Per the spec's "safe alternative"
+    /// for multi-Chromium-window Cascade repair: sequential per-move
+    /// fresh enumeration + write. Each move is independent — a stale
+    /// or ambiguous match on one window does NOT contaminate other
+    /// confident matches. Each move's outcome is returned so the caller
+    /// can AX-fallback per-window.
+    ///
+    /// Sequential rather than concurrent: AppleScript against the same
+    /// browser is inherently serialized by the target's event handler,
+    /// so parallel calls buy nothing and can trip the browser's own
+    /// script-execution ordering.
+    @MainActor
+    static func setBrowserWindowBoundsBatch(
+        bundleID: String,
+        moves: [BrowserBoundsMove],
+        timeout: TimeInterval = nativeBoundsTimeout
+    ) async -> [BrowserBoundsMoveOutcome] {
+        var outcomes: [BrowserBoundsMoveOutcome] = []
+        outcomes.reserveCapacity(moves.count)
+        for move in moves {
+            let result = await setBrowserWindowBoundsNearFrame(
+                bundleID: bundleID,
+                currentBoundsAX: move.currentBoundsAX,
+                targetBoundsAX: move.targetBoundsAX,
+                timeout: timeout
+            )
+            outcomes.append(BrowserBoundsMoveOutcome(clientTag: move.clientTag, result: result))
+        }
+        return outcomes
+    }
+
+    /// Runs a bounds-only enumeration and returns `[(index, boundsAX)]`
+    /// or nil on script failure. Empty result (browser has no windows)
+    /// returns empty array — not nil. NEVER touches the snapshot cache.
+    private static func freshBoundsEnumeration(
+        bundleID: String,
+        targetAX: CGRect,
+        deadline: CFAbsoluteTime
+    ) async -> [(index: Int, boundsAX: CGRect)]? {
+        let remainingA = max(0.2, deadline - CFAbsoluteTimeGetCurrent())
+        // Whose-filter shortcut — one line back on match, empty on miss.
+        if let text = await runScriptAsync(
+            source: boundsByFilterScript(bundleID: bundleID, targetAX: targetAX),
+            timeoutSeconds: remainingA
+        ), !text.isEmpty {
+            let parsed = parseBoundsOnly(text)
+            if !parsed.isEmpty {
+                return parsed.map { (index: $0.index, boundsAX: $0.bounds) }
+            }
+        }
+        // Fallback: bounds-only walk (capped at 8 per Chromium quirk).
+        let remainingB = deadline - CFAbsoluteTimeGetCurrent()
+        if remainingB <= 0 { return nil }
+        guard let text = await runScriptAsync(
+            source: boundsOnlyScript(bundleID: bundleID),
+            timeoutSeconds: max(0.2, remainingB)
+        ) else {
+            return nil
+        }
+        // Empty is a valid enumeration (browser genuinely has no
+        // scriptable windows). Return [] rather than nil so the caller
+        // distinguishes "script failed" (nil) from "no windows" ([]).
+        return parseBoundsOnly(text).map { (index: $0.index, boundsAX: $0.bounds) }
+    }
+
+    private static func nativeBoundsWriteScript(
+        bundleID: String,
+        windowIndex: Int,
+        targetAX: CGRect
+    ) -> String {
+        let x1 = Int(targetAX.minX.rounded())
+        let y1 = Int(targetAX.minY.rounded())
+        let x2 = Int(targetAX.maxX.rounded())
+        let y2 = Int(targetAX.maxY.rounded())
+        return """
+        tell application id "\(bundleID)"
+            set bounds of window \(windowIndex) to {\(x1), \(y1), \(x2), \(y2)}
+        end tell
+        """
+    }
+
+    private static func nativeBoundsCenterDistance(_ a: CGRect, _ b: CGRect) -> CGFloat {
+        let dx = a.midX - b.midX
+        let dy = a.midY - b.midY
+        return (dx * dx + dy * dy).squareRoot()
+    }
+
+    private static func nativeBoundsRectsIndistinguishable(_ a: CGRect, _ b: CGRect) -> Bool {
+        return abs(a.minX - b.minX) < 2
+            && abs(a.minY - b.minY) < 2
+            && abs(a.width  - b.width)  < 2
+            && abs(a.height - b.height) < 2
+    }
+
     /// Returns every window (bounds + tabs) reported by the browser
     /// with the given bundle ID, or nil if the browser isn't
     /// supported, isn't running, or Automation permission was denied.
@@ -952,6 +1310,45 @@ enum BrowserScripting {
     /// wrapper because Swift's inout-across-threads isn't legal.
     private final class ResultBox: @unchecked Sendable {
         var value: String?
+    }
+
+    /// Async wrapper around `runScriptCore` for the native-bounds
+    /// transport. Unlike `runScriptWithTimeout` (which uses
+    /// semaphore.wait on the CALLING thread — blocks main), this
+    /// variant returns via async continuation and dispatches
+    /// AppleScript to a background QoS-userInitiated queue.
+    ///
+    /// Timeout races the AppleScript against `Task.sleep`. If the
+    /// script wins, we return its result. If the timeout wins, we
+    /// return nil — the AppleScript keeps executing in its background
+    /// thread (NSAppleScript has no cancellation API) but its result
+    /// is abandoned. Same behavior as `runScriptWithTimeout`'s
+    /// timeout path; leaked threads clear on session end.
+    ///
+    /// Callable from any actor context. The AppleScript runs off-main
+    /// unconditionally, so awaiting this from `@MainActor` releases
+    /// main for other work during the wall-clock wait.
+    nonisolated static func runScriptAsync(
+        source: String,
+        timeoutSeconds: TimeInterval
+    ) async -> String? {
+        return await withTaskGroup(of: String?.self) { group in
+            group.addTask {
+                await withCheckedContinuation { (cont: CheckedContinuation<String?, Never>) in
+                    DispatchQueue.global(qos: .userInitiated).async {
+                        cont.resume(returning: runScriptCore(source: source))
+                    }
+                }
+            }
+            group.addTask {
+                let nanos = UInt64(max(0, timeoutSeconds) * 1_000_000_000)
+                try? await Task.sleep(nanoseconds: nanos)
+                return nil
+            }
+            let first = await group.next() ?? nil
+            group.cancelAll()
+            return first
+        }
     }
 
     /// The actual compile + execute + parse work. Split out from

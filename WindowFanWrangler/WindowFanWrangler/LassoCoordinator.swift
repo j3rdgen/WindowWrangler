@@ -19,6 +19,13 @@ import os
 final class LassoCoordinator {
 
     private let eventMonitor = GlobalEventMonitor()
+
+    /// Exposes the shared event tap owner so a sibling mode
+    /// (PlotCoordinator) can reuse the same CGEventTap rather than
+    /// creating a second one. Mode arbitration in WindowWranglerApp
+    /// ensures only one of Lasso / Plot is active at a time; the
+    /// tap forwards left-mouse events to whichever mode is enabled.
+    var sharedEventMonitor: GlobalEventMonitor { eventMonitor }
     private let overlay = SelectionOverlay()
     private let modeHint = LassoModeHint()
     let selection: WindowSelection

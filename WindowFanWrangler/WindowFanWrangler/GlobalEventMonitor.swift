@@ -35,6 +35,13 @@ final class GlobalEventMonitor {
     /// While false, mouse events pass through untouched.
     var isLassoModeActive: Bool = false
 
+    /// Toggled by PlotCoordinator when Plot Mode is on. Mutually
+    /// exclusive with `isLassoModeActive` — the app delegate ensures
+    /// only one is on at a time. When true, left-mouse events go to
+    /// the `onPlot*` callbacks (which consume) instead of the lasso
+    /// callbacks.
+    var isPlotModeActive: Bool = false
+
     // MARK: - Callbacks
 
     /// Mouse-down location in Cocoa global coords. Only fires while
@@ -52,6 +59,19 @@ final class GlobalEventMonitor {
     /// User pressed Escape — caller decides what to do (typically clear
     /// the selection and turn off lasso mode).
     var onEscapePressed: (() -> Void)?
+
+    /// Plot mode mouse-down. Includes modifier flags so Control-click
+    /// reselection can be distinguished from plain click. Only fires
+    /// while `isPlotModeActive` is true.
+    var onPlotMouseDown: ((CGPoint, CGEventFlags) -> Void)?
+
+    /// Plot mode mouse-dragged — every intermediate position during a
+    /// drag. Fires only if a matching down happened in Plot mode.
+    var onPlotMouseDragged: ((CGPoint) -> Void)?
+
+    /// Plot mode mouse-up. Fires if a Plot mode drag was in progress
+    /// (regardless of whether Plot mode is still active).
+    var onPlotMouseUp: ((CGPoint) -> Void)?
 
     // MARK: - State
 
@@ -155,6 +175,7 @@ final class GlobalEventMonitor {
 
         dragInProgress = false
         isLassoModeActive = false
+        isPlotModeActive = false
     }
 
     // MARK: - Event tap setup
@@ -261,6 +282,15 @@ final class GlobalEventMonitor {
 
         switch type {
         case .leftMouseDown:
+            if isPlotModeActive {
+                // Plot always consumes mouseDown so the underlying
+                // control (button in the target app) doesn't activate.
+                // Whether this becomes a select, a pending gesture, or
+                // a Control-click is decided by PlotCoordinator.
+                dragInProgress = true
+                onPlotMouseDown?(location, event.flags)
+                return nil   // consume
+            }
             if isLassoModeActive {
                 dragInProgress = true
                 onLassoDragBegan?(location)
@@ -268,13 +298,21 @@ final class GlobalEventMonitor {
             }
         case .leftMouseDragged:
             if dragInProgress {
-                onLassoDragUpdated?(location)
+                if isPlotModeActive {
+                    onPlotMouseDragged?(location)
+                } else {
+                    onLassoDragUpdated?(location)
+                }
                 return nil   // consume
             }
         case .leftMouseUp:
             if dragInProgress {
                 dragInProgress = false
-                onLassoDragEnded?(location)
+                if isPlotModeActive {
+                    onPlotMouseUp?(location)
+                } else {
+                    onLassoDragEnded?(location)
+                }
                 return nil   // consume
             }
         default:

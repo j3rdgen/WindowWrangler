@@ -65,6 +65,29 @@ final class CascadeOrchestrator {
     private let useAccessoryAppCascade = true              // Stage 2.6
     private let useExplicitCascadeZOrder = true            // Stage 3 — deterministic reverse-walk raise pass on single-app + selection cascade paths (all-apps already had `enforceCascadeZOrder`, now with rich logging).
 
+    /// Routes any Chromium-family cascade laggard through
+    /// `BrowserScripting.setBrowserWindowBoundsNearFrame` instead of
+    /// the standard AX write. Chromium browsers asynchronously revert
+    /// AX size writes on their next runloop tick; native AppleScript
+    /// bounds writes persist. Non-Chromium laggards remain on the
+    /// existing AX path, and pass-1 is always AX-only regardless of
+    /// this flag. Set to `false` to restore the previous behavior
+    /// exactly — Chromium laggards go through AX like everything else.
+    private let useBrowserNativeBoundsForCascadeLaggards = true
+
+    /// Uses `CascadePlanning.resolveCascadePlanningSize` to decouple
+    /// slot-geometry decisions from each window's mutable current
+    /// size. When true, the all-apps DR/DL path plans narrow-window
+    /// right-align and origin clamping with the standard cascade
+    /// target size for size-settable windows (regardless of what
+    /// unusual dimensions Plot, manual resize, or another tool left
+    /// them at). Set to `false` to restore the exact prior current-
+    /// frame-sensitive planning behavior — every planning input goes
+    /// back to `window.frame.size`, and `willStayNarrow` / `fitFrame`
+    /// clamp again read mutable dimensions. Not exposed to any other
+    /// cascade mode (single-app, selection, restore).
+    private let useDeterministicPlanningSizesForAllAppsCascade = true
+
     // MARK: - State
 
     /// Pre-cascade snapshot for Restore Previous Layout. nil until the
@@ -152,6 +175,17 @@ final class CascadeOrchestrator {
     /// the resize entirely" (returned size equals original).
     /// Reset at the start of each all-apps cascade.
     private var preCascadeSizeByElement: [(axElement: AXUIElement, size: CGSize)] = []
+
+    /// Chromium laggards whose native-bounds repair is currently
+    /// in flight. Prevents multiple retry passes (which fire at
+    /// +0.12, +0.50, +1.00s) from stacking parallel or overlapping
+    /// AppleScript writes against the same window. Entry is
+    /// (axElement, generation) — same axElement across generations
+    /// is a different repair. Cleared per entry when the async
+    /// operation completes (on any outcome, including failure).
+    /// Fully reset at the start of each all-apps cascade so a stale
+    /// entry from a cancelled cascade cannot block a new one.
+    private var nativeRepairInFlight: [(axElement: AXUIElement, generation: UInt64)] = []
 
     // MARK: - Injected dependencies
 
@@ -534,6 +568,11 @@ final class CascadeOrchestrator {
         cascadeCapabilityByElement.removeAll()
         preCascadeSizeByElement.removeAll()
 
+        // Reset native-repair in-flight tracking. An entry from a
+        // previously-cancelled cascade cannot leak into this one and
+        // block a legitimate new repair on the same window.
+        nativeRepairInFlight.removeAll()
+
         let screen = computeScreenFrame(visibleFrame: chosenScreen.visibleFrame)
         let targetSize = CGSize(
             width: screen.width * cascadeWindowSizeFraction,
@@ -839,8 +878,31 @@ final class CascadeOrchestrator {
             for window in group.windows {
                 let plannedTarget = shiftedTargets[idx]
                 let isSettable = WindowMutator.isSizeSettable(window.axElement)
-                let naturalSize = window.frame.size
+                let actualCurrentSize = window.frame.size
                 let isAnchor = (idx == 0)
+
+                // Planning size — decoupled from actual current size for
+                // deterministic slot geometry. See `CascadePlanning` for
+                // the invariant: normally resizable windows plan at
+                // `targetSize`, position-only windows plan at their
+                // current natural size. Prior to this decoupling, the
+                // narrow-window right-align check and `fitFrame` origin
+                // clamp both read `window.frame.size`, so any window
+                // left at an unusual size by Plot / manual resize /
+                // another tool would produce a different plan than the
+                // same window at its post-cascade size — driving the
+                // multi-invocation convergence the user reported.
+                //
+                // Flag-gated: setting `useDeterministicPlanningSizesForAllAppsCascade`
+                // to false restores prior behavior exactly (planning
+                // uses `actualCurrentSize`).
+                let planningSize: CGSize = useDeterministicPlanningSizesForAllAppsCascade
+                    ? CascadePlanning.resolveCascadePlanningSize(
+                        currentFrame: window.frame,
+                        standardTargetSize: targetSize,
+                        isSizeSettable: isSettable
+                    )
+                    : actualCurrentSize
 
                 // STAGE 2.5: right-edge alignment for narrow fixed-size
                 // windows in downRight cascades. Currently gated to the
@@ -853,70 +915,94 @@ final class CascadeOrchestrator {
                 // narrower than the slot:
                 //   - `!isSettable`: definitely won't resize (Zoom
                 //     pre-login).
-                //   - Settable but `naturalWidth < 70% of target`:
+                //   - Settable but `planningSize.width < 70% of target`:
                 //     strong signal it's a fixed-size dialog that
-                //     reports settable=true but clamps at write time
-                //     (Get Info at 34% of target, System Settings About
-                //     panel at 62% of target).
-                // A settable window at 70–99% of target is probably a
-                // normal window the user shrunk — it'll grow back to
-                // target after cascade, so left-alignment is correct.
+                //     reports settable=true but clamps at write time.
+                //     With deterministic planning ON, this predicate is
+                //     effectively `false` for size-settable windows —
+                //     planningSize equals target size, and 1168 < 0.7*1168
+                //     is false. The narrow branch fires only for genuine
+                //     non-settable windows (Zoom pre-login etc.). A
+                //     window that misreports settable=true but actually
+                //     clamps (Get Info, About This Mac) will no longer
+                //     receive automatic right-alignment via this Stage
+                //     2.5 path; the trade-off is deterministic
+                //     cascade planning, which was the higher-value
+                //     invariant per the M-series planning-size spec.
                 //
                 // downLeft cascades don't need this — the LEFT edge of
                 // every window aligns with the slot origin, which is
                 // already the correct reveal direction.
                 let anchorStaysNarrow = isAnchor
-                    && (!isSettable || naturalSize.width < plannedTarget.size.width * 0.7)
-                    && naturalSize.width < plannedTarget.size.width
+                    && (!isSettable || planningSize.width < plannedTarget.size.width * 0.7)
+                    && planningSize.width < plannedTarget.size.width
                 let nonAnchorStaysNarrow = useFixedSizeSlotAdjustment
                     && !isAnchor
-                    && naturalSize.width < plannedTarget.size.width
-                    && (!isSettable || naturalSize.width < plannedTarget.size.width * 0.7)
+                    && planningSize.width < plannedTarget.size.width
+                    && (!isSettable || planningSize.width < plannedTarget.size.width * 0.7)
                 let willStayNarrow = anchorStaysNarrow || nonAnchorStaysNarrow
 
                 let target: CGRect
                 if willStayNarrow && direction == .downRight {
                     // Right-align by shifting the origin so the
                     // window's right edge lands at the slot's right
-                    // edge. CRITICAL: pass `naturalSize` as fitFrame's
-                    // frameSize argument so its clamp uses the actual
-                    // narrow width — otherwise fitFrame's default
-                    // clamp (max(frameSize, naturalSize) = the wide
-                    // planned width) would drag x back to the anchor
-                    // position and undo the shift entirely.
+                    // edge. Uses `planningSize` — for a genuine
+                    // non-settable narrow window this is its natural
+                    // size (correct right-align by narrow-natural
+                    // width). For a size-settable window the branch
+                    // no longer fires (see gate above), so this path
+                    // is effectively non-settable-only when
+                    // deterministic planning is on.
                     let shiftedOrigin = CGPoint(
                         x: plannedTarget.origin.x
                             + plannedTarget.size.width
-                            - naturalSize.width,
+                            - planningSize.width,
                         y: plannedTarget.origin.y
                     )
                     target = fitFrame(
                         plannedOrigin: shiftedOrigin,
-                        frameSize: naturalSize,
-                        naturalSize: naturalSize,
+                        frameSize: planningSize,
+                        naturalSize: planningSize,
                         bounds: screen
                     )
                 } else {
-                    let frameSize = isSettable ? plannedTarget.size : naturalSize
+                    // Standard slot placement. `frameSize` is what the
+                    // mutator will attempt to write (target size for
+                    // settable, current natural for non-settable);
+                    // `naturalSize` feeds the fitFrame clamp — pass
+                    // `planningSize` so the clamp is deterministic
+                    // (target size for settable → no oversize clamp,
+                    // current for non-settable → preserves existing
+                    // behavior for position-only apps).
+                    let frameSize = isSettable ? plannedTarget.size : planningSize
                     target = fitFrame(
                         plannedOrigin: plannedTarget.origin,
                         frameSize: frameSize,
-                        naturalSize: naturalSize,
+                        naturalSize: planningSize,
                         bounds: screen
                     )
                 }
                 allMoves.append((window.axElement, target))
                 appPlanFrames.append((window.axElement, target))
+                // Snapshot uses the ACTUAL current frame (window.frame),
+                // not planning size — Restore Previous Layout must
+                // return the window to its pre-cascade state, not to
+                // the deterministic planning size.
                 snapshotEntries.append(
                     LayoutSnapshot.Entry(axElement: window.axElement, frame: window.frame)
                 )
+                #if DEBUG
+                Log.cascade.debug(
+                    "Plan[\(idx, privacy: .public)] app=\(group.app.localizedName ?? "?", privacy: .public) settable=\(isSettable ? "yes" : "no", privacy: .public) current=\(Int(actualCurrentSize.width), privacy: .public)×\(Int(actualCurrentSize.height), privacy: .public) planning=\(Int(planningSize.width), privacy: .public)×\(Int(planningSize.height), privacy: .public) target=(\(Int(target.minX), privacy: .public),\(Int(target.minY), privacy: .public)) \(Int(target.width), privacy: .public)×\(Int(target.height), privacy: .public)"
+                )
+                #endif
                 idx += 1
             }
             plans.append(AppCascadePlan(app: group.app, expectedFrames: appPlanFrames))
         }
 
         Log.cascade.info(
-            "All-apps cascade target display: '\(screenLabel, privacy: .public)' — \(plans.count, privacy: .public) app group(s), \(totalWindows, privacy: .public) total windows"
+            "All-apps cascade target display: '\(screenLabel, privacy: .public)' — \(plans.count, privacy: .public) app group(s), \(totalWindows, privacy: .public) total windows, deterministicPlanning=\(self.useDeterministicPlanningSizesForAllAppsCascade ? "true" : "false", privacy: .public)"
         )
 
         guard totalWindows >= 2 else {
@@ -1639,7 +1725,20 @@ final class CascadeOrchestrator {
             // previous retry pass, and it still doesn't match target,
             // the app has settled at its size constraint — further
             // writes won't change anything.
-            var laggardMoves: [(axWindow: AXUIElement, target: CGRect)] = []
+            //
+            // Enriched with `app` + `currentFrame` for the post-collect
+            // partition step (see below): Chromium laggards can route
+            // through native AppleScript-bounds repair when the flag
+            // is on, and the async repair needs the owning app +
+            // fresh current frame in scope. Non-Chromium laggards
+            // ignore these extra fields — they only ever hit the
+            // existing AX applyBatch path.
+            var laggardMoves: [(
+                axWindow: AXUIElement,
+                target: CGRect,
+                app: NSRunningApplication,
+                currentFrame: CGRect
+            )] = []
             var totalChecked = 0
             var currentObservations: [(axElement: AXUIElement, frame: CGRect)] = []
             for plan in plans {
@@ -1712,7 +1811,7 @@ final class CascadeOrchestrator {
                         // Real laggard — frame changed since last
                         // observation AND still doesn't meet the
                         // capability tolerance. Worth one more nudge.
-                        laggardMoves.append((axElement, target))
+                        laggardMoves.append((axElement, target, plan.app, current.frame))
                         continue
                     }
 
@@ -1729,7 +1828,7 @@ final class CascadeOrchestrator {
                         self.stableClampedWindows.append((axElement, current.frame))
                         continue
                     }
-                    laggardMoves.append((axElement, target))
+                    laggardMoves.append((axElement, target, plan.app, current.frame))
                 }
             }
             // Update baseline for the next retry pass (used by the
@@ -1743,9 +1842,37 @@ final class CascadeOrchestrator {
                 return
             }
 
-            let count = WindowMutator.applyBatch(laggardMoves)
+            // Partition. Chromium-family laggards get their own AppleScript
+            // `bounds` repair (persists where AX size writes revert on
+            // Chrome). Non-Chromium laggards use the existing AX batch
+            // exactly as before. Skip Chromium windows that already have
+            // a native repair in flight — a later retry pass will
+            // observe the outcome without stacking parallel writes.
+            var axLaggards: [(axWindow: AXUIElement, target: CGRect)] = []
+            var chromiumLaggards: [(
+                axWindow: AXUIElement,
+                target: CGRect,
+                bundleID: String,
+                currentFrame: CGRect
+            )] = []
+            for laggard in laggardMoves {
+                let bundleID = laggard.app.bundleIdentifier
+                let canUseNative = self.useBrowserNativeBoundsForCascadeLaggards
+                    && (bundleID.map { BrowserScripting.supportsNativeWindowBounds(bundleID: $0) } ?? false)
+                    && !self.nativeRepairIsInFlight(laggard.axWindow)
+                if canUseNative, let bundleID = bundleID {
+                    chromiumLaggards.append((laggard.axWindow, laggard.target, bundleID, laggard.currentFrame))
+                } else {
+                    axLaggards.append((laggard.axWindow, laggard.target))
+                }
+            }
+
+            // Existing AX-write path — unchanged behavior. Chromium
+            // laggards are simply absent from this batch when the
+            // native flag is on.
+            let count = WindowMutator.applyBatch(axLaggards)
             Log.cascade.info(
-                "All-apps \(label, privacy: .public): \(count, privacy: .public)/\(laggardMoves.count, privacy: .public) laggards nudged"
+                "All-apps \(label, privacy: .public): \(count, privacy: .public)/\(axLaggards.count, privacy: .public) AX laggards nudged; \(chromiumLaggards.count, privacy: .public) chromium laggard(s) queued for native repair"
             )
             if count > 0 { self.onWindowsMoved?() }
 
@@ -1759,6 +1886,165 @@ final class CascadeOrchestrator {
             if count > 0 {
                 self.enforceCascadeZOrder(plans: plans, context: "all-apps \(label) (post-write)")
             }
+
+            // Fire native repair for each Chromium laggard. Each call
+            // is per-window (safe alternative from the spec's multi-
+            // Chromium-window handling) — one fresh bounds enumeration
+            // per repair, so no stale positional-index reuse across
+            // moves. In-flight marker prevents overlap with the next
+            // retry pass on the same window.
+            for laggard in chromiumLaggards {
+                self.markNativeRepairInFlight(laggard.axWindow, generation: generation)
+                Task { [weak self] in
+                    await self?.repairChromiumCascadeLaggard(
+                        bundleID: laggard.bundleID,
+                        axElement: laggard.axWindow,
+                        currentCocoa: laggard.currentFrame,
+                        targetCocoa: laggard.target,
+                        generation: generation,
+                        plans: plans,
+                        label: label
+                    )
+                }
+            }
+        }
+    }
+
+    // MARK: - Native repair (Chromium cascade laggards)
+
+    /// Marks a window as having a native-bounds repair in flight for
+    /// the given cascade generation. Prevents subsequent retry passes
+    /// from stacking parallel writes on the same window.
+    private func markNativeRepairInFlight(_ axElement: AXUIElement, generation: UInt64) {
+        nativeRepairInFlight.append((axElement, generation))
+    }
+
+    /// True if a native repair is currently in flight for the given
+    /// AX element (regardless of generation). Comparing AXUIElement
+    /// with `CFEqual` matches the pattern used elsewhere in the file
+    /// (see `axElementIsInList`).
+    private func nativeRepairIsInFlight(_ axElement: AXUIElement) -> Bool {
+        return nativeRepairInFlight.contains { CFEqual($0.axElement, axElement) }
+    }
+
+    /// Removes any in-flight marker(s) for the given element. Called
+    /// from the Task's completion path unconditionally so a failed
+    /// native repair doesn't leave a stale entry that would block
+    /// the next retry.
+    private func clearNativeRepairInFlight(_ axElement: AXUIElement) {
+        nativeRepairInFlight.removeAll { CFEqual($0.axElement, axElement) }
+    }
+
+    /// One Chromium cascade laggard's targeted repair via AppleScript
+    /// bounds. Runs off-main (BrowserScripting.setBrowserWindowBoundsNearFrame
+    /// dispatches the script itself to a background queue and returns
+    /// to the main actor).
+    ///
+    /// Contract (matches spec §"Single Chromium laggard" +
+    /// §"Cascade native failure" + §"Cascade settled verification"):
+    ///   - Fresh AX current frame at repair time (not the frame the
+    ///     retry pass captured — that value can be several hundred
+    ///     ms stale by the time the Task actually runs).
+    ///   - Uses the existing expected cascade target frame verbatim.
+    ///   - On native success: emit onWindowsMoved + re-enforce
+    ///     z-order (matches AX-path behavior after any laggard write).
+    ///     Existing later retry / verify passes observe the settled
+    ///     AX frame using existing tolerance and stable-clamped logic
+    ///     — we do NOT add a new verify step here.
+    ///   - On any structured failure: fall back to a single AX write
+    ///     for this specific laggard (matches spec §"Cascade native
+    ///     failure"). Do not fail the whole cascade; do not prompt.
+    ///   - Generation-guarded — a Restore or new Cascade advances
+    ///     `cascadeGeneration` and this Task exits without mutation.
+    private func repairChromiumCascadeLaggard(
+        bundleID: String,
+        axElement: AXUIElement,
+        currentCocoa: CGRect,
+        targetCocoa: CGRect,
+        generation: UInt64,
+        plans: [AppCascadePlan],
+        label: String
+    ) async {
+        // Bail if a newer operation has taken over.
+        guard cascadeGeneration == generation, isTrusted() else {
+            clearNativeRepairInFlight(axElement)
+            return
+        }
+        // Fresh AX current frame — retry timing can leave `currentCocoa`
+        // hundreds of ms stale, and a stale frame would cause the
+        // matcher to reject or misidentify the browser window.
+        let refreshedAX = AXWindowEnumerator.currentFrame(of: axElement)
+        let refreshedCocoa = refreshedAX.map { CoordinateSpace.cocoaRect(fromAX: $0) } ?? currentCocoa
+        let currentAX = CoordinateSpace.axRect(fromCocoa: refreshedCocoa)
+        let targetAX = CoordinateSpace.axRect(fromCocoa: targetCocoa)
+
+        let start = CFAbsoluteTimeGetCurrent()
+        let result = await BrowserScripting.setBrowserWindowBoundsNearFrame(
+            bundleID: bundleID,
+            currentBoundsAX: currentAX,
+            targetBoundsAX: targetAX
+        )
+        let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
+
+        // Always clear in-flight, whatever the outcome.
+        clearNativeRepairInFlight(axElement)
+
+        // Post-await re-check — generation may have advanced.
+        guard cascadeGeneration == generation, isTrusted() else {
+            Log.cascade.info(
+                "Native cascade repair dropped — generation advanced (bundle=\(bundleID, privacy: .public))"
+            )
+            return
+        }
+
+        switch result {
+        case .success:
+            Log.cascade.notice(
+                "All-apps \(label, privacy: .public) native repair ok: bundle=\(bundleID, privacy: .public) in \(elapsedMs, privacy: .public)ms"
+            )
+            onWindowsMoved?()
+            // AppleScript bounds writes also trigger a raise-on-write
+            // in Chrome — same z-order symptom the AX post-write path
+            // handles by re-enforcing. Match that behavior so a native
+            // repair doesn't leave Chrome ahead of its intended slot.
+            if useExplicitCascadeZOrder {
+                enforceCascadeZOrder(
+                    plans: plans,
+                    context: "all-apps \(label) (native repair)"
+                )
+            }
+        case .unsupported, .automationDenied, .permissionUnavailable,
+             .browserNotRunning, .noMatch, .ambiguousMatch, .timedOut,
+             .targetDisappeared, .scriptError:
+            let reason = nativeCascadeFailureReason(result)
+            Log.cascade.notice(
+                "All-apps \(label, privacy: .public) native repair failed: bundle=\(bundleID, privacy: .public) reason=\(reason, privacy: .public) in \(elapsedMs, privacy: .public)ms — falling back to AX for this laggard"
+            )
+            // Single AX write for this specific laggard. Existing
+            // later retry / verify passes will observe the outcome.
+            _ = WindowMutator.setFrame(targetCocoa, of: axElement)
+            onWindowsMoved?()
+            if useExplicitCascadeZOrder {
+                enforceCascadeZOrder(
+                    plans: plans,
+                    context: "all-apps \(label) (native failure → AX fallback)"
+                )
+            }
+        }
+    }
+
+    private func nativeCascadeFailureReason(_ result: BrowserScripting.BrowserBoundsMoveResult) -> String {
+        switch result {
+        case .success: return "success"
+        case .unsupported: return "unsupported"
+        case .automationDenied: return "automation-denied"
+        case .permissionUnavailable: return "permission-unavailable"
+        case .browserNotRunning: return "browser-not-running"
+        case .noMatch: return "no-match"
+        case .ambiguousMatch: return "ambiguous-match"
+        case .timedOut: return "timed-out"
+        case .targetDisappeared: return "target-disappeared"
+        case .scriptError(let msg): return "script-error(\(msg))"
         }
     }
 
@@ -1859,7 +2145,26 @@ final class CascadeOrchestrator {
     /// size fits inside the padded screen. If the natural size is
     /// larger than `bounds`, the origin pins to minX/minY — better to
     /// bleed off one edge than be entirely off-screen.
+    /// Instance shim preserved so existing callers stay unchanged.
+    /// Delegates to the static implementation.
     private func fitFrame(
+        plannedOrigin: CGPoint,
+        frameSize: CGSize,
+        naturalSize: CGSize,
+        bounds: CGRect
+    ) -> CGRect {
+        Self.fitFrame(
+            plannedOrigin: plannedOrigin,
+            frameSize: frameSize,
+            naturalSize: naturalSize,
+            bounds: bounds
+        )
+    }
+
+    /// Pure origin-clamp implementation extracted for unit-testability.
+    /// Same body as before; touches no instance state. `nonisolated`
+    /// so tests can invoke it without a main-actor hop.
+    static nonisolated func fitFrame(
         plannedOrigin: CGPoint,
         frameSize: CGSize,
         naturalSize: CGSize,

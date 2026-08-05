@@ -23,6 +23,7 @@ import AppKit
     @objc func cascadeAllAppsDownLeft()
     @objc func restoreLayout()
     @objc func toggleLassoFromMenu()
+    @objc func togglePlotFromMenu()
     @objc func clearSelection()
     @objc func reopenOnboarding()
     @objc func corralSave()
