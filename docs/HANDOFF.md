@@ -11,8 +11,9 @@ For a developer taking over the codebase. Read this once, then use it as a map w
 ## Development context
 
 - **Solo dev, non-developer.** The person who owns this project can read code at a high level, run commands you give them, and describe observed behavior, but cannot debug Swift errors independently. Any issue reported comes with a Console log and a description; diagnosis is your job.
-- **AI as primary code author.** Written with Claude Code as the primary author over ~2 weeks. Every commit represents a validated user-tested outcome, not an AI-generated draft. If a commit exists, the associated behavior was verified.
-- **Prototype phase.** The goal was to validate the core mechanics (cascade, lasso, corral) on the author's own machine before hiring a developer for production polish. That means: no code signing beyond local self-sign, no notarization, no distribution wiring, no unit tests beyond a scaffolded target that isn't wired up.
+- **AI as primary code author.** Written with Claude Code as the primary author. Every commit represents a validated user-tested outcome, not an AI-generated draft. If a commit exists, the associated behavior was verified.
+- **Prototype phase.** The goal was to validate the core mechanics (cascade, lasso, corral, plot) on the author's own machine before hiring a developer for production polish. That means: no code signing beyond local self-sign, no notarization, no distribution wiring. A test target does exist and holds 96 tests — see the Testing section below.
+- **Post-MVP additions in flight (branch `cascade-flicker-refinement`).** Three concrete refinements have landed on top of MVP-1.0 and are documented throughout this guide: (1) **Plot Mode** — a single-window precision placement gesture bound to `⌃⌥⌘P` (click a window, drag to draw a rectangle, release to snap the window to that rectangle with edge-snap on the outer 15% of the display); (2) **Chromium native-bounds transport** — Plot's Chromium commit path and Cascade's Chromium laggard repair now route through AppleScript `set bounds` because Chromium browsers silently revert AX size writes on the next runloop tick; (3) **bounded z-order settlement pipeline** — a shared All-Apps + Selection identity-based persistent-drift detector that escalates to async serialized reconstruction only when two consecutive complete observations agree the same slots are wrong, with a max-2-walks-per-generation budget and a conditional late recommit at +1600ms.
 - **Target: macOS 13 (Ventura) minimum.** Developed and tested on macOS 26.5 (Tahoe). Xcode 26.5+ to build. Swift + AppKit throughout; SwiftUI only for `OnboardingWindowController`.
 
 ---
@@ -37,7 +38,7 @@ Alphabetical, grouped by role.
 
 ### Foundation
 
-- **`Log.swift`** — `os.Logger` categories: `app`, `ax`, `cascade`, `lasso`, `permission`, `corral`. Console filter for our subsystem is `subsystem:com.jmw3.WindowWrangler`. Everything is subsystem-scoped so you can filter noise from other apps.
+- **`Log.swift`** — `os.Logger` categories: `app`, `ax`, `cascade`, `lasso`, `permission`, `corral`, `plot`, `mutator`, `shortcuts`, `ui`. Console filter for our subsystem is `subsystem:com.jmw3.WindowWrangler`. Everything is subsystem-scoped so you can filter noise from other apps.
 - **`AppInfo.swift`** — Small helper for the app's own display name (`Bundle.main` lookup).
 - **`CoordinateSpace.swift`** — AX ↔ Cocoa conversion. `CoordinateSpace.axRect(fromCocoa:)` and `cocoaRect(fromAX:)` are the workhorse converters. Also has `screen(containing:)` used by the modal panels for center-on-mouse-screen positioning.
 
@@ -50,7 +51,9 @@ Alphabetical, grouped by role.
 ### Cascade
 
 - **`FanGeometry.swift`** — pure geometry. Given `(count, targetSize, reveal, screen, direction)`, produces the ordered array of target rects. Reveal-tightening (packing windows tighter when they'd overflow) lives here.
-- **`CascadeOrchestrator.swift`** — top-level flow for both single-app and all-apps cascade. Runs pass 1 immediately, schedules retries at +0.12/0.5/1.0s to nudge laggards, then verifies. Captures a layout snapshot before each cascade for the "Restore Previous Layout" shortcut. Cross-app z-order enforcement is here (`enforceCascadeZOrder`). Fires `onSnapshotChanged` (menu rebuild) and `onWindowsMoved` (lasso overlay refresh) callbacks.
+- **`CascadePlanning.swift`** — pure planning-size resolver. `resolveCascadePlanningSize(currentFrame, standardTargetSize, isSizeSettable)` decouples slot geometry from each window's mutable current size. Size-settable windows plan at `standardTargetSize` deterministically; non-settable windows preserve their current natural size. Fixes the "post-Plot cascade needs multiple invocations to converge" class of bug — planned slot positions no longer drift with mutable window state. Feature-flagged (`useDeterministicPlanningSizesForAllAppsCascade`) for rollback.
+- **`CascadeZOrderDrift.swift`** — pure identity-based drift-detection + settlement-status types for the z-order settlement pipeline. `ZOrderMismatchRecord` (per-checkpoint history entry with slot-index Set), `ZOrderFinalStatus` (8-variant final outcome), `CascadeZOrderDrift.isPersistentDrift(history)` (two consecutive complete-observation non-empty checkpoints with overlapping slot identities), and `CascadeZOrderSettlementTiming` named constants (raise spacing 16ms, settled reobservation 200ms, late recommit earliest +1600ms, max 2 walks per generation). No AX, no state — testable in isolation.
+- **`CascadeOrchestrator.swift`** — top-level flow for single-app, all-apps, and selection cascades. Runs pass 1 immediately, schedules retries at +0.12/0.5/1.0s to nudge laggards, then verifies. Captures a layout snapshot before each cascade for the "Restore Previous Layout" shortcut. Cross-app z-order enforcement is here (`enforceCascadeZOrder`). Also owns the **bounded z-order settlement pipeline**: per-generation drift history, pass-4 escalation to serialized reconstruction (async 16ms-spaced raises deepest→anchor), settled reobservation at 200ms, conditional late recommit at max(now, cascade-start + 1600ms), hard cap of 2 serialized walks per generation, then unresolved. Selection Cascade shares the same pipeline via `scheduleSelectionZOrderCheckpoint`. Also routes Chromium cascade laggards through `BrowserScripting.setBrowserWindowBoundsNearFrame` for reliable resize where AX writes revert. Fires `onSnapshotChanged` (menu rebuild) and `onWindowsMoved` (lasso overlay refresh) callbacks.
 - **`LayoutSnapshot.swift`** — data type for the pre-cascade window layout that "Restore Previous Layout" replays.
 
 ### Lasso and selection
@@ -60,6 +63,15 @@ Alphabetical, grouped by role.
 - **`LassoCoordinator.swift`** — orchestrator for the lasso flow: rubber-band selection updates, group drag with per-frame overlay pan, mode-hint show/hide. Owns an `[CGWindowID: AXUIElement]` cache rebuilt on every `selection.onChange` — used by `refreshSelectionOverlay()` to read fresh AX positions after cascade so outlines follow the windows without CGWindowList's lag. Also owns the sleep/session-lock observers that force lasso off when the machine idles.
 - **`SelectionOverlay.swift`** — the borderless NSPanel that draws the dashed selection outlines and the rubber-band lasso rectangle. Group-drag fast path (`beginGroupDrag`/`updateGroupDrag`/`endGroupDrag`) blits the panel origin via `setFrameOrigin` without re-drawing, avoiding overlay lag during fast drags.
 - **`LassoModeHint.swift`** — the small "Lasso Mode: ON" chip in the corner.
+
+### Plot Mode
+
+Single-window precision placement — bound to `⌃⌥⌘P`. Click to select, drag to draw, release to place.
+
+- **`PlotCoordinator.swift`** — the state machine (`inactive` / `awaitingWindow` / `windowSelected` / `pendingGesture` / `drawingPlot` / `committing`). Wires mouse events from `GlobalEventMonitor.onPlotMouseDown/Dragged/Up`. Mutually exclusive with Lasso — activation hooks fire `willActivate` to tear down the conflicting mode. Commit flow branches on target app's bundle ID: Chromium windows route through `BrowserScripting.setBrowserWindowBoundsNearFrame` (AppleScript bounds — persists where AX size reverts on Chrome/Brave/Edge/Opera/Vivaldi/Chromium); everything else uses the standard `WindowMutator.setFrame` AX path. Both paths run a settled readback + one optional `PlotGeometry.correctForConstraints` position write to anchor to the drawn snap edge when the app enforced a minimum size. Feature-flagged (`useBrowserNativeBoundsForPlot`) for rollback. Logs completion with `transport=browser-native | ax-fallback(nativeFailure=X) | ax` and settled-frame vs requested-frame diagnostics.
+- **`PlotGeometry.swift`** — pure snap + validation. `computePlotArea(rawRect:, visibleFrame:, previous:)` returns `(finalRect, PlotSnapState)` — each of N/S/E/W independently snaps to the display edge when the raw edge enters the outer 15% zone (with hysteresis to prevent flicker at the boundary). `correctForConstraints(actualSize:, requested:, intent:, visibleFrame:)` re-anchors to snap-intent edges when the app enforced a minimum size. Minimum area 80×60pt; drag threshold 6pt. No AppKit, no AX.
+- **`PlotModeHint.swift`** — the persistent "Press Esc to End Plot Mode" pill. `show()` / `hide()` / `hideImmediately()` / `dim()` / `undim()` (dims to alpha 0.28 after a window is selected so the pill doesn't obscure the drawing area).
+- **`PlotOverlay.swift`** — per-display NSPanel overlays that render the selected-window outline (dashed blue), the live Plot Area preview (translucent fill + snapped-edge emphasis), and the landing pulse around the final settled frame. Generation-guarded so a mode-teardown mid-animation can't leave overlays visible.
 
 ### Corral
 
@@ -73,8 +85,10 @@ Alphabetical, grouped by role.
 
 ### Browser scripting
 
-- **`BrowserScripting.swift`** — everything AppleScript for browsers. Chromium family + Safari. Bundle-ID addressing (`tell application id "…"`), 8-window enumeration cap, `whose bounds is {…}` shortcut for targeted lookup, timeout guard on every script call, per-bundle Automation permission tracking. See the "Landmines" section for the `tab`-class shadowing trap.
-- **`AutomationPermission.swift`** — thin Swift wrapper around `AEDeterminePermissionToAutomateTarget`. Returns `granted`/`denied`/`notAvailable`/`other(OSStatus)`. Also `openSystemSettings()` to jump to the Automation panel.
+- **`BrowserScripting.swift`** — everything AppleScript for browsers. Chromium family + Safari. Bundle-ID addressing (`tell application id "…"`), 8-window enumeration cap, `whose bounds is {…}` shortcut for targeted lookup, timeout guard on every script call, per-bundle Automation permission tracking. Two API surfaces:
+  - **Corral tab capture / restore** (existing): `snapshotBrowserWindowNearFrame`, `moveBrowserWindow`, `openBrowserWindow` — full snapshot + tab enumeration + window creation for the save/restore flow.
+  - **Native window-bounds transport** (Plot + Cascade laggard repair): `supportsNativeWindowBounds(bundleID:)` (Chromium bundles only — Safari's AX writes are already reliable), `setBrowserWindowBoundsNearFrame(bundleID:, currentBoundsAX:, targetBoundsAX:) async → BrowserBoundsMoveResult` (fresh bounds enumeration → pure ambiguity-safe `matchBrowserWindow` → immediate bounds write; no tabs fetched, no snapshot cache used). Non-blocking via `runScriptAsync` that races the AppleScript against `Task.sleep(timeout)` on a background queue. Used by PlotCoordinator's Chromium commit path and CascadeOrchestrator's Chromium laggard repair — Chrome asynchronously reverts AX size writes on its next runloop tick, but the AppleScript `bounds` write goes through Chrome's Apple Event handler and persists. See the "Landmines" section for the `tab`-class shadowing trap.
+- **`AutomationPermission.swift`** — thin Swift wrapper around `AEDeterminePermissionToAutomateTarget`. Returns `granted`/`denied`/`notAvailable`/`other(OSStatus)`. Also `openSystemSettings()` to jump to the Automation panel. Native-bounds transport calls this with `askIfNeeded: false` so Plot / Cascade never surface a Chrome-permission prompt mid-interaction — onboarding already ran the request pass.
 
 ### App shell
 
@@ -190,28 +204,46 @@ The lasso overlay draws in Cocoa space (that's what NSPanel and NSView use). The
 
 ## Testing
 
-There's a `Window WranglerTests` target in the Xcode project but it isn't populated. All validation during MVP development was manual, user-driven, and observed through Console.app logs.
+**96 tests currently passing**, all XCTest, running under the `Window WranglerTests` target (Xcode filesystem-synchronized group — new test files in that folder are auto-picked up). Coverage is on the pure-geometry / pure-decision modules; the orchestrators remain user-validated through Console logs.
 
-If you're going to add tests, start with `FanGeometry.swift` — it's pure geometry, takes rects, returns rects, no AX. `CoordinateSpace.swift` next. The orchestrators are harder to test without mocking half of AppKit.
+Current test files:
+
+- **`CoordinateSpaceTests.swift`** — AX ↔ Cocoa round-trip identity, negative-coordinate displays, primary-display pivot rules.
+- **`FanGeometryTests.swift`** — cascade layout with anchor override, natural-vs-rigid shifting, reveal reduction, empty input, single-window special case.
+- **`WindowSelectionTests.swift`** — selection state semantics (`replace(with:)` fires only on actual change, duplicate-ID collapse, frames ordered by windowID).
+- **`BrowserBoundsMatcherTests.swift`** — the pure `BrowserScripting.matchBrowserWindow` matcher: exact/near/no/beyond-tolerance/tied/duplicate/ordered-alignment/negative-coord scenarios + `supportsNativeWindowBounds` bundle-ID coverage.
+- **`CascadePlanningTests.swift`** — resolver invariance (settable → always target size), non-settable preservation, negative-coord independence, end-to-end `fitFrame` determinism (Set A vs Set B with different current sizes → identical target for settable windows), old-behavior regression proof.
+- **`CascadeZOrderDriftTests.swift`** — persistent-drift detection identity semantics: transient burst vs recurring pattern, disjoint vs overlapping slots, incomplete-observation handling, warm-cascade zero-correction, cold-start pattern reproduction, `zOrderStatusIsSettled` matrix.
+- **`SelectionCascadeSettlementTests.swift`** — parity with All-Apps: drift detection with Selection labels, warm zero-raise, transient-drift clearing, reported failure reproduction, shared final-status handling, shared timing constants (no forks).
+
+If you add tests: pure modules first (`FanGeometry`, `CoordinateSpace`, `PlotGeometry`, `CascadePlanning`, `CascadeZOrderDrift`, `BrowserScripting.matchBrowserWindow`). Orchestrators (`PlotCoordinator`, `CascadeOrchestrator`, `LassoCoordinator`, `CorralOrchestrator`) remain harder to unit-test without extensive AX + AppKit mocking — for those the manual test matrices in past commit messages are the reference.
 
 ---
 
-## The parking lot as of MVP-1.0
+## The parking lot as of current session
 
-Items intentionally deferred from the prototype phase. The user (project owner) is aware of each. Not surprises.
+Items intentionally deferred. The user (project owner) is aware of each. Not surprises.
 
 ### Repo hygiene
 
-- **Push to a private GitHub remote** — currently local-only. If the SSD dies, everything is lost.
-- **README.md** — this one exists; the parking-lot item is complete.
+- **Private GitHub remote** — now `origin` at `github.com/j3rdgen/WindowWrangler.git`. Push cadence: after each substantial commit.
+- **README.md, HANDOFF.md, TECHNICAL_OVERVIEW.md** — this doc set exists; kept current alongside code changes.
 - **LICENSE** — currently just "all rights reserved" in the README; should be a formal file.
 - **`.gitignore` audit** — confirm no DerivedData / secrets / build artifacts tracked.
-- **Feature-branch + PR workflow** — currently committing straight to `main`. Fine for solo work; matters at handoff.
+- **Feature-branch + PR workflow** — currently working on `cascade-flicker-refinement`, direct-commit style. Fine for solo work; matters at handoff.
 - **Semantic version releases** — will be relevant when moving toward distribution.
 
 ### Scope items deferred from prototype
 
 - **M7 — adjustable header + lateral reveal in a Preferences UI.** Sketched: a SwiftUI Preferences window with two sliders (vertical / horizontal cascade offsets), values persisted in `UserDefaults`, cascade geometry code reads from those settings. Deferred because the hardcoded defaults (28pt header reveal, 60pt lateral reveal) feel right in practice — no scenario has surfaced where they don't. Revisit if one does.
+- **Uniform window sizing** — capture the frontmost window's current dimensions via `⌃⌥⌘U`, apply as target size to every subsequent cascade until cleared. Sketched in the CLAUDE.md parking-lot with concrete implementation details. Small addition (~30 lines new `UniformSize.swift`, two menu items, one target-size site in `CascadeOrchestrator`). Not blocking anything; revisit when a real need surfaces.
+
+### Recently resolved (previously parking-lot)
+
+- **Chrome AX size revert during cascade / Plot** — resolved via Chromium native-bounds AppleScript transport (see BrowserScripting module). AX writes are still the default for non-Chromium; Chromium windows go through `set bounds of window N` which persists.
+- **Post-Plot cascade required 4-5 invocations to converge** — resolved via deterministic planning-size resolver (`CascadePlanning`). Slot geometry now uses `standardTargetSize` for size-settable windows regardless of current dimensions.
+- **Intermittent wrong-depth after cascade** — resolved via bounded z-order settlement pipeline (per-generation drift history, pass-4 persistent-drift escalation, async 16ms-spaced serialized reconstruction, conditional late recommit at +1600ms, max 2 walks). Applies to All-Apps and Selection cascades.
+- **Lasso auto-cascade after multi-window resize occasionally wrong depth** — resolved by extending the settlement pipeline to `performCascadeOnSelection` with the same +120/+300/+500/+1000ms checkpoints and shared escalation.
 
 ### Known limitations (macOS-inherent or design trade-offs, not bugs)
 
@@ -276,6 +308,26 @@ Same class of bug as `activate`. When Chrome is running with windows on other De
 
 **Fix in place.** `CorralOrchestrator.openAppForRestore` skips `/usr/bin/open -b` entirely for browsers. Browsers get their windows created via AppleScript in `restoreBrowserMember` → `openChromiumWindowScript`, which doesn't activate. Non-browsers still get `open -b` as their launch path.
 
+### Chromium apps asynchronously revert AX size writes
+
+**The trap.** Chrome, Brave, Edge, Opera, Vivaldi, and other Chromium-derived browsers accept `AXUIElementSetAttributeValue(kAXSizeAttribute, …)` writes and immediately report the new size — then, on the next Chrome runloop tick (~15–30ms), silently revert the size to whatever they think it should be. Position writes are honored; size writes bounce. No error, no log signal.
+
+**Where it bit us.** (1) Cascade end-shot verification saw the position at target but size back to pre-cascade, flagging every Chrome window as a "laggard" and re-cascading in an infinite loop. (2) Plot Mode's draw-your-rectangle gesture worked for every app except Chrome — user drags a 1000×600 area, Chrome ends up at its previous size, position was correct.
+
+**Fix in place.** Chromium windows (bundle IDs matched via `BrowserScripting.supportsNativeWindowBounds`) route through `BrowserScripting.setBrowserWindowBoundsNearFrame`, which uses AppleScript `set bounds of window N to {x1, y1, x2, y2}` — a single atomic write through Chrome's Apple Event handler. The bounds path is not subject to the AX size-revert behavior; Chrome persists the write. `PlotCoordinator` and `CascadeOrchestrator` both branch on `supportsNativeWindowBounds(bundleID:)` and pick the native transport for those bundles.
+
+**If you add a new mutation path** that changes size on cross-app windows, mirror the branch. AX-only for Safari (its AX writes are reliable), AppleScript-bounds for Chromium. Feature-flagged (`useBrowserNativeBoundsForPlot`) — flip off if a specific Chrome version regresses the AppleScript path.
+
+### CGWindowList z-order vs observed reality gap
+
+**The trap.** `CGWindowListCopyWindowInfo(.optionOnScreenOnly)` returns windows in front-to-back z-order, and we use that ordering to observe what stack order actually took effect after `AXUIElementPerformAction(kAXRaiseAction)` calls during cascade. But CGWindowList's z-order snapshot lags the WindowServer state by up to hundreds of ms for cross-app windows — so a well-formed pass-1 cascade can appear to leave 3 windows at the wrong depth when in reality every raise landed correctly and the observation itself is stale.
+
+**Where it bit us.** Cold-start cascades with 5+ apps consistently reported "3 windows still drifted" at pass-2 checkpoint, escalated to serialized reconstruction, and produced a visible re-stacking flicker — even though a subsequent complete observation 200ms later showed correct order. The persistent-drift detector's job is to distinguish "same slot keeps drifting across TWO consecutive complete observations" (real) from "one stale observation" (fake).
+
+**Fix in place.** `CascadeZOrderDrift.isPersistentDrift(history)` requires **two consecutive complete-observation non-empty checkpoints with overlapping slot identities** before escalating. `observationIncomplete` records don't count. This is why the pipeline schedules four spaced checkpoints (+120/+300/+500/+1000ms) — the spacing lets CGWindowList catch up between reads, so single-checkpoint stale reads don't cascade into cosmetic serialized-reconstruction walks. Also why the final status can downgrade `.observationIncomplete` → `.settledNoCorrection` once a later complete observation confirms.
+
+**If you add another z-order verification path**, use the same primitives — never trigger corrective action on a single observation, never use count-only heuristics (a two-window drift that shifts identity across reads is not persistent), and always let the drift history carry the incomplete-observation flag.
+
 ### `NSRunningApplication.runningApplications(withBundleIdentifier:).first` is unreliable for multi-PID apps
 
 Console (and some other Apple system apps) can have multiple concurrent PIDs for a single bundle. Window ownership can land on any of them. `.first` is not deterministic.
@@ -304,8 +356,10 @@ If you're new to the codebase and want to understand it fastest:
 4. Read `LassoCoordinator.swift` to see how the input event → selection → overlay flow wires together.
 5. Read `CorralOrchestrator.swift` last — the biggest orchestrator, the most gotchas, but structured similarly to the others.
 
-If you're going to add a browser feature: read `BrowserScripting.swift` in full FIRST. The `tab`-class shadowing landmine will bite you otherwise.
+If you're going to add a browser feature: read `BrowserScripting.swift` in full FIRST. The `tab`-class shadowing landmine will bite you otherwise. Chromium size writes also need the native-bounds transport, not AX — see the "Chromium apps asynchronously revert AX size writes" landmine.
 
 If you're going to touch the event tap: read `GlobalEventMonitor.swift` and the "CGEventTap safety" section above in full. The default-disabled invariant is load-bearing.
 
 If you're going to add a modal UI: read `CorralPanelHelpers.swift` — it hosts the three shared symbols (`KeyablePanel`, `ButtonTarget`, `centerCorralPanel`) that the existing modals use. Follow the pattern instead of rolling your own.
+
+If you're going to touch cascade z-order enforcement: read `CascadeZOrderDrift.swift` (pure primitives) and the "CGWindowList z-order vs observed reality gap" landmine before writing any corrective action. The identity-based two-observation persistent-drift rule is load-bearing — a single stale CGWindowList read can look identical to real drift, and count-only heuristics generate cosmetic flicker on cold-start cascades.

@@ -4,7 +4,7 @@ Comprehensive product technical profile. Read this document when you need to rea
 
 **Audience:** external AI planning agents (or human strategists) preparing business plans, marketing plans, GTM plans, ICP research, competitive positioning, or roadmap prioritization from this project. Not a developer guide; see [`HANDOFF.md`](HANDOFF.md) for that.
 
-**Currency:** as of MVP-1.0 (git tag `MVP-1.0`, commit `55b6807`, July 2026). This document is the source of truth as of that snapshot. Later commits may add features not reflected here.
+**Currency:** as of MVP-1.0 (git tag `MVP-1.0`, commit `55b6807`, July 2026) plus a follow-on refinement pass on branch `cascade-flicker-refinement` (through commit `68e7fe8`, August 2026) that added **Plot Mode**, **Chromium native-bounds transport**, and the **bounded z-order settlement pipeline**. All three additions are reflected in §2 and §3 below. Later commits may add features not reflected here.
 
 **How to use this document:** Section §14 at the bottom tells you which sections to pull from for which kinds of questions. If you're pressed for time, read §1, §2, §8, §9, §13, §14 first — those alone let you make sound positioning and pricing judgments.
 
@@ -14,9 +14,9 @@ Comprehensive product technical profile. Read this document when you need to rea
 
 ### 1.1 What it is
 
-Window Wrangler is a macOS menu-bar utility that arranges application windows across displays and desktops. It has three distinct mechanics: **cascade** (fan-stack every window in a display in a way that keeps title bars visible), **lasso** (click-and-drag rubber-band selection of windows across multiple applications), and **corral** (save a lasso selection as a named group and restore it later, including the tab lists of any browser windows in the group).
+Window Wrangler is a macOS menu-bar utility that arranges application windows across displays and desktops. It has four distinct mechanics: **cascade** (fan-stack every window in a display in a way that keeps title bars visible), **lasso** (click-and-drag rubber-band selection of windows across multiple applications), **corral** (save a lasso selection as a named group and restore it later, including the tab lists of any browser windows in the group), and **plot** (click any window then drag to draw a rectangle — the window snaps to that rectangle on release, with edge-snap on the outer 15% of the display).
 
-The product's differentiating idea is treating a set of windows across different apps as one addressable thing — something you can grab, move, cascade, save, and recall as a group. Most macOS window managers operate on one window at a time; Wrangler is designed around multi-window operations.
+The product's differentiating idea is treating a set of windows across different apps as one addressable thing — something you can grab, move, cascade, save, and recall as a group. Most macOS window managers operate on one window at a time; Wrangler is designed around multi-window operations. Plot Mode complements the group model by giving the same user a precision-placement gesture for the individual-window moments in between.
 
 ### 1.2 Category
 
@@ -32,10 +32,10 @@ Any customer-facing surface uses "Window Wrangler."
 
 ### 1.4 Current status
 
-- **MVP-1.0 complete.** All in-scope prototype features shipped and validated by the author on their daily-driver machine.
+- **MVP-1.0 complete + post-MVP refinement pass in flight.** All in-scope prototype features shipped and validated by the author on their daily-driver machine. Follow-on additions on branch `cascade-flicker-refinement`: Plot Mode (single-window precision placement), Chromium native-bounds transport (reliable resize where AX writes silently revert on Chrome/Brave/Edge/Opera/Vivaldi/Chromium), and a bounded z-order settlement pipeline shared by All-Apps and Selection Cascade (identity-based persistent-drift detection + async serialized reconstruction + late recommit, all budget-capped).
 - **Personal prototype, not distributed.** Runs from Xcode as a local build. No code signing beyond self-sign. No notarization. No public download. No Mac App Store presence.
 - **Solo developer, AI-assisted.** The project owner is not a professional developer; the code was authored primarily by Claude Code with the owner directing feature scope, testing every commit, and making product decisions.
-- **Two-week development timeline** for the current feature set. Corral (M8) was the largest single milestone.
+- **Two-week development timeline** for the MVP-1.0 feature set. Corral (M8) was the largest single milestone. Post-MVP refinements landed in follow-on sessions.
 
 ---
 
@@ -55,7 +55,9 @@ Every feature currently shipping. Section §13 explicitly enumerates features th
 
 - Bound to `⌃⌥⌘]` (Down-Right) and `⌃⌥⌘[` (Down-Left).
 - Same as single-app cascade but includes windows from every visible app on the target display, grouped by application (each app's windows form their own sub-cascade, and each subsequent app's anchor is offset laterally so the app groupings remain visually distinguishable).
-- Handles the retry / verify / z-order-enforcement pattern to accommodate slow-to-respond apps (Chrome, Zoom) that don't complete AX-driven position updates in one pass.
+- **Deterministic planning-size resolver.** Slot geometry is computed from each window's `standardTargetSize` (for size-settable apps) rather than its current mutable size — so a cascade fired after a manual resize or after Plot Mode still lands every window at the same slot on the first invocation. Fixes the "post-Plot cascade needs 4-5 invocations to converge" bug class.
+- **Handles the retry / verify / z-order-enforcement pattern** to accommodate slow-to-respond apps (Chrome, Zoom) that don't complete AX-driven position updates in one pass. Includes a bounded z-order settlement pipeline: pass-1 raise, three spaced re-checkpoints (+120/+300/+500ms), a pass-4 persistent-drift decision at +1000ms, async 16ms-spaced serialized reconstruction (deepest→anchor) when persistent drift is confirmed by two consecutive complete observations, a settled reobservation at +200ms, and a conditional late recommit at +1600ms. Hard cap of 2 serialized walks per cascade generation. All work is generation-guarded so a newer cascade or Restore aborts the older settlement in flight.
+- **Chromium laggard native-bounds repair.** When Chromium windows show as laggards during retry passes, the fix write routes through AppleScript `set bounds` instead of AX — AX size writes to Chromium browsers silently revert on the next runloop tick, but the AppleScript path persists.
 
 ### 2.3 Layout snapshot + restore
 
@@ -77,6 +79,21 @@ Every feature currently shipping. Section §13 explicitly enumerates features th
 - Uses a Finder-style ghost preview: the outlines shift with the cursor, and the actual windows follow via AX position writes.
 - On drag release, the windows snap to their final positions.
 - Handles cross-display drags — the group can be dragged across multiple displays.
+
+### 2.5a Lasso group resize
+
+- With lasso mode on and a selection active, two circle handles (BL / BR) appear on the last-interacted selected window.
+- Grab a handle and drag; the frontmost selection outline updates live and the entire selection resizes together on release. Zero AX writes fire during the drag itself — the whole authoritative resize (per-window preflight, per-PID parallel writes, settle, readback, positions-only recascade, toast) is deferred until mouse-up. This keeps the interactive surface at 60fps even for cross-app selections that include Chrome / System Settings, where mid-drag AX writes would otherwise stutter to single-digit fps.
+- Fires an auto-cascade of the selection on release, with cascade direction inferred from the anchor geometry (which corner was pulled).
+
+### 2.5b Plot Mode
+
+- Bound to `⌃⌥⌘P`. Also available from the menu-bar dropdown.
+- Single-window precision-placement gesture. State machine: enter Plot Mode → click any visible window to select it (window gets a dashed outline; the "Press Esc to End Plot Mode" pill dims to alpha 0.28) → click-and-drag anywhere to draw a destination rectangle → release to snap the window to that rectangle.
+- **Edge-snap logic:** each of the four rectangle edges (N/S/E/W) independently snaps to the display edge when the drawn edge enters the outer 15% zone, with hysteresis to prevent flicker at the snap boundary. Interior coordinates are preserved exactly as drawn — no grid, no presets.
+- **Chromium commit path:** Chromium windows (Chrome, Brave, Edge, Opera, Vivaldi, Chromium — matched by bundle ID) commit via AppleScript `set bounds` because Chromium apps asynchronously revert AX size writes on the next runloop tick. Non-Chromium windows commit via the standard AX position + size write. Both paths run a settled readback + one optional position-correction write to re-anchor to snap-intent edges when the app enforced a minimum size.
+- **Mutually exclusive with Lasso Mode.** Activating one tears down the other. `Esc` or `⌃⌥⌘P` exits Plot Mode.
+- Multi-display aware — the drawn rectangle's target display is the one containing the mouse cursor when the drag begins.
 
 ### 2.6 Corral — save
 
@@ -106,10 +123,12 @@ Every feature currently shipping. Section §13 explicitly enumerates features th
 - Icon in the menu bar (SF Symbol / custom art). Clicking it opens a dropdown showing:
   - Accessibility permission status
   - Lasso mode current state + toggle
+  - Plot mode current state + toggle
   - Selection count (when non-empty) + Clear button
   - Cascade Down-Right / Down-Left / All Apps variants / Restore Previous Layout
   - Corral (Save) — grayed out unless selection + not at cap
   - Release ▸ submenu with each saved corral for direct-restore + a "Manage Corrals…" item that opens the pill for delete UI
+  - Launch at Login toggle
   - Reopen Setup (only shown when Accessibility isn't granted)
   - Quit
 - Every menu item shows its keyboard shortcut hint.
@@ -140,24 +159,26 @@ Arc is NOT supported — Arc's AppleScript dictionary differs from stock Chromiu
 
 ### 3.1 macOS APIs used
 
-- **Accessibility (AX)** — `AXUIElementCopyAttributeValue`, `AXUIElementSetAttributeValue` for reading and writing window position, size, title, document path. Requires user grant.
-- **CGWindow (Quartz)** — `CGWindowListCopyWindowInfo` for cross-app window enumeration with on-screen-only filtering. No permission required (public API).
-- **AppleScript / Apple Events** — `NSAppleScript` for browser tab capture and creation. Requires per-target Automation permission (TCC).
-- **CGEventTap** — for global left-mouse-event interception during lasso mode. Requires Accessibility permission (same grant as AX).
-- **NSEvent local monitor** — for Escape-key handling within lasso overlays.
+- **Accessibility (AX)** — `AXUIElementCopyAttributeValue`, `AXUIElementSetAttributeValue`, `AXUIElementPerformAction(kAXRaiseAction)` for reading, writing, and z-ordering windows. Requires user grant.
+- **CGWindow (Quartz)** — `CGWindowListCopyWindowInfo` for cross-app window enumeration + z-order observation. No permission required (public API).
+- **AppleScript / Apple Events** — `NSAppleScript` for browser tab capture and creation (Corral) and for direct window-bounds writes on Chromium apps (Plot + Cascade laggard repair). Requires per-target Automation permission (TCC).
+- **CGEventTap** — for global left-mouse-event interception during lasso mode and Plot Mode. Requires Accessibility permission (same grant as AX).
+- **NSEvent local monitor** — for Escape-key handling within lasso and Plot overlays.
 - **NSWorkspace** — for launching apps (`NSWorkspace.open`, `Process` invoking `/usr/bin/open`) and for `NSRunningApplication` enumeration.
+- **SMAppService** — modern Login Items registration (macOS 13+) for the "Launch at Login" toggle.
 
 ### 3.2 Module structure
 
 Codebase is organized around strict separation of concerns:
 
 - **Boundary modules** wrap platform APIs (`AXWindowEnumerator`, `WindowMutator`, `CrossAppWindowEnumerator`, `BrowserScripting`, `GlobalEventMonitor`, `AccessibilityPermission`, `AutomationPermission`, `CoordinateSpace`).
+- **Pure decision modules** contain testable logic with no platform dependencies (`FanGeometry`, `PlotGeometry`, `CascadePlanning`, `CascadeZOrderDrift`, and the pure `BrowserScripting.matchBrowserWindow` matcher).
 - **State modules** own specific state (`WindowSelection`, `CorralStore`, `LayoutSnapshot`).
-- **Orchestrator modules** wire the boundaries + state into user-facing flows (`CascadeOrchestrator`, `LassoCoordinator`, `CorralOrchestrator`).
-- **UI modules** render dedicated pieces (`SelectionOverlay`, `LassoModeHint`, `CorralNamePill`, `CorralReleaseMenu`, `CorralToast`, `MenuBuilder`, `OnboardingWindowController`).
+- **Orchestrator modules** wire the boundaries + state into user-facing flows (`CascadeOrchestrator`, `LassoCoordinator`, `CorralOrchestrator`, `PlotCoordinator`).
+- **UI modules** render dedicated pieces (`SelectionOverlay`, `LassoModeHint`, `PlotOverlay`, `PlotModeHint`, `CorralNamePill`, `CorralReleaseMenu`, `CorralToast`, `MenuBuilder`, `OnboardingWindowController`).
 - **App shell** wires everything together (`WindowWranglerApp`, `WindowWranglerActions`, `GlobalShortcuts`, `MenuBarIcon`).
 
-30 Swift source files. Approximately 8,000 lines of code (post-simplification pass; a cleanup pass reduced 400+ lines with no functional loss).
+~35 Swift source files, ~9,500 lines of code, plus a `Window WranglerTests` target with 7 test files and 96 currently-passing XCTest cases (see §12.3).
 
 ### 3.3 Coordinate spaces
 
@@ -475,8 +496,9 @@ Nobody currently ships:
 - **Cross-app lasso** — Finder has a similar rubber-band-select gesture within Finder itself, but no utility extends this to work across arbitrary apps' windows.
 - **Named window groups with browser tab preservation** — Moom's layouts don't capture tabs. Chrome extensions (Session Buddy, One Tab) capture tabs but not window positions or non-browser context. Wrangler is the only one that unifies both.
 - **Group drag** across apps as a first-class primitive.
+- **Draw-your-target-rectangle placement (Plot Mode).** Most window managers offer snap-to-preset (halves, thirds, quarters) or free-form drag. Plot Mode's "draw a rectangle, the window snaps to it with independent per-edge display-edge snap on the outer 15%" gesture is unusual — Moom's mouse-hover-corner has a superficially similar feel but commits to preset regions, not a user-drawn rectangle.
 
-The competitive whitespace Wrangler occupies is "multi-window operations across apps" — a category currently unfilled.
+The competitive whitespace Wrangler occupies is "multi-window operations across apps" complemented by "precision single-window placement without a preset grid" — a category currently unfilled.
 
 ---
 
@@ -548,13 +570,9 @@ Features not currently shipping but technically feasible with the current archit
 
 **Effort:** 1–2 days.
 
-### 11.2 Launch at login
+### 11.2 Launch at login — **shipped**
 
-**What:** ship with a Login Item so the menu-bar icon appears on every login without manual launch.
-
-**Approach:** modern `SMAppService.mainApp.register()` (macOS 13+) or Login Items in `Info.plist`.
-
-**Effort:** half a day.
+Menu-bar toggle wires `SMAppService.mainApp.register()`. Managed via the standard **System Settings → General → Login Items & Extensions**. Persists across relaunches.
 
 ### 11.3 Custom keybindings
 
@@ -656,8 +674,9 @@ Features not currently shipping but technically feasible with the current archit
 ### 12.3 Testing surface
 
 - **Primary test rig:** developer's daily-driver MacBook. macOS 26.5 (Tahoe), Retina Built-in Display, various external displays connected during some sessions.
-- **All validation was manual + observational.** No unit tests, no UI tests, no automated regression tests. Every behavior claim in this document was validated by the developer running the app and observing the result.
-- **What's been tested extensively:** cascade in every direction, lasso across many app configurations, corral save/restore with mixed app types, browser tab capture with Chrome (extensive), Safari (moderate), Brave / Edge / Vivaldi / Opera (spot-check).
+- **Manual + observational for orchestrators.** Cascade orchestration, lasso flow, Plot commit path, corral save/restore, and cross-app behavior are all validated by the developer running the app and inspecting Console logs (`subsystem:com.jmw3.WindowWrangler`).
+- **XCTest coverage on pure-decision modules.** 96 tests currently passing across 7 files: `CoordinateSpaceTests`, `FanGeometryTests`, `WindowSelectionTests`, `BrowserBoundsMatcherTests` (the ambiguity-safe Chromium-window matcher), `CascadePlanningTests` (the deterministic planning-size resolver), `CascadeZOrderDriftTests` (identity-based persistent-drift detection + final-status matrix), and `SelectionCascadeSettlementTests` (parity with All-Apps + shared-timing invariants). Test target is filesystem-synchronized — new files auto-picked up.
+- **What's been tested extensively:** cascade in every direction, lasso across many app configurations, corral save/restore with mixed app types, browser tab capture with Chrome (extensive), Safari (moderate), Brave / Edge / Vivaldi / Opera (spot-check), Plot Mode with Chromium and non-Chromium targets.
 - **What's been tested lightly:** multi-display configurations, macOS versions other than 26.5, edge cases like extreme window counts.
 - **What has NOT been tested:** older macOS versions (13, 14, 15), Apple Silicon vs Intel distinctions, Firefox (not supported), enterprise MDM environments, apps with unusual AX behavior beyond what's covered in the parking lot.
 
@@ -670,10 +689,11 @@ Features not currently shipping but technically feasible with the current archit
 
 ### 12.5 Repo state
 
-- **~30 Swift source files**, ~8,000 LOC.
-- **Single Xcode project**, single build target for the app + one for a scaffolded (unused) test target.
-- **git tag `MVP-1.0`** anchors the shippable state at commit `55b6807`.
-- **No external dependencies** — pure Foundation + AppKit + ApplicationServices. No CocoaPods, no Swift Package Manager dependencies, no Carthage.
+- **~35 Swift source files** in the app target, ~9,500 LOC.
+- **Single Xcode project**, one app target + one test target (`Window WranglerTests`) with 96 passing XCTest cases.
+- **git tag `MVP-1.0`** anchors the MVP shippable state at commit `55b6807`. Follow-on work lives on branch `cascade-flicker-refinement`; current head as of this document is `68e7fe8` (bounded z-order settlement pipeline for All-Apps + Selection Cascades).
+- **git remote:** `origin` → private GitHub repo. Local commits are pushed after each substantial change.
+- **No external dependencies** — pure Foundation + AppKit + ApplicationServices + ServiceManagement. No CocoaPods, no Swift Package Manager dependencies, no Carthage.
 
 ---
 
@@ -699,7 +719,6 @@ This section exists specifically so external AI planners **don't invent features
 - **No Shortcuts integration.** No Focus integration.
 - **No custom keybindings UI.** Shortcuts are hardcoded (deferred, see §11.3).
 - **No Preferences UI at all.** No settings screen exists (deferred, see §11.1).
-- **No login items behavior** — the app doesn't auto-launch on macOS login (deferred, see §11.2).
 - **No tutorial or onboarding beyond the accessibility permission flow.**
 - **No update mechanism.** No Sparkle. No auto-update. No update-check-on-launch.
 - **No telemetry.** No analytics. No crash reporting. Nothing sent anywhere.
@@ -803,4 +822,4 @@ Ask the human user in your session, don't guess. They can go back to the develop
 
 ---
 
-*End of document. Length: ~5,800 words. Currency: MVP-1.0 (git tag `MVP-1.0`, commit `55b6807`).*
+*End of document. Currency: MVP-1.0 (git tag `MVP-1.0`, commit `55b6807`, July 2026) plus post-MVP refinements on branch `cascade-flicker-refinement` through commit `68e7fe8` (August 2026) — Plot Mode, Chromium native-bounds transport, bounded z-order settlement pipeline for All-Apps + Selection Cascades.*
