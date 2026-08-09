@@ -187,4 +187,5 @@ enum KeyCode {
     static let period:       UInt16 = 0x2F  // kVK_ANSI_Period
     static let leftBracket:  UInt16 = 0x21  // kVK_ANSI_LeftBracket
     static let rightBracket: UInt16 = 0x1E  // kVK_ANSI_RightBracket
+    static let p:            UInt16 = 0x23  // kVK_ANSI_P
 }

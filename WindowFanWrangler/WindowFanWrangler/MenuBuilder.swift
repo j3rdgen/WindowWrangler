@@ -24,6 +24,8 @@ enum MenuBuilder {
         let isTrusted: Bool
         /// Is lasso mode currently active?
         let lassoModeActive: Bool
+        /// Is Plot Mode currently active?
+        let plotModeActive: Bool
         /// How many windows are in the current selection (0 hides the
         /// selection / clear-selection items).
         let selectionCount: Int
@@ -66,6 +68,14 @@ enum MenuBuilder {
             modifiers: shortcutModifiers,
             isTrusted: state.isTrusted,
             lassoActive: state.lassoModeActive
+        )
+
+        addPlotSection(
+            to: menu,
+            target: target,
+            modifiers: shortcutModifiers,
+            isTrusted: state.isTrusted,
+            plotActive: state.plotModeActive
         )
 
         if state.selectionCount > 0 {
@@ -145,6 +155,40 @@ enum MenuBuilder {
             title: lassoActive ? "Turn Off Lasso Mode" : "Turn On Lasso Mode",
             action: #selector(WindowWranglerActions.toggleLassoFromMenu),
             keyEquivalent: "c"
+        )
+        toggleItem.keyEquivalentModifierMask = modifiers
+        toggleItem.target = target
+        toggleItem.isEnabled = isTrusted
+        menu.addItem(toggleItem)
+    }
+
+    /// Plot (Snap Window to Drawn Area) section. Same structural
+    /// pattern as the Lasso section — a disabled state row plus a
+    /// toggle row bound to the ⌃⌥⌘P shortcut. Independent of Lasso
+    /// state; mode arbitration is handled by the coordinators.
+    private static func addPlotSection(
+        to menu: NSMenu,
+        target: WindowWranglerActions,
+        modifiers: NSEvent.ModifierFlags,
+        isTrusted: Bool,
+        plotActive: Bool
+    ) {
+        let stateItem = NSMenuItem(
+            title: plotActive
+                ? "Plot Mode: ● ON  — click a window, then drag its area"
+                : "Plot Mode: Off",
+            action: nil,
+            keyEquivalent: ""
+        )
+        stateItem.isEnabled = false
+        menu.addItem(stateItem)
+
+        let toggleItem = NSMenuItem(
+            title: plotActive
+                ? "Turn Off Plot Mode"
+                : "Plot (Snap Window to Drawn Area)",
+            action: #selector(WindowWranglerActions.togglePlotFromMenu),
+            keyEquivalent: "p"
         )
         toggleItem.keyEquivalentModifierMask = modifiers
         toggleItem.target = target

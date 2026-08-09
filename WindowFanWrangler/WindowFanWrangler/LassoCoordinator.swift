@@ -19,6 +19,13 @@ import os
 final class LassoCoordinator {
 
     private let eventMonitor = GlobalEventMonitor()
+
+    /// Exposes the shared event tap owner so a sibling mode
+    /// (PlotCoordinator) can reuse the same CGEventTap rather than
+    /// creating a second one. Mode arbitration in WindowWranglerApp
+    /// ensures only one of Lasso / Plot is active at a time; the
+    /// tap forwards left-mouse events to whichever mode is enabled.
+    var sharedEventMonitor: GlobalEventMonitor { eventMonitor }
     private let overlay = SelectionOverlay()
     private let modeHint = LassoModeHint()
     let selection: WindowSelection
@@ -347,6 +354,20 @@ final class LassoCoordinator {
         } else {
             modeHint.hide()
             cancelScheduledBrowserPrefetch()
+            // Purely cosmetic: hide the on-screen lasso UI so the
+            // screen matches the "off" reality. Without this, a second
+            // shortcut press left the previous session's selection
+            // outlines / corner handles / rubber-band rectangle drawn
+            // on screen even though the event tap was already inactive,
+            // producing a "lasso looks on but isn't" state. Selection
+            // *data* is preserved (WindowSelection is untouched) so
+            // menu commands like "Cascade Selected" and "Save to
+            // Corral" still act on the retained selection. Escape
+            // remains the way to fully clear data.
+            overlay.hideLassoRect()
+            overlay.endGroupDrag()
+            overlay.setFrontmostFrame(nil)
+            overlay.setSelectionFrames([])
         }
         Log.lasso.notice("Lasso mode: \(self.isLassoModeActive ? "ON" : "OFF", privacy: .public)")
         onLassoModeChanged?(isLassoModeActive)

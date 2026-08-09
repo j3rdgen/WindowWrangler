@@ -1,8 +1,8 @@
 # Window Wrangler
 
-A macOS menu-bar utility for arranging windows across apps. Cascade every visible window in a title-bar-preserving fan layout, lasso windows across apps with click-and-drag, and save named window groups ("Corrals") that restore later — including browser tabs.
+A macOS menu-bar utility for arranging windows across apps. Cascade every visible window in a title-bar-preserving fan layout, lasso windows across apps with click-and-drag, save named window groups ("Corrals") that restore later — including browser tabs — and precision-place any window into a drawn rectangle with **Plot Mode**.
 
-**Status:** MVP-1.0. Personal prototype. Not distributed.
+**Status:** MVP-1.0 + Plot / native-Chromium transport / two-phase z-order correction ownership + geometry-quiescence barrier. Personal prototype. Not distributed.
 
 ---
 
@@ -43,6 +43,7 @@ All shortcuts use the `⌃⌥⌘` (Control-Option-Command) chord.
 | `⌃⌥⌘[` | Cascade All Apps Down-Left |
 | `⌃⌥⌘↑` | Restore Previous Layout |
 | `⌃⌥⌘C` | Toggle Lasso Mode |
+| `⌃⌥⌘P` | Toggle Plot Mode (snap window to drawn area) |
 | `⌃⌥⌘S` | Corral: save current lasso selection as a named group |
 | `⌃⌥⌘R` | Release: open the saved-groups menu |
 
@@ -59,6 +60,8 @@ The same actions are available from the menu-bar icon.
 **Corral (save)** — with a lasso selection active, hit `⌃⌥⌘S`. Type a name and press Return. The selection is saved as a named Corral, including tab lists for any browser windows.
 
 **Corral (release)** — hit `⌃⌥⌘R`. A menu opens listing your saved Corrals. Click one to restore, or click the × next to a corral to delete it. Or use the menu-bar dropdown's "Release ▸" submenu to restore directly without opening the pill.
+
+**Plot (Snap Window to Drawn Area)** — hit `⌃⌥⌘P` to enter Plot Mode (a "Press Esc to End Plot Mode" pill appears near the top). Click any window to select it, then click-and-drag to draw the destination rectangle. On release, the window snaps to that rectangle. Each edge of the Plot Area independently snaps to the display edge when it enters the outer 15% zone. Interior coordinates are preserved exactly as drawn — no grid, no presets. Chromium browsers (Chrome, Brave, Edge, Opera, Vivaldi, Chromium) commit via a reliable AppleScript-bounds path so the drawn size persists where AX size writes typically revert. Plot Mode is mutually exclusive with Lasso; press `Esc` or `⌃⌥⌘P` again to exit.
 
 ## Things to know as a user
 

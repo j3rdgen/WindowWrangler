@@ -68,6 +68,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
     /// for the app's lifetime.
     private lazy var lassoCoordinator = LassoCoordinator(selection: windowSelection)
 
+    /// Owns Plot Mode — the single-window snap-to-drawn-area flow.
+    /// Shares the GlobalEventMonitor tap with Lasso; the two modes
+    /// are arbitrated to be mutually exclusive by the toggle routes
+    /// below. Injected with the same AX trust closure.
+    private lazy var plotCoordinator = PlotCoordinator(
+        eventMonitor: lassoCoordinator.sharedEventMonitor,
+        isTrusted: { [weak self] in self?.isTrusted ?? false }
+    )
+
     /// Owns the cascade + restore flow. Injected with closures that
     /// resolve the current target app and the live AX trust state.
     /// Using closures (rather than direct references) lets the
@@ -115,8 +124,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
         // are wired up BEFORE setupSelectionObserver / permission
         // callbacks wrap them.
         _ = lassoCoordinator
+        _ = plotCoordinator
         _ = cascadeOrchestrator
         _ = corralOrchestrator
+
+        // Plot mode arbitration + menu refresh.
+        // - willActivate: fires when Plot Mode is turning ON. Tear
+        //   down Lasso first if it's active so the modes are truly
+        //   mutually exclusive at the tap layer.
+        // - onPlotModeChanged: rebuild the menu so its "Plot Mode: On/Off"
+        //   state stays in sync.
+        plotCoordinator.willActivate = { [weak self] in
+            guard let self else { return }
+            if self.lassoCoordinator.isLassoModeActive {
+                self.lassoCoordinator.toggleLassoMode()  // turn off
+            }
+        }
+        plotCoordinator.onPlotModeChanged = { [weak self] _ in
+            self?.rebuildMenu()
+        }
+
+        // Escape router — GlobalEventMonitor has a single escape
+        // callback. Lasso already installs one in its wireEvents();
+        // we wrap it so Plot also gets a shot. Whichever mode is
+        // actually active handles the press (each is a no-op when
+        // not active).
+        let existingEscape = lassoCoordinator.sharedEventMonitor.onEscapePressed
+        lassoCoordinator.sharedEventMonitor.onEscapePressed = { [weak self] in
+            self?.plotCoordinator.handleEscape()
+            existingEscape?()
+        }
 
         // Menu must rebuild whenever the snapshot becomes available
         // or is consumed (cascade creates, restore consumes), so the
@@ -147,9 +184,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
         lassoCoordinator.onResizeCompleted = { [weak self] windows, intendedSize in
             guard let self, let first = windows.first,
                   let screen = CoordinateSpace.screen(containing: first.frame) else { return }
+            // Infer cascade direction from the anchor's current x
+            // position relative to the other selected windows, NOT
+            // from lastCascadeDirection. A stale last-direction can
+            // flip the fan (e.g. user cascaded DR then DL then
+            // resized — resize would inherit DL even though the fan
+            // was already re-arranged). Comparing geometry preserves
+            // whatever visual layout the user is actually looking at.
+            // Fully app-agnostic.
+            let others = windows.dropFirst().map { $0.frame.origin.x }
+            let inferredDirection: CascadeDirection
+            if others.isEmpty {
+                inferredDirection = self.cascadeOrchestrator.lastCascadeDirection
+            } else {
+                let anchorX = first.frame.origin.x
+                let othersAverageX = others.reduce(0, +) / CGFloat(others.count)
+                inferredDirection = anchorX > othersAverageX ? .downRight : .downLeft
+            }
             self.cascadeOrchestrator.performCascadeOnSelection(
                 windows,
-                direction: self.cascadeOrchestrator.lastCascadeDirection,
+                direction: inferredDirection,
                 targetScreen: screen,
                 overrideTargetSize: intendedSize,
                 preserveWindowSizes: true
@@ -267,6 +321,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
             action: { [weak self] in self?.corralRelease() },
             label: "Release (Open Window Group)"
         ))
+
+        // Plot (Snap Window to Drawn Area) — single-window precision
+        // placement. Toggle-on if inactive; toggle-off (same as Escape)
+        // if active. Mutually exclusive with Lasso; PlotCoordinator's
+        // willActivate hook ends Lasso first when needed.
+        shortcuts.register(.init(
+            modifiers: modifiers,
+            keyCode: KeyCode.p,
+            action: { [weak self] in self?.togglePlotFromMenu() },
+            label: "Plot (Snap Window to Drawn Area)"
+        ))
     }
 
     /// Shortcut-triggered cascade. Captures the mouse cursor's location
@@ -282,6 +347,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
     /// runloop tick keeps the timing consistent with the menu path
     /// (harmless ~1ms wait, helps if anything else is in flight).
     private func shortcutCascade(direction: CascadeDirection) {
+        endPlotBeforeConflictingAction()
         let mouseDisplay = CoordinateSpace.screen(containing: NSEvent.mouseLocation)
         runAfterMenuDismiss { [weak self] in
             self?.cascadeOrchestrator.performCascade(
@@ -296,6 +362,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
     /// all-apps method, which cascades every visible app's windows on
     /// the mouse-cursor's display.
     private func shortcutCascadeAllApps(direction: CascadeDirection) {
+        endPlotBeforeConflictingAction()
         let mouseDisplay = CoordinateSpace.screen(containing: NSEvent.mouseLocation)
         runAfterMenuDismiss { [weak self] in
             self?.cascadeOrchestrator.performCascadeAllApps(
@@ -502,6 +569,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
         let state = MenuBuilder.State(
             isTrusted: isTrusted,
             lassoModeActive: lassoCoordinator.isLassoModeActive,
+            plotModeActive: plotCoordinator.isPlotModeActive,
             selectionCount: windowSelection.count,
             hasSnapshot: cascadeOrchestrator.hasSnapshot,
             corrals: corralStore.corrals,
@@ -514,32 +582,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
     // MARK: - WindowWranglerActions
 
     @objc func cascadeDownRight() {
+        endPlotBeforeConflictingAction()
         runAfterMenuDismiss { [weak self] in
             self?.cascadeOrchestrator.performCascade(direction: .downRight)
         }
     }
 
     @objc func cascadeDownLeft() {
+        endPlotBeforeConflictingAction()
         runAfterMenuDismiss { [weak self] in
             self?.cascadeOrchestrator.performCascade(direction: .downLeft)
         }
     }
 
     @objc func cascadeAllAppsDownRight() {
+        endPlotBeforeConflictingAction()
         runAfterMenuDismiss { [weak self] in
             self?.cascadeOrchestrator.performCascadeAllApps(direction: .downRight)
         }
     }
 
     @objc func cascadeAllAppsDownLeft() {
+        endPlotBeforeConflictingAction()
         runAfterMenuDismiss { [weak self] in
             self?.cascadeOrchestrator.performCascadeAllApps(direction: .downLeft)
         }
     }
 
     @objc func restoreLayout() {
+        endPlotBeforeConflictingAction()
         runAfterMenuDismiss { [weak self] in
             self?.cascadeOrchestrator.restoreLayout()
+        }
+    }
+
+    /// Ends Plot Mode before any Fan / Cascade / Restore / Corral
+    /// action fires. Per spec: "Incompatible Window Wrangler commands
+    /// cannot start concurrently." The concrete failure mode this
+    /// prevents: cascade's per-app AX enumeration can block the main
+    /// thread for several seconds, and Plot's CGEventTap has a ~75ms
+    /// callback budget. If Plot's tap is still armed while cascade
+    /// runs, mouse events queue up, macOS times out and disables the
+    /// tap, and the user feels a system-wide freeze until cascade
+    /// finishes. Turning Plot off first releases the tap so mouse
+    /// input flows normally during cascade.
+    private func endPlotBeforeConflictingAction() {
+        if plotCoordinator.isPlotModeActive {
+            plotCoordinator.endPlotMode()
         }
     }
 
@@ -547,7 +636,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
         // Lasso toggle is safe to run synchronously — it doesn't touch
         // AX, doesn't enumerate windows, and the user is comfortable
         // with the click → response feeling immediate.
+        //
+        // Mode arbitration: Lasso and Plot are mutually exclusive. If
+        // Plot is currently active and the user turns on Lasso, end
+        // Plot cleanly first via its own teardown path.
+        if plotCoordinator.isPlotModeActive {
+            plotCoordinator.endPlotMode()
+        }
         lassoCoordinator.toggleLassoMode()
+    }
+
+    @objc func togglePlotFromMenu() {
+        // Toggle Plot Mode. If Lasso is active, PlotCoordinator's
+        // `willActivate` hook (installed in applicationDidFinishLaunching)
+        // tears it down before Plot starts receiving events.
+        plotCoordinator.togglePlotMode()
     }
 
     @objc func clearSelection() {
@@ -563,6 +666,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
     }
 
     @objc func corralSave() {
+        endPlotBeforeConflictingAction()
         // Preflight (permission, empty selection, at-cap) is cheap and
         // safe to run synchronously; the heavier snapshot work fires
         // only after the user submits the name pill, at which point the
@@ -571,6 +675,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
     }
 
     @objc func corralRelease() {
+        endPlotBeforeConflictingAction()
         // Preflight is cheap; the release menu itself renders
         // immediately. The actual restore work only runs after the
         // user picks a corral from the menu.
@@ -580,6 +685,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
     /// Menu bar "Release ▸" submenu callback. The sender is the
     /// NSMenuItem whose `representedObject` carries the corral's UUID.
     @objc func restoreCorralFromMenu(_ sender: Any) {
+        endPlotBeforeConflictingAction()
         guard let item = sender as? NSMenuItem,
               let id = item.representedObject as? UUID else {
             Log.corral.error("restoreCorralFromMenu: sender missing UUID representedObject")
