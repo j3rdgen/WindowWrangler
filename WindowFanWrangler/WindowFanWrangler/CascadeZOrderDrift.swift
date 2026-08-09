@@ -36,7 +36,8 @@ struct ZOrderMismatchRecord: Equatable {
 
     /// Slot indices (into the ordered plan; 0 = anchor/frontmost,
     /// n-1 = deepest) where CGWindowList observed the wrong window.
-    /// Empty set means "order correct at this checkpoint."
+    /// Empty set means "order correct at this checkpoint" OR
+    /// "observation was incomplete" (see `observationIncomplete`).
     let mismatchedSlots: Set<Int>
 
     /// True when observation could not confidently map every planned
@@ -44,6 +45,21 @@ struct ZOrderMismatchRecord: Equatable {
     /// is retained for diagnostics but MUST NOT be used to prove
     /// settled success in the final status.
     let observationIncomplete: Bool
+
+    /// Coverage metric — how many of the planned windows the observer
+    /// managed to confidently map to CGWindowList this checkpoint.
+    /// For complete records equals `plannedCount`; for incomplete
+    /// records is strictly less. Used by `postWalkMadeObservationProgress`
+    /// to decide whether a serialized reconstruction actually improved
+    /// observability. Defaults to 0 for pre-existing test call sites.
+    var matchedCount: Int = 0
+
+    /// Coverage denominator — the total intended windows in the plan
+    /// this checkpoint was evaluating. Redundant when the record is
+    /// complete (`matchedCount == plannedCount`), but the pair is what
+    /// downstream diagnostics log ("matched N/M") and what the progress
+    /// helper compares. Defaults to 0.
+    var plannedCount: Int = 0
 }
 
 // MARK: - Final z-order status
@@ -88,6 +104,16 @@ enum ZOrderFinalStatus: Equatable {
     /// Cancelled by an explicit signal (accessibility loss, orchestrator
     /// teardown, user activation where detected).
     case cancelled
+
+    /// Every serialized reconstruction attempt (up to the walk budget)
+    /// finished, but each post-walk reobservation was itself incomplete
+    /// — we cannot prove settled OR wrong. Distinct from `.unresolved`
+    /// (which means we DID observe wrong order after every attempt) and
+    /// from `.observationIncomplete` (which only means a single
+    /// checkpoint in the observation phase was incomplete). Reserved
+    /// for the terminal outcome of the observation-starvation
+    /// escalation path when verification never becomes possible.
+    case unresolvedObservationIncomplete
 }
 
 // MARK: - Drift-detection policy
@@ -159,6 +185,96 @@ enum CascadeZOrderDrift {
         let usable = history.filter { !$0.observationIncomplete }
         guard !usable.isEmpty else { return false }
         return usable.allSatisfy { $0.mismatchedSlots.isEmpty }
+    }
+
+    /// Progress-aware post-walk decision — did a serialized
+    /// reconstruction actually improve CGWindowList observability?
+    ///
+    /// Called after post-walk #1 reobservation returns incomplete. If
+    /// the answer is "no progress," the caller must skip walk #2 (no
+    /// evidence walk #2 would help; running it would just re-flicker
+    /// against the same structural unobservability). If "progress,"
+    /// walk #2 remains a valid bounded attempt.
+    ///
+    /// Semantics:
+    ///   - Complete post-walk observation is handled separately by the
+    ///     caller (this function assumes `postIncomplete == true`).
+    ///   - For incomplete post-walk: progress means
+    ///     `postMatchedCount > bestPreWalkMatchedCount`. Equal count
+    ///     is explicitly NOT progress — the same number of windows are
+    ///     still unobservable, and the second walk has no basis to
+    ///     believe more will resolve.
+    ///   - `bestPreWalkMatchedCount` is the maximum matched count seen
+    ///     across pre-walk observation checkpoints in this generation.
+    ///     Zero is a legitimate baseline if no observation ever landed.
+    ///
+    /// This is the primary gate that prevents the "retry flicker"
+    /// symptom on structural plateaus (5/6 → 5/6, 7/8 → 7/8).
+    static func postWalkMadeObservationProgress(
+        bestPreWalkMatchedCount: Int,
+        postWalkMatchedCount: Int,
+        postWalkIncomplete: Bool
+    ) -> Bool {
+        guard postWalkIncomplete else {
+            // Complete observation is not this function's decision.
+            // Caller should route via the complete-correct /
+            // complete-wrong branches before consulting this helper.
+            return false
+        }
+        return postWalkMatchedCount > bestPreWalkMatchedCount
+    }
+
+    /// Observation-starvation — repeated inability to VERIFY the
+    /// planned order because CGWindowList observations keep coming
+    /// back incomplete. Complementary to `isPersistentDrift`, which
+    /// requires complete observations to prove the same slots keep
+    /// drifting; this one triggers when we can't get complete
+    /// observations at all.
+    ///
+    /// Semantics (spec §"OBSERVATION-STARVATION DEFINITION" + Part 4
+    /// tests 1–10):
+    ///   1. The latest record MUST be incomplete.
+    ///   2. There MUST be at least two consecutive incomplete records
+    ///      ending with the latest record (i.e., the ending incomplete
+    ///      streak has length ≥ 2).
+    ///   3. NO complete observation may appear inside that ending
+    ///      streak — a complete observation earlier in history is
+    ///      fine (it just doesn't help now).
+    ///
+    /// Rationale:
+    ///   - Isolated single incomplete observation (case: complete →
+    ///     incomplete) does NOT starve — it's one stale CGWindowList
+    ///     read, not a settlement failure.
+    ///   - Two consecutive incomplete observations with no complete
+    ///     one in between mean the observer has been unable to
+    ///     confidently map every planned window across two distinct
+    ///     checkpoints — that's the exact cold-start signature the
+    ///     supplied 3/7 → 3/7 → 3/7 → 5/7 → 5/7 trace produces.
+    ///   - We deliberately do NOT read `mismatchedSlots` from
+    ///     incomplete records — those sets are always empty (line
+    ///     1858 in CascadeOrchestrator.enforceCascadeZOrder) and
+    ///     using them as evidence would violate the "don't trust
+    ///     incomplete mismatch identities" invariant.
+    ///
+    /// Independent from `isPersistentDrift` on purpose — the two
+    /// detectors answer different questions and must both remain
+    /// separately testable + separately callable.
+    static func isObservationStarved(_ history: [ZOrderMismatchRecord]) -> Bool {
+        guard let last = history.last else { return false }
+        guard last.observationIncomplete else { return false }
+
+        // Walk backward from the last record, counting the length of
+        // the ending incomplete streak. Stop on the first complete
+        // record. Streak length must be ≥ 2.
+        var streak = 0
+        for record in history.reversed() {
+            if record.observationIncomplete {
+                streak += 1
+            } else {
+                break
+            }
+        }
+        return streak >= 2
     }
 }
 

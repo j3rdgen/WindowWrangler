@@ -88,6 +88,46 @@ final class CascadeOrchestrator {
     /// cascade mode (single-app, selection, restore).
     private let useDeterministicPlanningSizesForAllAppsCascade = true
 
+    /// Enables the two-phase z-order correction ownership model:
+    /// pass 1 = provisional correction, intermediate stages (+120ms /
+    /// +300ms / +500ms / +1000ms / post-write / native-repair) =
+    /// observation-only, pass 4 = authoritative final settlement
+    /// (deferred until native-repair drains).
+    ///
+    /// Under the pre-fix design, EVERY intermediate stage called
+    /// `enforceCascadeZOrder`, which fires a fallback full walk when
+    /// observation is incomplete. For a cold 5-Chromium cascade with
+    /// a chronically-unobservable window (Grammarly / Notes), that
+    /// produced 5-11 visible AXRaise bursts per cascade (one per
+    /// intermediate site × N Chromium native-repair completions).
+    /// This flag routes intermediate stages through
+    /// `observeCascadeZOrder` + `recordZOrderCheckpoint` instead —
+    /// zero raises, same drift-history evidence for the final
+    /// settlement decision. Warm cascades (complete observation)
+    /// keep exactly their pre-fix behavior: pass 1 fires the
+    /// front-prefix corrector at most, intermediate stages observe
+    /// zero-raises regardless. Set to `false` to restore the exact
+    /// prior "every stage may correct" behavior.
+    private let useSingleOwnerZOrderSettlement = true
+
+    /// Enables observation-starvation escalation in the shared z-order
+    /// settlement pipeline. When true, `runPassFourZOrderCheckpoint`
+    /// evaluates `CascadeZOrderDrift.isObservationStarved(history)`
+    /// after `isPersistentDrift` returns false — if repeated CGWindowList
+    /// observations couldn't map every planned window across ≥2
+    /// consecutive incomplete checkpoints, pass 4 escalates to the
+    /// existing serialized reconstruction with trigger
+    /// `observation-starvation` instead of silently exiting. Also
+    /// enables post-walk-incomplete → late recommit routing and
+    /// idempotent final-status emission for every terminal branch.
+    /// Set to `false` to restore the exact pre-fix behavior —
+    /// starvation goes undetected, pass 4 returns silently when
+    /// persistent-drift is false, and post-walk incomplete
+    /// reobservations do not schedule the late recommit. Applies to
+    /// All-Apps and Selection cascades (they share the same final-
+    /// checkpoint decision layer).
+    private let useObservationStarvationEscalation = true
+
     // MARK: - State
 
     /// Pre-cascade snapshot for Restore Previous Layout. nil until the
@@ -245,6 +285,39 @@ final class CascadeOrchestrator {
     /// independently. Set to `.pending` at cascade start; transitions
     /// to a settled/unresolved state as the pipeline runs.
     private var zOrderFinalStatus: ZOrderFinalStatus = .settledNoCorrection
+
+    /// True once `finalizeZOrderSettlement` has emitted the
+    /// terminal `Stage 3 z-order settlement: FINAL` log line for the
+    /// current generation. Idempotency guard so multiple asynchronous
+    /// terminal branches (pass-4 immediate settle, walk-1 reobservation,
+    /// walk-2 reobservation, budget-exhaustion path) cannot emit two
+    /// competing final-status lines. Reset per cascade generation.
+    private var zOrderFinalStatusEmitted: Bool = false
+
+    /// Pending final z-order settlement request, captured when pass 4
+    /// wants to escalate but geometry / native-repair work is still
+    /// in flight. Non-nil means: "when the last tracked native repair
+    /// for this generation drains, take a FRESH pure observation and
+    /// resume the final settlement decision." Nil means no pending
+    /// request. Reset per generation.
+    ///
+    /// This is the geometry-quiescence barrier. Under the pre-fix
+    /// design, serialized reconstruction could begin while native-
+    /// repair callbacks were still landing, causing walk raises to
+    /// interleave with native-repair fallback walks (visible in
+    /// generation 24 of the reported trace). The barrier ensures
+    /// the authoritative correction observes only the settled
+    /// post-repair state.
+    private var pendingFinalSettlement: (plans: [AppCascadePlan], generation: UInt64, context: String)? = nil
+
+    /// Best (highest) `matchedCount` seen across pre-walk observation
+    /// checkpoints for the current cascade generation. Captured just
+    /// before serialized reconstruction #1 fires, so post-walk
+    /// reobservations can compare their coverage against the
+    /// pre-walk best to decide whether the walk actually made
+    /// observational progress. `nil` means no walk has run yet in
+    /// this generation. Reset per cascade generation.
+    private var zOrderPreWalkBestMatchedCount: Int? = nil
 
     // MARK: - Injected dependencies
 
@@ -507,6 +580,9 @@ final class CascadeOrchestrator {
         zOrderLateRecommitScheduled = false
         zOrderGenerationStart = CFAbsoluteTimeGetCurrent()
         zOrderFinalStatus = .settledNoCorrection
+        zOrderFinalStatusEmitted = false
+        zOrderPreWalkBestMatchedCount = nil
+        pendingFinalSettlement = nil
 
         lastCascadeDirection = direction
         let screen = computeScreenFrame(visibleFrame: targetScreen.visibleFrame)
@@ -698,7 +774,13 @@ final class CascadeOrchestrator {
                     context: label
                 )
             } else {
-                self.enforceCascadeZOrder(
+                // Two-phase correction-owner model: Selection intermediate
+                // checkpoints observe-only, matching the All-Apps shared
+                // policy. Selection's "pass 1" provisional correction
+                // already happened in `performCascadeOnSelection` via
+                // `raiseCascadedWindows` before these delayed checkpoints
+                // were scheduled.
+                self.intermediateZOrderCheckpoint(
                     plans: plans,
                     context: label
                 )
@@ -838,6 +920,9 @@ final class CascadeOrchestrator {
         // any checkpoint records a non-empty mismatch, and finalizes
         // at verify time based on the accumulated history.
         zOrderFinalStatus = .settledNoCorrection
+        zOrderFinalStatusEmitted = false
+        zOrderPreWalkBestMatchedCount = nil
+        pendingFinalSettlement = nil
 
         let screen = computeScreenFrame(visibleFrame: chosenScreen.visibleFrame)
         let targetSize = CGSize(
@@ -1309,7 +1394,7 @@ final class CascadeOrchestrator {
                 guard let self else { return }
                 guard self.cascadeGeneration == myGen else { return }
                 guard self.isTrusted() else { return }
-                self.enforceCascadeZOrder(plans: plans, context: "all-apps +300ms re-raise")
+                self.intermediateZOrderCheckpoint(plans: plans, context: "all-apps +300ms re-raise")
             }
         }
 
@@ -1754,6 +1839,63 @@ final class CascadeOrchestrator {
     /// the visual z-order matches the cascade's intent. Used by the
     /// all-apps path. Thin wrapper — the observation-based repair logic
     /// lives in `raiseWithObservation`.
+    /// Observation-only alternative to `enforceCascadeZOrder`. Runs
+    /// the pure observer, records the checkpoint into the drift
+    /// history (so persistent-drift / observation-starvation
+    /// detectors still see this data), logs the outcome, and returns.
+    /// **Never** issues any AXRaise.
+    ///
+    /// Used by every intermediate settlement stage under the two-
+    /// phase correction-owner model: +300ms re-raise, pass 2 / pass 3
+    /// converged z-recheck, pass 2 / pass 3 post-write, Chromium
+    /// native-repair completion, native-failure → AX fallback. Pass 1
+    /// remains the provisional correction owner and still calls
+    /// `enforceCascadeZOrder`. Pass 4 has its own observe-first
+    /// classifier (`runPassFourZOrderCheckpoint`).
+    ///
+    /// The log line format mirrors `raiseWithObservation`'s
+    /// "observed order already matches intent" and "correcting
+    /// front-prefix" lines so a `log stream` filter picks it up, but
+    /// with `[observe-only]` in the context so it's obvious the stage
+    /// did not mutate.
+    private func observeCascadeZOrderOnly(plans: [AppCascadePlan], context: String) {
+        let observation = observeCascadeZOrder(plans: plans)
+        recordZOrderCheckpoint(
+            context: context,
+            mismatchedSlots: observation.mismatchedSlots,
+            observationIncomplete: observation.observationIncomplete,
+            matchedCount: observation.matchedCount,
+            plannedCount: observation.plannedCount
+        )
+        if observation.isCompleteCorrect {
+            Log.cascade.info(
+                "Stage 3 z-order (\(context, privacy: .public)) [observe-only]: observed order already matches intent — 0 raise(s), \(observation.plannedCount, privacy: .public) window(s) untouched"
+            )
+        } else if observation.observationIncomplete {
+            Log.cascade.info(
+                "Stage 3 z-order (\(context, privacy: .public)) [observe-only]: matched \(observation.matchedCount, privacy: .public)/\(observation.plannedCount, privacy: .public); recorded for final settlement — 0 raise(s)"
+            )
+        } else {
+            Log.cascade.info(
+                "Stage 3 z-order (\(context, privacy: .public)) [observe-only]: complete observation shows \(observation.mismatchedSlots.count, privacy: .public)/\(observation.plannedCount, privacy: .public) slot(s) still wrong; recorded for final settlement — 0 raise(s)"
+            )
+        }
+    }
+
+    /// Dispatcher: observation-only OR observation-plus-correction,
+    /// per the `useSingleOwnerZOrderSettlement` flag. Intermediate
+    /// stages call this instead of `enforceCascadeZOrder` directly.
+    /// When the flag is on (default), all intermediate stages become
+    /// observation-only. When off, behavior reverts to the pre-fix
+    /// enforcement path for rollback / A-B comparison.
+    private func intermediateZOrderCheckpoint(plans: [AppCascadePlan], context: String) {
+        if useSingleOwnerZOrderSettlement {
+            observeCascadeZOrderOnly(plans: plans, context: context)
+        } else {
+            enforceCascadeZOrder(plans: plans, context: context)
+        }
+    }
+
     private func enforceCascadeZOrder(plans: [AppCascadePlan], context: String) {
         // Build front-to-back slot list from the plan. Targets are in
         // Cocoa (bottom-left per-screen); convert to AX (top-left
@@ -1765,6 +1907,122 @@ final class CascadeOrchestrator {
                 }
             }
         raiseWithObservation(slots, context: context)
+    }
+
+    /// Pure, read-only z-order observation. Runs the same
+    /// CGWindowList query + slot-matching logic used by
+    /// `raiseWithObservation`, but performs ZERO AXRaise operations,
+    /// ZERO frame writes, ZERO Apple events. Returns the outcome as
+    /// a value.
+    ///
+    /// Used by:
+    ///   - Post-walk #1 and #2 reobservation (mandatory: must never
+    ///     itself perform a fallback full walk).
+    ///   - Pass-4 observe-first classification (mandatory: must not
+    ///     immediately perform a fallback walk before deciding
+    ///     escalation).
+    ///
+    /// Callers that need active correction (pass 1 / pass 2 / +300 /
+    /// pass 3) continue to use `enforceCascadeZOrder` /
+    /// `raiseWithObservation` which observes AND corrects in one call.
+    ///
+    /// Not called from tests directly (it needs live CGWindowList),
+    /// but the shape of the returned data mirrors the pure test
+    /// scenarios in `postWalkMadeObservationProgress`.
+    private struct ZOrderObservation {
+        /// True when at least one planned window could not be mapped
+        /// to a CGWindowList entry within tolerance.
+        let observationIncomplete: Bool
+        /// Number of planned windows successfully mapped.
+        let matchedCount: Int
+        /// Total planned windows.
+        let plannedCount: Int
+        /// Slot indices where CGWindowList observed the wrong window.
+        /// Only meaningful when `observationIncomplete == false`.
+        let mismatchedSlots: Set<Int>
+        /// True when observation was complete AND every slot's
+        /// observed depth matched the planned depth. Convenience.
+        var isCompleteCorrect: Bool { !observationIncomplete && mismatchedSlots.isEmpty }
+        /// True when observation was complete AND at least one slot
+        /// was out of order. Convenience.
+        var isCompleteWrong: Bool { !observationIncomplete && !mismatchedSlots.isEmpty }
+    }
+
+    private func observeCascadeZOrder(plans: [AppCascadePlan]) -> ZOrderObservation {
+        // Match `enforceCascadeZOrder`'s slot construction exactly so
+        // pure observation gives the same result as `raiseWithObservation`
+        // would have recorded — no mutation is the only difference.
+        let slots: [(app: NSRunningApplication, axElement: AXUIElement, axOrigin: CGPoint, target: CGRect)] =
+            plans.flatMap { plan in
+                plan.expectedFrames.map {
+                    (plan.app, $0.axElement, CoordinateSpace.axRect(fromCocoa: $0.target).origin, $0.target)
+                }
+            }
+        return observeSlots(slots)
+    }
+
+    /// Slot-list variant of `observeCascadeZOrder`. Factored out so
+    /// `raiseWithObservation` can call the same matching logic and
+    /// avoid drift between "observe" and "observe-plus-correct."
+    private func observeSlots(
+        _ slots: [(app: NSRunningApplication, axElement: AXUIElement, axOrigin: CGPoint, target: CGRect)]
+    ) -> ZOrderObservation {
+        let n = slots.count
+        guard n > 0 else {
+            return ZOrderObservation(
+                observationIncomplete: false,
+                matchedCount: 0,
+                plannedCount: 0,
+                mismatchedSlots: []
+            )
+        }
+        let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+        guard let raw = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] else {
+            return ZOrderObservation(
+                observationIncomplete: true,
+                matchedCount: 0,
+                plannedCount: n,
+                mismatchedSlots: []
+            )
+        }
+        var observedIndices: [Int] = []
+        observedIndices.reserveCapacity(n)
+        var assigned = Set<Int>()
+        for info in raw {
+            guard let pid = info[kCGWindowOwnerPID as String] as? pid_t,
+                  let boundsDict = info[kCGWindowBounds as String] as? NSDictionary
+            else { continue }
+            var bounds = CGRect.zero
+            guard CGRectMakeWithDictionaryRepresentation(boundsDict, &bounds) else { continue }
+            for i in 0..<n where !assigned.contains(i) {
+                let s = slots[i]
+                if s.app.processIdentifier == pid
+                    && abs(s.axOrigin.x - bounds.origin.x) <= 4
+                    && abs(s.axOrigin.y - bounds.origin.y) <= 4 {
+                    observedIndices.append(i)
+                    assigned.insert(i)
+                    break
+                }
+            }
+        }
+        if observedIndices.count != n {
+            return ZOrderObservation(
+                observationIncomplete: true,
+                matchedCount: observedIndices.count,
+                plannedCount: n,
+                mismatchedSlots: []
+            )
+        }
+        var mismatchedSlots: Set<Int> = []
+        for i in 0..<n where observedIndices[i] != i {
+            mismatchedSlots.insert(i)
+        }
+        return ZOrderObservation(
+            observationIncomplete: false,
+            matchedCount: n,
+            plannedCount: n,
+            mismatchedSlots: mismatchedSlots
+        )
     }
 
     /// Shared helper: observation-based minimum-prefix raise, with
@@ -1813,77 +2071,49 @@ final class CascadeOrchestrator {
             }
         }
 
-        // Read current on-screen z-order (front-to-back per Apple docs).
-        let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
-        guard let raw = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] else {
-            fallbackFullWalk("CGWindowListCopyWindowInfo returned nil")
-            return
-        }
+        // Delegate to pure observation so `raiseWithObservation` and
+        // `observeCascadeZOrder` share one matching implementation.
+        let observation = observeSlots(slots)
 
-        // Walk the observed list in z-order, recording the intended
-        // slot index of each entry we recognize. Unrelated windows are
-        // skipped. The `assigned` set prevents a second observed window
-        // with the same (pid, origin) from being credited to a slot
-        // already claimed by an earlier entry.
-        var observedIndices: [Int] = []
-        observedIndices.reserveCapacity(n)
-        var assigned = Set<Int>()
-        for info in raw {
-            guard let pid = info[kCGWindowOwnerPID as String] as? pid_t,
-                  let boundsDict = info[kCGWindowBounds as String] as? NSDictionary
-            else { continue }
-            var bounds = CGRect.zero
-            guard CGRectMakeWithDictionaryRepresentation(boundsDict, &bounds) else { continue }
-            for i in 0..<n where !assigned.contains(i) {
-                let s = slots[i]
-                if s.app.processIdentifier == pid
-                    && abs(s.axOrigin.x - bounds.origin.x) <= 4
-                    && abs(s.axOrigin.y - bounds.origin.y) <= 4 {
-                    observedIndices.append(i)
-                    assigned.insert(i)
-                    break
-                }
-            }
-        }
-
-        // If any planned window wasn't confidently matched (frame write
-        // still in flight, unexpected clamp), fall back rather than
-        // raise a partial prefix based on stale data.
-        guard observedIndices.count == n else {
-            // Record observation-incomplete BEFORE the fallback fires
-            // so the settlement pipeline's history reflects that this
-            // checkpoint's mismatch set is unknown-not-empty.
+        // If observation couldn't confidently map every planned window,
+        // fall back to the tight-loop full walk. Same behavior as
+        // before the extraction — this is the "observe-plus-correct"
+        // path used by pass 1 / pass 2 / +300 / pass 3.
+        guard !observation.observationIncomplete else {
             recordZOrderCheckpoint(
                 context: context,
                 mismatchedSlots: [],
-                observationIncomplete: true
+                observationIncomplete: true,
+                matchedCount: observation.matchedCount,
+                plannedCount: observation.plannedCount
             )
-            fallbackFullWalk("matched \(observedIndices.count)/\(n) planned window(s)")
+            fallbackFullWalk("matched \(observation.matchedCount)/\(n) planned window(s)")
             return
         }
 
-        // Find how far back the front-to-back order is already correct
-        // AND collect every slot index that IS out of order for the
-        // persistent-drift record. `correctTo` still drives the raise
-        // extent (the front-prefix optimization); `mismatchedSlots`
-        // is the identity-based signal the pass-4 escalation reads.
+        // Complete observation. Re-observe the slot indices only for
+        // the front-prefix computation — cheap since we already have
+        // the raw list matching in `observation`. To avoid a second
+        // CGWindowList query, reconstruct `observedIndices` from
+        // `observation.mismatchedSlots` semantics: a slot appears at
+        // its correct position iff it's NOT in `mismatchedSlots`.
+        //
+        // For the front-prefix, we need the deepest wrong slot. If
+        // there are mismatchedSlots, the deepest wrong index is
+        // max(mismatchedSlots); the front-prefix runs 0 ... that.
         var correctTo = 0
-        var mismatchedSlots: Set<Int> = []
-        for i in 0..<n where observedIndices[i] != i {
-            mismatchedSlots.insert(i)
+        if let deepestWrong = observation.mismatchedSlots.max() {
+            correctTo = deepestWrong + 1
         }
-        for i in stride(from: n - 1, through: 0, by: -1) {
-            if observedIndices[i] != i {
-                correctTo = i + 1
-                break
-            }
-        }
+        let mismatchedSlots = observation.mismatchedSlots
 
         guard correctTo > 0 else {
             recordZOrderCheckpoint(
                 context: context,
                 mismatchedSlots: [],
-                observationIncomplete: false
+                observationIncomplete: false,
+                matchedCount: n,
+                plannedCount: n
             )
             Log.cascade.info(
                 "Stage 3 z-order (\(context, privacy: .public)): observed order already matches intent — 0 raise(s), \(n, privacy: .public) window(s) untouched"
@@ -1894,7 +2124,9 @@ final class CascadeOrchestrator {
         recordZOrderCheckpoint(
             context: context,
             mismatchedSlots: mismatchedSlots,
-            observationIncomplete: false
+            observationIncomplete: false,
+            matchedCount: n,
+            plannedCount: n
         )
 
         // Raise slots[0..correctTo-1] back-to-front. Windows deeper
@@ -2002,12 +2234,16 @@ final class CascadeOrchestrator {
     private func recordZOrderCheckpoint(
         context: String,
         mismatchedSlots: Set<Int>,
-        observationIncomplete: Bool
+        observationIncomplete: Bool,
+        matchedCount: Int = 0,
+        plannedCount: Int = 0
     ) {
         zOrderMismatchHistory.append(ZOrderMismatchRecord(
             checkpoint: context,
             mismatchedSlots: mismatchedSlots,
-            observationIncomplete: observationIncomplete
+            observationIncomplete: observationIncomplete,
+            matchedCount: matchedCount,
+            plannedCount: plannedCount
         ))
         // Terminal statuses set by the escalation pipeline are never
         // touched here. Only the observation-only transitions below
@@ -2043,38 +2279,325 @@ final class CascadeOrchestrator {
     }
 
     /// Pass-4-specific enforcement. Called from `scheduleAllAppsRetry`
-    /// when `label == "pass 4"`. Unlike the earlier passes' plain
+    /// when `label == "pass 4"` and from `scheduleSelectionZOrderCheckpoint`
+    /// when `isFinalPass: true`. Unlike the earlier passes' plain
     /// `enforceCascadeZOrder` call, this variant:
     ///   1. Runs the normal observation-based enforcement (which
     ///      records a checkpoint via `raiseWithObservation`).
-    ///   2. If the fresh history matches the persistent-drift
-    ///      pattern per `CascadeZOrderDrift.isPersistentDrift`,
-    ///      immediately escalates to a serialized full
-    ///      reconstruction rather than trusting the front-prefix
-    ///      correction to be durable.
+    ///   2. If the fresh history matches the persistent-drift pattern
+    ///      per `CascadeZOrderDrift.isPersistentDrift`, immediately
+    ///      escalates to a serialized full reconstruction rather than
+    ///      trusting the front-prefix correction to be durable.
+    ///   3. ELSE, if starvation escalation is enabled AND the fresh
+    ///      history matches the observation-starvation pattern per
+    ///      `CascadeZOrderDrift.isObservationStarved` (two consecutive
+    ///      incomplete records ending at the latest checkpoint),
+    ///      escalates to the SAME serialized reconstruction with a
+    ///      different trigger label. This is the fix for the cold-
+    ///      start silent-exit path — under the pre-fix design, both
+    ///      detectors returned false when observations were repeatedly
+    ///      incomplete and pass 4 exited without escalation, log line,
+    ///      or final-status assignment.
+    ///   4. ELSE, if pass 4 did not settle and did not escalate, emit
+    ///      an explicit final status so the trace never ends
+    ///      mid-pipeline.
     ///
     /// The serialized reconstruction is asynchronous and generation-
     /// guarded; overlap-safe via `zOrderSerializedWalkInFlight`.
+    ///
+    /// Selection Cascade shares this exact function — the decision
+    /// order and escalation targets are identical for both callers.
+    /// The only difference is the label prefix.
+    /// Pass-4 wrapper: applies the geometry-quiescence barrier before
+    /// running the settlement decision. If native repairs are still
+    /// in flight for the current generation, defer the settlement
+    /// until they drain — `resumePendingFinalSettlementIfQuiescent`
+    /// (called from every native-repair completion) will fire the
+    /// core once the count reaches zero.
+    ///
+    /// When quiescent OR the barrier is disabled, delegates
+    /// immediately to `runPassFourZOrderCheckpointCore`.
+    ///
+    /// Pre-fix behavior: pass 4 could start serialized reconstruction
+    /// while Chromium native-repair callbacks were still landing,
+    /// which caused the reconstruction's async raise sequence to
+    /// interleave with fallback full walks from the callbacks. Under
+    /// the two-phase model those callbacks are already observation-
+    /// only, but the barrier additionally guarantees that final
+    /// serialized reconstruction observes only post-repair state —
+    /// no risk of a mid-walk repair completion disturbing the stack
+    /// the walk just reconstructed.
     private func runPassFourZOrderCheckpoint(
         plans: [AppCascadePlan],
         generation: UInt64,
         context: String
     ) {
-        enforceCascadeZOrder(plans: plans, context: context)
-
-        // Guard: don't escalate if generation advanced while we were
-        // enforcing (Restore Previous Layout, subsequent cascade).
         guard cascadeGeneration == generation else { return }
         guard isTrusted() else { return }
         guard useExplicitCascadeZOrder else { return }
 
+        // Barrier: defer if geometry / native-repair work is still in
+        // flight. When the last repair drains, its completion callback
+        // invokes `resumePendingFinalSettlementIfQuiescent` which
+        // takes a fresh pure observation and runs the core.
+        if useSingleOwnerZOrderSettlement {
+            let repairsInFlight = nativeRepairCountForCurrentGeneration()
+            if repairsInFlight > 0 {
+                Log.cascade.notice(
+                    "Stage 3 z-order settlement: pass 4 arrived with geometry not yet quiescent — repairsInFlight=\(repairsInFlight, privacy: .public); deferring final settlement until drain (context='\(context, privacy: .public)')"
+                )
+                pendingFinalSettlement = (plans: plans, generation: generation, context: context)
+                return
+            }
+        }
+
+        runPassFourZOrderCheckpointCore(
+            plans: plans,
+            generation: generation,
+            context: context
+        )
+    }
+
+    /// Pass-4 core: observe-first classify + exactly one correction
+    /// path. Callable directly by `runPassFourZOrderCheckpoint` when
+    /// no barrier defer is needed AND by
+    /// `resumePendingFinalSettlementIfQuiescent` after the barrier
+    /// drains. Takes its own fresh observation regardless of which
+    /// caller — pre-drain observations must not be reused, as
+    /// geometry may have changed between the deferral and the resume.
+    private func runPassFourZOrderCheckpointCore(
+        plans: [AppCascadePlan],
+        generation: UInt64,
+        context: String
+    ) {
+        guard cascadeGeneration == generation else { return }
+        guard isTrusted() else { return }
+        guard useExplicitCascadeZOrder else { return }
+
+        let observation = observeCascadeZOrder(plans: plans)
+        recordZOrderCheckpoint(
+            context: context,
+            mismatchedSlots: observation.mismatchedSlots,
+            observationIncomplete: observation.observationIncomplete,
+            matchedCount: observation.matchedCount,
+            plannedCount: observation.plannedCount
+        )
+
+        // Diagnostic log to mirror pre-fix visibility. This is the
+        // "what pass 4 saw" line — corrective actions still log their
+        // own lines below when they fire.
+        if observation.isCompleteCorrect {
+            Log.cascade.info(
+                "Stage 3 z-order (\(context, privacy: .public)) [pure observation]: observed order already matches intent — 0 raise(s), \(observation.plannedCount, privacy: .public) window(s) untouched"
+            )
+        } else if observation.observationIncomplete {
+            Log.cascade.info(
+                "Stage 3 z-order (\(context, privacy: .public)) [pure observation]: matched \(observation.matchedCount, privacy: .public)/\(observation.plannedCount, privacy: .public) planned window(s); no fallback walk fired"
+            )
+        } else {
+            Log.cascade.info(
+                "Stage 3 z-order (\(context, privacy: .public)) [pure observation]: complete observation shows \(observation.mismatchedSlots.count, privacy: .public)/\(observation.plannedCount, privacy: .public) slot(s) still wrong"
+            )
+        }
+
+        // Decision order:
+        //   1. Complete + correct → settle now.
+        //   2. Complete + persistent drift → serialized reconstruction.
+        //   3. Observation starvation → serialized reconstruction.
+        //   4. Complete + isolated wrong → one ordinary correction via
+        //      enforceCascadeZOrder (its optimizer will front-prefix).
+        //   5. Single trailing incomplete (not starvation) → truthful
+        //      finalize; no blind fallback walk.
+        //
+        // Exactly one correction path fires per pass 4 invocation.
+
+        // 1. Complete + correct.
+        if observation.isCompleteCorrect {
+            finalizeIfTerminal(
+                generation: generation,
+                reason: "pass 4 complete + correct observation"
+            )
+            return
+        }
+
+        // 2. Persistent drift.
         if CascadeZOrderDrift.isPersistentDrift(zOrderMismatchHistory) {
             escalateToSerializedReconstruction(
                 plans: plans,
                 generation: generation,
                 trigger: "\(context) → persistent-drift escalation"
             )
+            return
         }
+
+        // 3. Observation starvation.
+        let planWindowCount = plans.reduce(0) { $0 + $1.expectedFrames.count }
+        let starvationEligible = planWindowCount > 1
+        if useObservationStarvationEscalation
+            && starvationEligible
+            && CascadeZOrderDrift.isObservationStarved(zOrderMismatchHistory) {
+            let streak = countTrailingIncomplete(zOrderMismatchHistory)
+            Log.cascade.notice(
+                "Stage 3 z-order settlement: pass 4 observation starvation detected — \(streak, privacy: .public) consecutive incomplete checkpoint(s), latest='\(context, privacy: .public)', planned=\(planWindowCount, privacy: .public); routing to serialized reconstruction (no immediate fallback walk fired first)"
+            )
+            escalateToSerializedReconstruction(
+                plans: plans,
+                generation: generation,
+                trigger: "\(context) → observation-starvation escalation"
+            )
+            return
+        }
+
+        // 4. Complete + isolated wrong. Ordinary correction path (its
+        // front-prefix optimizer only touches slots that need moving).
+        if observation.isCompleteWrong {
+            enforceCascadeZOrder(plans: plans, context: "\(context) (ordinary correction)")
+            finalizeIfTerminal(
+                generation: generation,
+                reason: "pass 4 complete + isolated wrong order, ordinary correction applied"
+            )
+            return
+        }
+
+        // 5. Single trailing incomplete but not starvation. Do NOT
+        // fire a fallback walk solely because pass 4's own observation
+        // was incomplete; the earlier checkpoints already ran their
+        // corrections. Finalize truthfully from the observation-derived
+        // status. Preserves the spec's "truthfulness > cosmetic
+        // optimism" requirement.
+        finalizeIfTerminal(
+            generation: generation,
+            reason: "pass 4 incomplete but not starvation (single trailing incomplete)"
+        )
+    }
+
+    /// Number of native-repair operations currently in flight for the
+    /// current cascade generation. Zero means geometry has quiesced
+    /// for z-order purposes: no async AppleScript `set bounds` write
+    /// is going to complete and disturb the stack. Non-zero means we
+    /// should defer any authoritative correction until the last
+    /// repair drains.
+    private func nativeRepairCountForCurrentGeneration() -> Int {
+        return nativeRepairInFlight.filter { $0.generation == cascadeGeneration }.count
+    }
+
+    /// Called from every native-repair callback (success + failure
+    /// paths). If a final settlement request is pending AND no more
+    /// tracked repairs remain for this generation, take a FRESH pure
+    /// observation and resume the settlement decision. Otherwise
+    /// no-op — either no settlement is pending, or more repairs are
+    /// still landing.
+    private func resumePendingFinalSettlementIfQuiescent(generation: UInt64) {
+        guard let pending = pendingFinalSettlement else { return }
+        guard pending.generation == generation else { return }
+        guard cascadeGeneration == generation else { return }
+        guard isTrusted() else { return }
+        guard nativeRepairCountForCurrentGeneration() == 0 else { return }
+
+        // Consume the pending request atomically before running
+        // settlement so a re-entrant native-repair completion during
+        // the fresh observation can't double-fire.
+        pendingFinalSettlement = nil
+        Log.cascade.notice(
+            "Stage 3 z-order settlement: geometry quiescent (0 native repairs in flight for gen \(generation, privacy: .public)) — running fresh final observation + settlement decision (context='\(pending.context, privacy: .public)')"
+        )
+        runPassFourZOrderCheckpointCore(
+            plans: pending.plans,
+            generation: generation,
+            context: "\(pending.context) (quiescent resume)"
+        )
+    }
+
+    /// Length of the ending incomplete streak in `history`. Diagnostic
+    /// only — matches the decision `isObservationStarved` uses
+    /// internally but exposed so the log line can report the streak
+    /// length that triggered escalation.
+    private func countTrailingIncomplete(_ history: [ZOrderMismatchRecord]) -> Int {
+        var streak = 0
+        for record in history.reversed() {
+            if record.observationIncomplete {
+                streak += 1
+            } else {
+                break
+            }
+        }
+        return streak
+    }
+
+    /// Idempotent finalization: emits ONE terminal `Stage 3 z-order
+    /// settlement: FINAL` log line for the current generation and
+    /// records that it emitted. Later terminal branches see
+    /// `zOrderFinalStatusEmitted == true` and no-op — the first
+    /// terminal outcome wins.
+    ///
+    /// Callers pass:
+    ///   - `status`: the finalized `ZOrderFinalStatus` to record.
+    ///     Only assigned if not already emitted this generation.
+    ///   - `generation`: the generation the caller was scheduled for.
+    ///     If it doesn't match `cascadeGeneration`, this is a stale
+    ///     callback and the finalization is silently dropped.
+    ///   - `reason`: short human label for the log line
+    ///     (e.g. "pass 4 complete", "walk #1 SETTLED", "budget
+    ///     exhausted"). Included verbatim in the FINAL log.
+    ///
+    /// Never called for generations we've already retired or that a
+    /// newer cascade has superseded — the `cascadeGeneration` guard
+    /// handles both cases.
+    private func finalizeZOrderSettlement(
+        status: ZOrderFinalStatus,
+        generation: UInt64,
+        reason: String
+    ) {
+        guard cascadeGeneration == generation else {
+            // Stale callback from a superseded cascade. Do not touch
+            // the current generation's status or emit a log line —
+            // finalizeIfTerminal on the new cascade owns finalization.
+            return
+        }
+        guard !zOrderFinalStatusEmitted else {
+            // Another terminal branch already emitted for this
+            // generation. Do not overwrite; do not log twice.
+            return
+        }
+        zOrderFinalStatus = status
+        zOrderFinalStatusEmitted = true
+        Log.cascade.notice(
+            "Stage 3 z-order settlement: FINAL — status=\(String(describing: status), privacy: .public), reason='\(reason, privacy: .public)', generation=\(generation, privacy: .public)"
+        )
+    }
+
+    /// Finalize IF this checkpoint is a terminal branch — i.e., no
+    /// serialized walk is currently in flight and no late recommit is
+    /// scheduled to fire. If either is pending, leave finalization to
+    /// that continuation's completion path (which owns the ownership
+    /// invariant).
+    ///
+    /// Reads `zOrderFinalStatus` — set by observation-only transitions
+    /// in `recordZOrderCheckpoint` — to decide the finalized value.
+    /// The default (`.settledNoCorrection`) means "every observation
+    /// showed correct order and no correction was ever needed."
+    ///
+    /// Used at the end of `runPassFourZOrderCheckpoint` after
+    /// persistent-drift and observation-starvation escalation checks
+    /// have both been evaluated and rejected.
+    private func finalizeIfTerminal(
+        generation: UInt64,
+        reason: String
+    ) {
+        guard cascadeGeneration == generation else { return }
+        // A walk in flight OR a late recommit scheduled means an
+        // async continuation is going to reach a terminal state and
+        // finalize itself. Do not finalize here — the walk's
+        // reobservation completion will call this function too, and
+        // the idempotency guard will let whichever gets there first
+        // record the status.
+        guard !zOrderSerializedWalkInFlight else { return }
+        guard !zOrderLateRecommitScheduled else { return }
+        finalizeZOrderSettlement(
+            status: zOrderFinalStatus,
+            generation: generation,
+            reason: reason
+        )
     }
 
     /// Escalation entry point: schedules one serialized full
@@ -2101,10 +2624,11 @@ final class CascadeOrchestrator {
             return
         }
         guard zOrderSerializedWalkCount < CascadeZOrderSettlementTiming.maxSerializedWalksPerGeneration else {
-            Log.cascade.notice(
-                "Stage 3 z-order settlement: budget exhausted (\(self.zOrderSerializedWalkCount, privacy: .public)/\(CascadeZOrderSettlementTiming.maxSerializedWalksPerGeneration, privacy: .public) walks) — leaving z-order UNRESOLVED"
+            finalizeZOrderSettlement(
+                status: .unresolved,
+                generation: generation,
+                reason: "serialized reconstruction budget exhausted (\(self.zOrderSerializedWalkCount)/\(CascadeZOrderSettlementTiming.maxSerializedWalksPerGeneration))"
             )
-            zOrderFinalStatus = .unresolved
             return
         }
 
@@ -2122,6 +2646,23 @@ final class CascadeOrchestrator {
         zOrderSerializedWalkInFlight = true
         zOrderSerializedWalkCount += 1
         let walkNumber = zOrderSerializedWalkCount
+
+        // Capture pre-walk-best observation coverage exactly once per
+        // generation (before walk #1 fires). Post-walk reobservation
+        // compares against this baseline via
+        // `CascadeZOrderDrift.postWalkMadeObservationProgress` to
+        // decide whether walk #2 has any evidence it might improve
+        // the observation.
+        if zOrderPreWalkBestMatchedCount == nil {
+            let bestMatched = zOrderMismatchHistory
+                .map(\.matchedCount)
+                .max() ?? 0
+            zOrderPreWalkBestMatchedCount = bestMatched
+            Log.cascade.info(
+                "Stage 3 z-order settlement: pre-walk best observation coverage = \(bestMatched, privacy: .public)/\(slots.count, privacy: .public) (captured before walk #\(walkNumber, privacy: .public))"
+            )
+        }
+
         let walkContext = "serialized reconstruction #\(walkNumber) (trigger: \(trigger))"
 
         Log.cascade.notice(
@@ -2155,16 +2696,26 @@ final class CascadeOrchestrator {
         walkNumber: Int
     ) {
         // Cancellation: generation advanced OR trust lost mid-walk.
-        guard cascadeGeneration == generation, isTrusted() else {
+        if cascadeGeneration != generation {
             Log.cascade.info(
-                "Stage 3 z-order settlement: serialized walk #\(walkNumber, privacy: .public) cancelled mid-sequence (generation advanced or trust lost)"
+                "Stage 3 z-order settlement: serialized walk #\(walkNumber, privacy: .public) cancelled mid-sequence (generation advanced)"
             )
             zOrderSerializedWalkInFlight = false
-            if cascadeGeneration != generation {
-                zOrderFinalStatus = .staleGeneration
-            } else {
-                zOrderFinalStatus = .cancelled
-            }
+            // Do NOT finalize the newer generation's status; our own
+            // generation is superseded and gets no final log line
+            // beyond the "cancelled mid-sequence" info line above.
+            return
+        }
+        if !isTrusted() {
+            Log.cascade.info(
+                "Stage 3 z-order settlement: serialized walk #\(walkNumber, privacy: .public) cancelled mid-sequence (AX trust lost)"
+            )
+            zOrderSerializedWalkInFlight = false
+            finalizeZOrderSettlement(
+                status: .cancelled,
+                generation: generation,
+                reason: "AX trust lost during serialized walk #\(walkNumber)"
+            )
             return
         }
 
@@ -2210,9 +2761,30 @@ final class CascadeOrchestrator {
     }
 
     /// Wait `settledReobservationDelay` then re-run the observation
-    /// checkpoint. If order is now correct, mark the walk as settled.
-    /// If drift persists AND walk budget allows AND we haven't yet
-    /// scheduled the late recommit, schedule it.
+    /// checkpoint. Three post-walk outcomes:
+    ///
+    ///   1. Complete + correct → mark settled (serializedReconstruction
+    ///      for walk 1, lateRecommit for walk 2) and finalize.
+    ///   2. Complete + wrong (`lastObservedWrong` on the fresh record) →
+    ///      schedule the existing late recommit if budget remains, or
+    ///      finalize as `.unresolved` if not.
+    ///   3. Incomplete (`observationIncomplete` on the fresh record) →
+    ///      cannot prove settled OR wrong. Schedule the existing late
+    ///      recommit if budget remains — the second walk gives
+    ///      CGWindowList another chance to catch up. If no budget
+    ///      remains (after walk 2), finalize as
+    ///      `.unresolvedObservationIncomplete` — distinct from
+    ///      `.unresolved` (which means we DID observe wrong order)
+    ///      because we cannot honestly claim we verified anything.
+    ///
+    /// The post-walk incomplete case is the second half of the
+    /// observation-starvation fix — under the pre-fix design, an
+    /// incomplete reobservation was silently swallowed by
+    /// `lastObservedWrong` returning false (it filters out incomplete
+    /// records), causing the walk to be reported as SETTLED when it
+    /// hadn't been verified. That's now impossible; the incomplete
+    /// case always routes to either late recommit or a truthful
+    /// unresolved-incomplete finalization.
     private func scheduleSettledReobservation(
         plans: [AppCascadePlan],
         generation: UInt64,
@@ -2220,46 +2792,173 @@ final class CascadeOrchestrator {
     ) {
         DispatchQueue.main.asyncAfter(deadline: .now() + CascadeZOrderSettlementTiming.settledReobservationDelay) { [weak self] in
             guard let self else { return }
-            guard self.cascadeGeneration == generation, self.isTrusted() else {
+            guard self.cascadeGeneration == generation else {
+                // Stale — a newer cascade / restore superseded us.
+                // Clear in-flight so the newer generation isn't
+                // blocked by our leftover mutex; do NOT finalize the
+                // newer generation's status here.
                 self.zOrderSerializedWalkInFlight = false
-                if self.cascadeGeneration != generation {
-                    self.zOrderFinalStatus = .staleGeneration
-                }
                 return
             }
-
-            // Run one observation-only pass by piggy-backing on
-            // enforceCascadeZOrder. If order is correct, this is a
-            // 0-raise call and the checkpoint records mismatchedSlots
-            // = []. If wrong, correcting-front-prefix fires again
-            // (cheap on this scale) and records the new mismatch.
-            let reobsContext = "post-walk #\(walkNumber) reobservation"
-            self.enforceCascadeZOrder(plans: plans, context: reobsContext)
-            self.zOrderSerializedWalkInFlight = false
-
-            let stillWrong = CascadeZOrderDrift.lastObservedWrong(self.zOrderMismatchHistory)
-            if !stillWrong {
-                // Walk succeeded; promote status per which walk it was.
-                if walkNumber == 1 {
-                    self.zOrderFinalStatus = .settledSerializedReconstruction
-                } else {
-                    self.zOrderFinalStatus = .settledLateRecommit
-                }
-                Log.cascade.notice(
-                    "Stage 3 z-order settlement: walk #\(walkNumber, privacy: .public) SETTLED — final z-order status = \(String(describing: self.zOrderFinalStatus), privacy: .public)"
+            guard self.isTrusted() else {
+                self.zOrderSerializedWalkInFlight = false
+                self.finalizeZOrderSettlement(
+                    status: .cancelled,
+                    generation: generation,
+                    reason: "AX trust lost during post-walk reobservation"
                 )
                 return
             }
 
-            // Still wrong. Consider late recommit.
+            // PURE observation — must NOT call enforceCascadeZOrder
+            // here. The pre-fix code called enforce, which fallback-
+            // walked on incomplete observation, producing the "post-
+            // walk reobservation … full walk" visible flicker even
+            // though this stage is supposed to only verify. The fix
+            // uses observeCascadeZOrder, which never raises.
+            let reobsContext = "post-walk #\(walkNumber) reobservation"
+            let observation = self.observeCascadeZOrder(plans: plans)
+            self.recordZOrderCheckpoint(
+                context: reobsContext,
+                mismatchedSlots: observation.mismatchedSlots,
+                observationIncomplete: observation.observationIncomplete,
+                matchedCount: observation.matchedCount,
+                plannedCount: observation.plannedCount
+            )
+            self.zOrderSerializedWalkInFlight = false
+
+            // Diagnostic log so users can see what post-walk saw. This
+            // does NOT trigger any raise regardless of outcome.
+            if observation.isCompleteCorrect {
+                Log.cascade.info(
+                    "Stage 3 z-order (\(reobsContext, privacy: .public)) [pure observation]: observed order already matches intent — 0 raise(s), \(observation.plannedCount, privacy: .public) window(s) untouched"
+                )
+            } else if observation.observationIncomplete {
+                Log.cascade.info(
+                    "Stage 3 z-order (\(reobsContext, privacy: .public)) [pure observation]: matched \(observation.matchedCount, privacy: .public)/\(observation.plannedCount, privacy: .public) planned window(s); no fallback walk fired"
+                )
+            } else {
+                Log.cascade.info(
+                    "Stage 3 z-order (\(reobsContext, privacy: .public)) [pure observation]: complete observation shows \(observation.mismatchedSlots.count, privacy: .public)/\(observation.plannedCount, privacy: .public) slot(s) still wrong"
+                )
+            }
+
+            if observation.isCompleteCorrect {
+                // Case 1: complete + correct. Walk succeeded.
+                let settledStatus: ZOrderFinalStatus = (walkNumber == 1)
+                    ? .settledSerializedReconstruction
+                    : .settledLateRecommit
+                self.finalizeZOrderSettlement(
+                    status: settledStatus,
+                    generation: generation,
+                    reason: "walk #\(walkNumber) reobservation complete and correct"
+                )
+                return
+            }
+
+            if observation.observationIncomplete {
+                // Case 3: observation unavailable. Do NOT mark settled.
+                // Progress-aware gating — skip walk #2 when the plateau
+                // hasn't improved.
+                Log.cascade.notice(
+                    "Stage 3 z-order settlement: post-walk #\(walkNumber, privacy: .public) reobservation INCOMPLETE (matched \(observation.matchedCount, privacy: .public)/\(observation.plannedCount, privacy: .public)) — checking observation progress before late recommit"
+                )
+                self.handlePostWalkIncomplete(
+                    plans: plans,
+                    generation: generation,
+                    walkNumber: walkNumber,
+                    postWalkMatchedCount: observation.matchedCount
+                )
+                return
+            }
+
+            // Case 2: complete + wrong. Consider late recommit —
+            // observation succeeded and DID prove wrong order.
             self.scheduleLateRecommitIfNeeded(plans: plans, generation: generation)
         }
+    }
+
+    /// Post-walk incomplete branch: the walk finished but we can't
+    /// prove settled OR wrong. Progress-gated:
+    ///
+    ///   - If the post-walk observation coverage strictly improved
+    ///     over `zOrderPreWalkBestMatchedCount` (e.g. 5/8 → 7/8),
+    ///     walk #2 remains justified — CGWindowList is catching up
+    ///     and the second walk may complete verification. Route to
+    ///     late recommit if budget remains.
+    ///
+    ///   - If coverage did NOT improve (e.g. 5/6 → 5/6, 7/8 → 7/8),
+    ///     walk #2 has no evidence it would help. The plateau is
+    ///     structural: at least one planned window is unobservable
+    ///     to CGWindowList regardless of raise activity. Finalize
+    ///     truthfully as `.unresolvedObservationIncomplete` and skip
+    ///     the second walk — this is the primary retry-flicker fix.
+    ///
+    ///   - If walk budget is exhausted (this WAS walk #2, or walk #1
+    ///     with the late recommit already scheduled), finalize
+    ///     regardless.
+    ///
+    /// The progress decision is delegated to the pure helper
+    /// `CascadeZOrderDrift.postWalkMadeObservationProgress` so it's
+    /// separately testable and the caller doesn't inline the rule.
+    private func handlePostWalkIncomplete(
+        plans: [AppCascadePlan],
+        generation: UInt64,
+        walkNumber: Int,
+        postWalkMatchedCount: Int
+    ) {
+        guard cascadeGeneration == generation, isTrusted() else { return }
+
+        // No budget remains → finalize truthfully.
+        if zOrderSerializedWalkCount >= CascadeZOrderSettlementTiming.maxSerializedWalksPerGeneration
+            || zOrderLateRecommitScheduled {
+            finalizeZOrderSettlement(
+                status: .unresolvedObservationIncomplete,
+                generation: generation,
+                reason: "walk #\(walkNumber) reobservation incomplete and walk budget exhausted"
+            )
+            return
+        }
+
+        // Budget remains — but do we have any evidence walk #2 would
+        // help? Progress gating decides.
+        let bestPre = zOrderPreWalkBestMatchedCount ?? 0
+        let progress = CascadeZOrderDrift.postWalkMadeObservationProgress(
+            bestPreWalkMatchedCount: bestPre,
+            postWalkMatchedCount: postWalkMatchedCount,
+            postWalkIncomplete: true
+        )
+        if !progress {
+            // No progress → structural plateau. Skip walk #2.
+            Log.cascade.notice(
+                "Stage 3 z-order settlement: walk #\(walkNumber, privacy: .public) reobservation incomplete with no observation progress; best pre-walk=\(bestPre, privacy: .public), post-walk=\(postWalkMatchedCount, privacy: .public); skipping redundant late recommit"
+            )
+            finalizeZOrderSettlement(
+                status: .unresolvedObservationIncomplete,
+                generation: generation,
+                reason: "walk #\(walkNumber) reobservation incomplete with no observation progress (pre-walk-best=\(bestPre), post-walk=\(postWalkMatchedCount)); walk #2 suppressed"
+            )
+            return
+        }
+
+        // Coverage improved → walk #2 remains justified.
+        Log.cascade.notice(
+            "Stage 3 z-order settlement: walk #\(walkNumber, privacy: .public) reobservation incomplete but observation coverage IMPROVED (best pre-walk=\(bestPre, privacy: .public), post-walk=\(postWalkMatchedCount, privacy: .public)); scheduling late recommit"
+        )
+        scheduleLateRecommitIfNeeded(plans: plans, generation: generation)
     }
 
     /// Schedules one conditional late recommit at approximately
     /// `+lateRecommitEarliestOffset` from cascade start (or ASAP if
     /// we're already past it). Fires at most once per generation.
-    /// No-op if budget exhausted.
+    /// Finalizes with `.unresolved` if budget is exhausted.
+    ///
+    /// Caller should have already decided that a late recommit is
+    /// warranted — either because a walk's reobservation returned
+    /// wrong order OR because a walk's reobservation was incomplete
+    /// (the observation-starvation post-walk path). This function
+    /// does not re-evaluate that decision; it only enforces budget +
+    /// idempotency + timing.
     private func scheduleLateRecommitIfNeeded(
         plans: [AppCascadePlan],
         generation: UInt64
@@ -2267,10 +2966,11 @@ final class CascadeOrchestrator {
         guard cascadeGeneration == generation, isTrusted() else { return }
         guard !zOrderLateRecommitScheduled else { return }
         guard zOrderSerializedWalkCount < CascadeZOrderSettlementTiming.maxSerializedWalksPerGeneration else {
-            Log.cascade.notice(
-                "Stage 3 z-order settlement: reobservation showed persistent drift and walk budget exhausted — final z-order = UNRESOLVED"
+            finalizeZOrderSettlement(
+                status: .unresolved,
+                generation: generation,
+                reason: "reobservation showed persistent drift and walk budget exhausted"
             )
-            zOrderFinalStatus = .unresolved
             return
         }
 
@@ -2281,12 +2981,25 @@ final class CascadeOrchestrator {
         let delay = max(0, earliest - now)
 
         Log.cascade.notice(
-            "Stage 3 z-order settlement: reobservation still shows drift after walk #\(self.zOrderSerializedWalkCount, privacy: .public); scheduling late recommit in \(Int(delay * 1000), privacy: .public)ms (walks used: \(self.zOrderSerializedWalkCount, privacy: .public)/\(CascadeZOrderSettlementTiming.maxSerializedWalksPerGeneration, privacy: .public))"
+            "Stage 3 z-order settlement: scheduling late recommit in \(Int(delay * 1000), privacy: .public)ms (walks used: \(self.zOrderSerializedWalkCount, privacy: .public)/\(CascadeZOrderSettlementTiming.maxSerializedWalksPerGeneration, privacy: .public))"
         )
 
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self else { return }
-            guard self.cascadeGeneration == generation, self.isTrusted() else { return }
+            guard self.cascadeGeneration == generation else {
+                // Generation superseded between scheduling and firing.
+                // Do nothing — the new generation owns its own final
+                // status; ours is superseded.
+                return
+            }
+            guard self.isTrusted() else {
+                self.finalizeZOrderSettlement(
+                    status: .cancelled,
+                    generation: generation,
+                    reason: "AX trust lost before late recommit fired"
+                )
+                return
+            }
             self.escalateToSerializedReconstruction(
                 plans: plans,
                 generation: generation,
@@ -2489,7 +3202,7 @@ final class CascadeOrchestrator {
                             context: "all-apps \(label) (converged z-recheck)"
                         )
                     } else {
-                        self.enforceCascadeZOrder(
+                        self.intermediateZOrderCheckpoint(
                             plans: plans,
                             context: "all-apps \(label) (converged z-recheck)"
                         )
@@ -2552,7 +3265,7 @@ final class CascadeOrchestrator {
                         context: "all-apps \(label) (post-write)"
                     )
                 } else {
-                    self.enforceCascadeZOrder(plans: plans, context: "all-apps \(label) (post-write)")
+                    self.intermediateZOrderCheckpoint(plans: plans, context: "all-apps \(label) (post-write)")
                 }
             }
 
@@ -2672,16 +3385,26 @@ final class CascadeOrchestrator {
                 "All-apps \(label, privacy: .public) native repair ok: bundle=\(bundleID, privacy: .public) in \(elapsedMs, privacy: .public)ms"
             )
             onWindowsMoved?()
-            // AppleScript bounds writes also trigger a raise-on-write
-            // in Chrome — same z-order symptom the AX post-write path
-            // handles by re-enforcing. Match that behavior so a native
-            // repair doesn't leave Chrome ahead of its intended slot.
+            // Two-phase correction-owner model: native-repair
+            // callbacks are OBSERVATION-ONLY. They record what the
+            // repair produced for the settlement pipeline, but do not
+            // themselves issue AXRaise. Pass 4's final settlement
+            // (deferred until native-repair drains) owns the
+            // authoritative correction. Under the pre-fix design,
+            // each of N Chromium repairs fired its own fallback full
+            // walk on incomplete observation, producing 5+ visible
+            // re-stacks per cascade.
+            //
+            // If native-repair drain plus final settlement is pending,
+            // this completion also arms the resume check below via
+            // `resumePendingFinalSettlementIfQuiescent`.
             if useExplicitCascadeZOrder {
-                enforceCascadeZOrder(
+                intermediateZOrderCheckpoint(
                     plans: plans,
                     context: "all-apps \(label) (native repair)"
                 )
             }
+            resumePendingFinalSettlementIfQuiescent(generation: generation)
         case .unsupported, .automationDenied, .permissionUnavailable,
              .browserNotRunning, .noMatch, .ambiguousMatch, .timedOut,
              .targetDisappeared, .scriptError:
@@ -2693,12 +3416,15 @@ final class CascadeOrchestrator {
             // later retry / verify passes will observe the outcome.
             _ = WindowMutator.setFrame(targetCocoa, of: axElement)
             onWindowsMoved?()
+            // Observation-only under the two-phase model (same as
+            // the native-success branch above).
             if useExplicitCascadeZOrder {
-                enforceCascadeZOrder(
+                intermediateZOrderCheckpoint(
                     plans: plans,
                     context: "all-apps \(label) (native failure → AX fallback)"
                 )
             }
+            resumePendingFinalSettlementIfQuiescent(generation: generation)
         }
     }
 
@@ -2818,9 +3544,9 @@ final class CascadeOrchestrator {
     }
 
     /// Whether the given `ZOrderFinalStatus` represents a settled
-    /// outcome. All five settled variants + `.staleGeneration`
-    /// (superseded is a benign non-failure) qualify. Everything else
-    /// is unfinished or explicitly wrong.
+    /// outcome. All settled variants + `.staleGeneration` (superseded
+    /// is a benign non-failure) qualify. Everything else is
+    /// unfinished or explicitly wrong.
     /// `nonisolated` so tests can call it without a main-actor hop.
     static nonisolated func zOrderStatusIsSettled(_ status: ZOrderFinalStatus) -> Bool {
         switch status {
@@ -2832,6 +3558,7 @@ final class CascadeOrchestrator {
             return true
         case .unresolved,
              .observationIncomplete,
+             .unresolvedObservationIncomplete,
              .cancelled:
             return false
         }
