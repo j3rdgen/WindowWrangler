@@ -335,12 +335,65 @@ final class PlotCoordinator {
         // against system junk, our own overlays, and windows too
         // small to be user-interactive. First hit wins.
         let all = CrossAppWindowEnumerator.allVisibleWindows()
-        guard let vw = all.first(where: { $0.frame.contains(point) }) else {
-            return nil
+        if let vw = all.first(where: { $0.frame.contains(point) }) {
+            if let selection = resolveAXSelection(for: vw, at: point) {
+                return selection
+            }
+            // The CGWindow hit resolved but AX matching failed.
+            // Fall through to the AX-only fallback below — the AX
+            // window we need may still be in another app's list.
         }
-        // Resolve AX element via frame match. Same pattern as
-        // LassoCoordinator's cache warm-up: enumerate the owning
-        // app's windows, match by frame ±4pt tolerance.
+
+        // AX-only fallback for the "no CGWindow contains the point"
+        // case. This is exactly the "CGWindow bounds lag AX after a
+        // recent plot" scenario: the user clicks on a window they
+        // just plotted; the visible surface is at the new AX-driven
+        // position, but CGWindowList still reports the pre-plot
+        // frame for several hundred ms. Result under the pre-fix
+        // code: no CGWindow's `frame.contains(point)` returns true,
+        // `all.first(where:)` yields nil, and we emit "No eligible
+        // window under cursor" even though the window IS there.
+        //
+        // Walk unique PIDs from `all` and query each app's fresh AX
+        // windows. Return the first app whose current AX frame
+        // contains the click point. `all` is already front-to-back,
+        // so unique-PID iteration in that order preserves the
+        // topmost-first semantics.
+        //
+        // Scope: only PIDs whose CGWindow is in `all`. That set is
+        // pre-filtered (own PID excluded, subrole allowlist, size
+        // minimum, Desktop backdrop excluded), so we can't
+        // accidentally pick up the Dock or a system UI overlay this
+        // way. Fresh AX enumeration also runs its own subrole
+        // allowlist (see AXWindowEnumerator), so the resolved
+        // window is guaranteed to be a standard user window.
+        var seenPIDs = Set<pid_t>()
+        for vw in all {
+            if !seenPIDs.insert(vw.ownerPID).inserted { continue }
+            guard let app = NSRunningApplication(processIdentifier: vw.ownerPID) else { continue }
+            let axWindows = AXWindowEnumerator.windows(of: app)
+            guard let axWin = axWindows.first(where: { $0.frame.contains(point) }) else { continue }
+            Log.plot.info("AX-only fallback matched '\(app.localizedName ?? "?", privacy: .public)' pid=\(vw.ownerPID, privacy: .public) — CGWindowList frame stale after recent plot")
+            return PlotSelection(
+                windowID: vw.windowID,
+                ownerPID: vw.ownerPID,
+                ownerName: app.localizedName ?? vw.ownerName,
+                bundleID: app.bundleIdentifier,
+                capturedFrame: axWin.frame,
+                axElement: axWin.axElement
+            )
+        }
+        return nil
+    }
+
+    /// AX-resolution helper extracted from the original in-line
+    /// path so the AX-only fallback below can reuse the same
+    /// strict-match-then-contains-point resolution semantics.
+    /// Returns nil if the app is gone or no AX window matches.
+    private func resolveAXSelection(
+        for vw: VisibleWindow,
+        at point: CGPoint
+    ) -> PlotSelection? {
         guard let app = NSRunningApplication(processIdentifier: vw.ownerPID) else {
             return nil
         }
