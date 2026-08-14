@@ -361,14 +361,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
     /// + defer pattern as `shortcutCascade`. Routes to the orchestrator's
     /// all-apps method, which cascades every visible app's windows on
     /// the mouse-cursor's display.
+    ///
+    /// `shortcutReceivedAt` captures the exact monotonic moment the
+    /// shortcut handler recognized the action — that becomes t=0 for
+    /// the per-generation `CascadeLatencyTrace`. Every downstream stage
+    /// (menu-dismiss dispatch hop, Task-@MainActor hop, cascade entry,
+    /// enumeration, planning, first write) is measured against this
+    /// origin so shortcut→firstWrite is exact end-to-end.
     private func shortcutCascadeAllApps(direction: CascadeDirection) {
+        let shortcutReceivedAt = CascadeLatencyTrace.now()
         endPlotBeforeConflictingAction()
         let mouseDisplay = CoordinateSpace.screen(containing: NSEvent.mouseLocation)
         runAfterMenuDismiss { [weak self] in
-            self?.cascadeOrchestrator.performCascadeAllApps(
-                direction: direction,
-                targetScreen: mouseDisplay
-            )
+            Task { @MainActor in
+                await self?.cascadeOrchestrator.performCascadeAllApps(
+                    direction: direction,
+                    targetScreen: mouseDisplay,
+                    shortcutReceivedAt: shortcutReceivedAt
+                )
+            }
         }
     }
 
@@ -598,14 +609,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
     @objc func cascadeAllAppsDownRight() {
         endPlotBeforeConflictingAction()
         runAfterMenuDismiss { [weak self] in
-            self?.cascadeOrchestrator.performCascadeAllApps(direction: .downRight)
+            Task { @MainActor in
+                await self?.cascadeOrchestrator.performCascadeAllApps(direction: .downRight)
+            }
         }
     }
 
     @objc func cascadeAllAppsDownLeft() {
         endPlotBeforeConflictingAction()
         runAfterMenuDismiss { [weak self] in
-            self?.cascadeOrchestrator.performCascadeAllApps(direction: .downLeft)
+            Task { @MainActor in
+                await self?.cascadeOrchestrator.performCascadeAllApps(direction: .downLeft)
+            }
         }
     }
 

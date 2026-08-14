@@ -16,7 +16,11 @@ enum CoordinateSpace {
 
     /// Converts an AX rect (top-left global origin) to a Cocoa rect
     /// (bottom-left global origin).
-    static func cocoaRect(fromAX axRect: CGRect) -> CGRect {
+    /// `nonisolated` so it can be called from the bounded concurrent
+    /// AX enumeration path in `AXWindowEnumerator.windows(of:)` —
+    /// safe because `NSScreen.screens` is documented safe from any
+    /// thread (it returns a cached array).
+    nonisolated static func cocoaRect(fromAX axRect: CGRect) -> CGRect {
         // AX measures from the top of the primary display, growing
         // downward. Cocoa measures from the bottom of the primary
         // display, growing upward. Flip y around the primary display's

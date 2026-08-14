@@ -88,6 +88,117 @@ final class CascadeOrchestrator {
     /// cascade mode (single-app, selection, restore).
     private let useDeterministicPlanningSizesForAllAppsCascade = true
 
+    /// Enables bounded concurrent per-app AX enumeration for All-Apps
+    /// Cascade. When on (default), the pre-pass-1 planning phase
+    /// enumerates windows for all eligible apps in parallel with a
+    /// bounded worker pool of `maxConcurrentAXEnumerations`, cutting
+    /// wall-clock time from sum-of-per-app AX round-trips to bounded
+    /// waves of the slowest apps. Preserves the exact eligible-app
+    /// set, deterministic ordering, and every downstream filter.
+    /// Set to `false` to restore the exact prior serial enumeration
+    /// behavior — useful for A/B performance comparison or rollback.
+    private let useConcurrentAllAppsEnumeration = true
+
+    /// Bounded worker pool size for concurrent AX enumeration. Started
+    /// at 6, raised to 10 after a 71-app cold-cascade profile showed
+    /// enumeration wall-clock at ~1.5 s with 6 workers — the slowest
+    /// per-app AX round-trip (sleepy-proxy retries, helper PIDs) still
+    /// serialized the tail because we ran out of workers before running
+    /// out of apps. Ten is the conservative production value chosen
+    /// per the reaction-time optimization spec's default guidance;
+    /// higher values (12, 16) risk exhausting WindowServer's parallel
+    /// cross-process AX handling without proportionate gains. In DEBUG
+    /// builds, the `WW_CASCADE_AX_MAX_CONCURRENCY` environment variable
+    /// overrides this value at runtime — set it in Xcode's scheme →
+    /// Run → Arguments → Environment Variables to A/B alternate values
+    /// against a specific 60+-app workload. Kept as a named constant so
+    /// the release build has one obvious knob to profile.
+    private let maxConcurrentAXEnumerations = 10
+
+    /// DEBUG-only override for `maxConcurrentAXEnumerations`, sourced
+    /// from the `WW_CASCADE_AX_MAX_CONCURRENCY` environment variable.
+    /// Returns the compile-time default when the env var is absent or
+    /// unparseable. Values ≤ 0 clamp to 1 inside the bounded map, so
+    /// no sanitization is needed here.
+    ///
+    /// In release builds this collapses to the constant — the debug
+    /// override cannot ship accidentally.
+    private var effectiveMaxAXEnumerationConcurrency: Int {
+        #if DEBUG
+        if let raw = ProcessInfo.processInfo.environment["WW_CASCADE_AX_MAX_CONCURRENCY"],
+           let n = Int(raw), n > 0 {
+            return n
+        }
+        #endif
+        return maxConcurrentAXEnumerations
+    }
+
+    /// Enables the accessory-app CG-negative prefilter for All-Apps
+    /// Cascade. When ON, one CG window snapshot is taken at the start
+    /// of planning; any `.accessory`-policy app whose PID has zero
+    /// entries in that snapshot is skipped from AX enumeration. Regular
+    /// apps are ALWAYS AX-enumerated regardless of CG presence
+    /// (preserves the Catalyst / Notes / Podcasts / Grammarly blind-spot
+    /// protection — those apps are all `.regular`). CG snapshot failure
+    /// fails open — every accessory is enumerated.
+    ///
+    /// Reduces AX enumeration count from ~70 to ~30-40 on a typical
+    /// menu-bar-heavy workload by eliminating cross-process AX round-
+    /// trips to helper apps that own zero user windows (BetterTouchTool,
+    /// Rectangle, 1Password Helper, sync clients, hardware monitors,
+    /// etc.).
+    ///
+    /// Set to `false` to restore the exact pre-fix behavior (every
+    /// eligible regular AND accessory app AX-enumerated). If a
+    /// legitimate accessory-app window is ever observed disappearing
+    /// from cascade, the fastest path is to flip this flag off; the
+    /// long-term fix is to add the offending bundle ID to
+    /// `accessoryAppsAlwaysAXEnumerated`.
+    ///
+    /// DEFAULT OFF during reaction-time-regression diagnosis. The
+    /// filter's implementation, tests, and DEBUG audit remain in the
+    /// tree so it can be re-enabled once (a) measurement proves
+    /// enumeration is the dominant remaining pre-write cost AND
+    /// (b) the differential audit confirms zero accessory false
+    /// negatives on the user's real workload. Enabling it before both
+    /// gates would silently change Cascade membership for the wrong
+    /// reason.
+    private let useAccessoryCGNegativePrefilter = false
+
+    /// Compatibility escape hatch for accessory apps that must ALWAYS
+    /// receive AX enumeration regardless of CG snapshot presence.
+    /// Starts empty because no known accessory app in the audit had a
+    /// CG-invisible AX-visible cascade-eligible window. Add a bundle ID
+    /// here iff we ever observe such an app in the wild (loud DEBUG
+    /// audit log will name it).
+    ///
+    /// Do NOT populate speculatively — the whole point of the prefilter
+    /// is skipping zero-window accessory helpers.
+    private let accessoryAppsAlwaysAXEnumerated: Set<String> = []
+
+    /// DEBUG-only differential audit for the accessory prefilter:
+    /// shadow-enumerates every app the prefilter would skip and logs a
+    /// loud warning if any returns a cascade-eligible AX window.
+    /// Diagnostic-only — must NEVER run in the normal Cascade hot path
+    /// because the shadow AX calls contend with the real cascade's
+    /// AX writes on WindowServer.
+    ///
+    /// OFF by default even in DEBUG. Enable explicitly via
+    /// `WW_CASCADE_ENABLE_PREFILTER_AUDIT=1` when validating whether
+    /// Path A can be turned back on. Never enable it while measuring
+    /// reaction time — the audit's parallel AX enumeration will
+    /// materially skew shortcut→firstWrite numbers.
+    ///
+    /// Always false in Release — the audit code path is
+    /// `#if DEBUG`-guarded at the call site.
+    private var isPrefilterAuditEnabled: Bool {
+        #if DEBUG
+        return ProcessInfo.processInfo.environment["WW_CASCADE_ENABLE_PREFILTER_AUDIT"] == "1"
+        #else
+        return false
+        #endif
+    }
+
     /// Enables the two-phase z-order correction ownership model:
     /// pass 1 = provisional correction, intermediate stages (+120ms /
     /// +300ms / +500ms / +1000ms / post-write / native-repair) =
@@ -388,12 +499,6 @@ final class CascadeOrchestrator {
         }
         let targetAppName = targetApp.localizedName ?? "?"
         Log.cascade.info("Resolved target app: '\(targetAppName, privacy: .public)'")
-
-        // Pre-cascade warmup — read once so AX is hot. Result discarded;
-        // the real enumeration on the next line is what we operate on.
-        // After idle periods the AX framework / target app's
-        // accessibility tree can go cold; first read has higher latency.
-        _ = AXWindowEnumerator.windows(of: targetApp)
 
         let allWindows = AXWindowEnumerator.windows(of: targetApp)
 
@@ -788,7 +893,24 @@ final class CascadeOrchestrator {
         }
     }
 
-    func performCascadeAllApps(direction: CascadeDirection, targetScreen: NSScreen? = nil) {
+    func performCascadeAllApps(
+        direction: CascadeDirection,
+        targetScreen: NSScreen? = nil,
+        shortcutReceivedAt: CFAbsoluteTime? = nil
+    ) async {
+        // Origin timestamp for the per-generation latency trace. When
+        // called from a keyboard shortcut, the shortcut handler stamps
+        // this at the moment it recognized the action (captures menu-
+        // dismiss dispatch + Task hop as part of shortcut→entry). When
+        // called from a menu, we stamp entry — the menu-dismiss delay
+        // is user-perceived pre-menu and not our latency to fix.
+        let trace = CascadeLatencyTrace(
+            generation: cascadeGeneration &+ 1,  // matches the &+= below
+            direction: String(describing: direction),
+            shortcutReceived: shortcutReceivedAt ?? CascadeLatencyTrace.now()
+        )
+        trace.cascadeEntered = CascadeLatencyTrace.now()
+
         guard isTrusted() else {
             Log.cascade.error("All-apps cascade aborted: AX permission not granted")
             return
@@ -804,6 +926,7 @@ final class CascadeOrchestrator {
             return
         }
         let screenLabel = chosenScreen.localizedName
+        trace.appSnapshotStart = CascadeLatencyTrace.now()
 
         // Enumerate every "regular" app's windows on the target display.
         // Skip ourselves (.accessory anyway, but the bundle-ID check is
@@ -882,6 +1005,8 @@ final class CascadeOrchestrator {
             // Rule 3: everyone else A→Z.
             return alphabeticalByAppName(lhs, rhs)
         }
+        trace.appSnapshotEnd = CascadeLatencyTrace.now()
+        trace.eligibleAppsCount = runningApps.count
 
         cascadeGeneration &+= 1
         let myGen = cascadeGeneration
@@ -938,11 +1063,179 @@ final class CascadeOrchestrator {
             let windows: [EnumeratedWindow]
         }
         var pendingGroups: [PendingGroup] = []
-        for app in runningApps {
-            // Pre-warm AX once per app so cold-start latency doesn't
-            // distort the first pass.
-            _ = AXWindowEnumerator.windows(of: app)
-            let allWindowsForApp = AXWindowEnumerator.windows(of: app)
+
+        // Accessory-app CG-negative prefilter (see the flag block-comment
+        // above `useAccessoryCGNegativePrefilter`). One CG snapshot,
+        // classify by activation policy, skip accessory apps whose PID
+        // is absent from the successful snapshot. Regular apps are
+        // ALWAYS AX-enumerated regardless of CG (preserves Notes /
+        // Podcasts / Grammarly protection — those apps are `.regular`).
+        // Fails open: CG snapshot failure ⇒ every accessory enumerates
+        // via AX exactly as before.
+        //
+        // Snapshot is bound to this cascade generation — result is
+        // discarded via the stale-generation guard below if a newer
+        // operation supersedes this one during enumeration.
+        trace.cgSnapshotStart = CascadeLatencyTrace.now()
+        let cgSnapStart = CFAbsoluteTimeGetCurrent()
+        let cgSnapshot: CGWindowSnapshot = useAccessoryCGNegativePrefilter
+            ? CGWindowSnapshotter.snapshot()
+            : .failure   // flag off ⇒ act as if snapshot failed ⇒ enumerate everything
+        let cgSnapshotMillis = Int((CFAbsoluteTimeGetCurrent() - cgSnapStart) * 1000)
+        trace.cgSnapshotEnd = CascadeLatencyTrace.now()
+
+        // Classify every eligible app into "AX-enumerate" vs "skip"
+        // based on policy + CG presence + bypass set. `nil` in
+        // `pidsForAXCall` at index i means "insert [] at position i in
+        // the final per-app-windows array, no AX call made". The
+        // parallel `pidsForAXCall` array is what the bounded concurrent
+        // primitive is fed, tagged with `.some(pid)` for real work and
+        // `.none` for skipped positions.
+        //
+        // Downstream planner behavior is unchanged: skipped apps
+        // materialize as zero-window contributors and get filtered out
+        // by the existing `guard !displayWindows.isEmpty else continue`.
+        let appFacts: [PrefilterAppFacts] = runningApps.map { app in
+            PrefilterAppFacts(
+                pid: app.processIdentifier,
+                bundleID: app.bundleIdentifier ?? "",
+                policy: app.activationPolicy
+            )
+        }
+        let classification = Self.classifyEligibleApps(
+            apps: appFacts,
+            cgSnapshot: cgSnapshot,
+            bypassSet: accessoryAppsAlwaysAXEnumerated
+        )
+        let regularCount = classification.regularCount
+        let accessoryCount = classification.accessoryCount
+        let accessoryCGPositiveCount = classification.accessoryCGPositiveCount
+        let accessorySkippedCGNegativeCount = classification.accessorySkippedCGNegativeCount
+        let accessoryBypassedCount = classification.accessoryBypassedCount
+        let pidsForAXCall = classification.pidsForAXCall
+        let axEnumeratedCount = classification.axEnumeratedCount
+
+        // Bounded concurrent AX enumeration for every eligible app.
+        // Skipped positions bypass the AX call entirely and return
+        // `[]` — preserves array indexing so the downstream loop over
+        // `runningApps.enumerated()` still reads `perAppWindows[index]`
+        // correctly. Only the scheduling changes: up to
+        // `maxConcurrentAXEnumerations` per-app enumerations run in
+        // parallel on the cooperative concurrent executor, and results
+        // are returned in the original index order so downstream
+        // planning (anchor rules, alphabetical ordering, target-display
+        // filtering) sees identical input to the serial path.
+        //
+        // Under `useConcurrentAllAppsEnumeration` off, uses the same
+        // helper with concurrency=1 so we always take the concurrent
+        // code path in one place.
+        trace.axEnumStart = CascadeLatencyTrace.now()
+        let enumStart = CFAbsoluteTimeGetCurrent()
+        let effectiveConcurrency = useConcurrentAllAppsEnumeration
+            ? effectiveMaxAXEnumerationConcurrency
+            : 1
+        let (perAppWindows, enumMetrics) = await Self.enumerateAppsBoundedConcurrentWithMetrics(
+            pidsOrSkip: pidsForAXCall,
+            maxConcurrency: effectiveConcurrency
+        )
+        let enumMillis = Int((CFAbsoluteTimeGetCurrent() - enumStart) * 1000)
+        trace.axEnumEnd = CascadeLatencyTrace.now()
+        trace.axEnumeratedCount = axEnumeratedCount
+        trace.postEnumStart = CascadeLatencyTrace.now()
+
+        // Stale-generation guard: while we were awaiting the async
+        // enumeration, the user may have fired another cascade or a
+        // Restore. If so, that newer operation has bumped
+        // `cascadeGeneration`, and this operation must NOT proceed to
+        // planning / frame mutation — the newer op owns the windows now.
+        guard cascadeGeneration == myGen else {
+            Log.cascade.info(
+                "All-apps cascade: superseded during enumeration (myGen=\(myGen, privacy: .public), current=\(self.cascadeGeneration, privacy: .public)) — discarding \(runningApps.count, privacy: .public)-app enumeration result (\(enumMillis, privacy: .public)ms wasted); zero mutations performed"
+            )
+            trace.emit(superseded: true, supersededStage: "post-AX-enumeration")
+            return
+        }
+        guard isTrusted() else {
+            Log.cascade.error("All-apps cascade aborted after enumeration: AX permission lost")
+            trace.emit(superseded: true, supersededStage: "AX-permission-lost")
+            return
+        }
+
+        // Concurrency-audit line — emitted alongside the summary so a
+        // single-log-grep can answer "was concurrency the bottleneck?".
+        // A `peakInFlight` well below `maxConcurrency` on a workload
+        // large enough to saturate it is evidence of hidden
+        // serialization (an actor hop, a serial DispatchQueue, an
+        // AX-per-process lock) — the primitive's own tests prove the
+        // scheduler is not the source, so an anomaly here would point
+        // at the transform / the AX layer.
+        let peakInFlight = enumMetrics.maxObservedInFlight
+        // Top-3 slowest apps by AX round-trip duration, for outlier
+        // triage. Names privacy-public because they're already emitted
+        // by the per-app enumeration log line and are needed to make
+        // this diagnostic actionable.
+        let slowest = enumMetrics.perItemDurationSeconds
+            .enumerated()
+            .sorted { $0.element > $1.element }
+            .prefix(3)
+            .map { (index, seconds) -> String in
+                let name = runningApps[index].localizedName ?? "?"
+                let ms = Int(seconds * 1000)
+                return "\(name)=\(ms)ms"
+            }
+            .joined(separator: ", ")
+        let cgSnapshotStatus: String = {
+            switch cgSnapshot {
+            case .success(let p): return "ok(\(p.count) pids)"
+            case .failure: return useAccessoryCGNegativePrefilter ? "failed" : "disabled"
+            }
+        }()
+        Log.cascade.info(
+            "All-apps cascade enumeration: \(runningApps.count, privacy: .public) eligible app(s) [regular=\(regularCount, privacy: .public), accessory=\(accessoryCount, privacy: .public) (cgPos=\(accessoryCGPositiveCount, privacy: .public), cgNegSkipped=\(accessorySkippedCGNegativeCount, privacy: .public), bypassed=\(accessoryBypassedCount, privacy: .public))], axEnumerated=\(axEnumeratedCount, privacy: .public), mode=\(effectiveConcurrency > 1 ? "concurrent" : "serial", privacy: .public), maxConcurrency=\(effectiveConcurrency, privacy: .public), peakInFlight=\(peakInFlight, privacy: .public), cgSnapshot=\(cgSnapshotMillis, privacy: .public)ms(\(cgSnapshotStatus, privacy: .public)), axEnum=\(enumMillis, privacy: .public)ms, slowest=[\(slowest, privacy: .public)]"
+        )
+
+        // DEBUG differential audit: for every accessory app the
+        // prefilter skipped, shadow-enumerate via AX and log a loud
+        // warning if that app would have contributed a cascade-eligible
+        // window. Never blocks the cascade — runs as a fire-and-forget
+        // Task on the cooperative executor after the main cascade
+        // proceeds. Zero effect on release builds.
+        //
+        // If this ever logs a violation, it means Path A's assumption
+        // ("accessory + CG-negative ⇒ zero cascade windows") failed for
+        // a real app on this machine — add the offending bundle ID to
+        // `accessoryAppsAlwaysAXEnumerated` (or flip
+        // `useAccessoryCGNegativePrefilter` off) to restore full coverage.
+        #if DEBUG
+        if isPrefilterAuditEnabled && accessorySkippedCGNegativeCount > 0 {
+            let skippedApps: [NSRunningApplication] = zip(runningApps, pidsForAXCall)
+                .filter { $0.1 == nil }
+                .map { $0.0 }
+            let auditPIDs = skippedApps.map { $0.processIdentifier }
+            Task.detached { [weak self] in
+                let (perApp, _) = await Self.enumerateAppsBoundedConcurrentWithMetrics(
+                    pidsOrSkip: auditPIDs.map { .some($0) },
+                    maxConcurrency: 4  // gentler than production — audit is background
+                )
+                await MainActor.run {
+                    guard let self else { return }
+                    for (i, windows) in perApp.enumerated() {
+                        if !windows.isEmpty {
+                            let name = skippedApps[i].localizedName ?? "?"
+                            let bundle = skippedApps[i].bundleIdentifier ?? "?"
+                            Log.cascade.error(
+                                "ACCESSORY PREFILTER FALSE NEGATIVE: bundle=\(bundle, privacy: .public) name=\(name, privacy: .public) pid=\(auditPIDs[i], privacy: .public) returned \(windows.count, privacy: .public) AX window(s) despite CG-negative — add bundle to accessoryAppsAlwaysAXEnumerated or flip useAccessoryCGNegativePrefilter off"
+                            )
+                            _ = self  // silence unused-capture warning; the error above is the side effect
+                        }
+                    }
+                }
+            }
+        }
+        #endif
+
+        for (index, app) in runningApps.enumerated() {
+            let allWindowsForApp = perAppWindows[index]
             let displayWindows = windowsOnDisplay(allWindowsForApp, display: chosenScreen)
             guard !displayWindows.isEmpty else { continue }
 
@@ -1072,6 +1365,8 @@ final class CascadeOrchestrator {
         )
 
         let totalWindows = pendingGroups.reduce(0) { $0 + $1.windows.count }
+        trace.totalPlannedWindows = totalWindows
+        trace.planningStart = CascadeLatencyTrace.now()
 
         // Build targets as ONE continuous cascade across all apps:
         //   - Within an app, each successive window steps by the normal
@@ -1220,6 +1515,8 @@ final class CascadeOrchestrator {
         // influencing the anchor from the back" — the fact that a
         // window CAN'T fit at natural size at the slot forces the
         // slot origin to be adjusted so it still fits.
+        trace.preWriteSetupStart = CascadeLatencyTrace.now()
+
         var plans: [AppCascadePlan] = []
         var snapshotEntries: [LayoutSnapshot.Entry] = []
         var allMoves: [(axWindow: AXUIElement, target: CGRect)] = []
@@ -1360,6 +1657,7 @@ final class CascadeOrchestrator {
             Log.cascade.notice(
                 "All-apps cascade no-op: \(totalWindows, privacy: .public) cascadable window(s) on '\(screenLabel, privacy: .public)' (need \u{2265}2 total)"
             )
+            trace.emit(superseded: true, supersededStage: "no-op-<2-windows")
             return
         }
 
@@ -1367,8 +1665,71 @@ final class CascadeOrchestrator {
         // across every app.
         lastSnapshot = LayoutSnapshot(entries: snapshotEntries)
 
-        // Pass 1.
-        let count1 = WindowMutator.applyBatch(allMoves)
+        // Pass 1 — this is the FIRST external window mutation. Uses the
+        // instrumented batch variant so per-window durations flow into
+        // the latency trace. `firstWriteDispatch` and `initialBatchStart`
+        // coincide today (applyBatch is sequential and starts writing
+        // immediately). Distinct fields let a future per-PID mutation
+        // scheduler decouple them without renaming existing consumers.
+        let axWindowToApp: [AXUIElement: NSRunningApplication] = {
+            var map: [AXUIElement: NSRunningApplication] = [:]
+            for group in pendingGroups {
+                for w in group.windows { map[w.axElement] = group.app }
+            }
+            return map
+        }()
+
+        trace.firstWriteDispatch = CascadeLatencyTrace.now()
+        trace.initialBatchStart = trace.firstWriteDispatch
+        let (count1, timings) = WindowMutator.applyBatchInstrumented(allMoves)
+        trace.initialBatchComplete = CascadeLatencyTrace.now()
+        trace.firstWriteReturned = trace.initialBatchComplete
+
+        // Per-PID aggregation for the trace's `slowestPIDGroup` /
+        // `pids` fields. Grouping by NSRunningApplication.pid because
+        // that's what a per-PID mutation scheduler would key on.
+        //
+        // Slowest single write is straightforward. Slowest PID group is
+        // the app with the largest SUMMED setFrame time — a proxy for
+        // "if we ran each PID's writes in parallel, this app would be
+        // the critical-path chain".
+        var perPIDTotalMs: [pid_t: (name: String, ms: Double, count: Int)] = [:]
+        var slowestSingle: (name: String, ms: Int)? = nil
+        for (move, timing) in zip(allMoves, timings) {
+            let ms = timing.durationSeconds * 1000
+            let app = axWindowToApp[move.axWindow]
+            let name = app?.localizedName ?? "?"
+            if slowestSingle == nil || Int(ms) > slowestSingle!.ms {
+                slowestSingle = (name, Int(ms))
+            }
+            if let pid = app?.processIdentifier {
+                var entry = perPIDTotalMs[pid] ?? (name, 0, 0)
+                entry.ms += ms
+                entry.count += 1
+                perPIDTotalMs[pid] = entry
+            }
+        }
+        trace.initialWindowCount = allMoves.count
+        trace.initialPIDCount = perPIDTotalMs.count
+        if let s = slowestSingle {
+            trace.slowestInitialWrite = (appName: s.name, ms: s.ms)
+        }
+        if let heaviest = perPIDTotalMs.values.max(by: { $0.ms < $1.ms }) {
+            trace.slowestInitialPIDGroup = (
+                appName: heaviest.name,
+                ms: Int(heaviest.ms),
+                windowCount: heaviest.count
+            )
+        }
+
+        // Surface the AX enumeration diagnostics into the same trace
+        // line so a single grep answers both "is enumeration or write
+        // the bottleneck" and "which apps are the slowest sources".
+        trace.axPeakInFlight = peakInFlight
+        trace.axConfiguredConcurrency = effectiveConcurrency
+        trace.axSlowestApps = slowest
+
+        trace.emit()
         Log.cascade.info(
             "All-apps \(String(describing: direction), privacy: .public) pass 1: \(count1, privacy: .public)/\(allMoves.count, privacy: .public) windows moved"
         )
@@ -3939,5 +4300,165 @@ final class CascadeOrchestrator {
         let wOff = abs(actual.width  - target.width)
         let hOff = abs(actual.height - target.height)
         return xOff <= 10 && yOff <= 10 && wOff <= 10 && hOff <= 10
+    }
+
+    // MARK: - Bounded concurrent AX enumeration
+    //
+    // Cold All-Apps Cascade was serially calling
+    // `AXWindowEnumerator.windows(of:)` for every running
+    // .regular/.accessory app (~30 on the test Mac), each round-trip
+    // paying 5–50 ms of cross-process AX latency plus occasional
+    // 50 ms sleepy-proxy retries. Wall-clock pre-pass-1 cost was
+    // ~1.5–3 seconds — the "long to react" symptom the user reported.
+    //
+    // This helper preserves the exact eligible-app set — every PID
+    // the serial path would have queried is still queried. Only the
+    // scheduling changes: up to `maxConcurrency` per-app enumerations
+    // run concurrently, and results are collected into a stable
+    // index-keyed array so downstream planning consumes them in the
+    // exact original order (frontmost first, then alphabetical).
+    //
+    // Nonisolated: the tasks run on the cooperative concurrent
+    // executor, not the main actor. Each task independently calls
+    // `AXWindowEnumerator.windows(of:)`, which is safe to call
+    // concurrently for different apps because it creates its own
+    // per-call AXUIElement handle and uses no shared mutable state.
+    // Results are collected on the main actor after `await` resumes.
+    //
+    // We use PIDs (Sendable) rather than NSRunningApplication
+    // references to cross the concurrency boundary cleanly. Each
+    // task reconstructs the NSRunningApplication via the standard
+    // `NSRunningApplication(processIdentifier:)` initializer, which
+    // is safe from any thread. If a PID has died between the
+    // main-actor capture and the worker's execution, the worker
+    // returns an empty result — same as if the app had zero windows.
+    /// Pure per-app facts the accessory prefilter needs — extracted
+    /// from `NSRunningApplication` so the classifier is unit-testable
+    /// without a live workspace. `pid` is the AX enumeration key,
+    /// `bundleID` is the bypass-set key, `policy` drives the branch.
+    struct PrefilterAppFacts: Equatable {
+        let pid: pid_t
+        let bundleID: String
+        let policy: NSApplication.ActivationPolicy
+    }
+
+    /// Pure classification result. `pidsForAXCall.count == apps.count`
+    /// and index-aligned — a `.some(pid)` at position i means "AX
+    /// enumerate this app", `.none` means "skip and treat as []".
+    /// Counts are diagnostics for the enumeration log line.
+    struct PrefilterClassification: Equatable {
+        let pidsForAXCall: [pid_t?]
+        let regularCount: Int
+        let accessoryCount: Int
+        let accessoryCGPositiveCount: Int
+        let accessorySkippedCGNegativeCount: Int
+        let accessoryBypassedCount: Int
+
+        var axEnumeratedCount: Int {
+            pidsForAXCall.reduce(0) { $0 + ($1 == nil ? 0 : 1) }
+        }
+    }
+
+    /// Pure classifier: partition eligible apps into AX-enumerate vs
+    /// skip. See the block comment above `useAccessoryCGNegativePrefilter`
+    /// for the decision matrix. Extracted so the branch logic can be
+    /// unit-tested against fixtures (regular CG-negative, accessory
+    /// CG-positive, accessory CG-negative, bypassed, CG-failure, etc.)
+    /// without needing a live NSWorkspace / live AX / live CG.
+    ///
+    /// Preserves input order — critical because the returned array is
+    /// index-aligned with the caller's `runningApps` array, which drives
+    /// deterministic anchor / alphabetical ordering downstream.
+    nonisolated static func classifyEligibleApps(
+        apps: [PrefilterAppFacts],
+        cgSnapshot: CGWindowSnapshot,
+        bypassSet: Set<String>
+    ) -> PrefilterClassification {
+        var pidsForAXCall: [pid_t?] = []
+        pidsForAXCall.reserveCapacity(apps.count)
+        var regularCount = 0
+        var accessoryCount = 0
+        var accessoryCGPositiveCount = 0
+        var accessorySkippedCGNegativeCount = 0
+        var accessoryBypassedCount = 0
+
+        for app in apps {
+            switch app.policy {
+            case .regular:
+                // Always AX — protects Notes / Podcasts / Grammarly
+                // and every other .regular app regardless of CG state.
+                regularCount += 1
+                pidsForAXCall.append(app.pid)
+
+            case .accessory:
+                accessoryCount += 1
+                if bypassSet.contains(app.bundleID) {
+                    // Escape hatch — always AX regardless of CG.
+                    accessoryBypassedCount += 1
+                    pidsForAXCall.append(app.pid)
+                    continue
+                }
+                switch cgSnapshot {
+                case .failure:
+                    // Fail open — CG state unknown, MUST AX-enumerate.
+                    pidsForAXCall.append(app.pid)
+                case .success(let cgPIDs):
+                    if cgPIDs.contains(app.pid) {
+                        accessoryCGPositiveCount += 1
+                        pidsForAXCall.append(app.pid)
+                    } else {
+                        accessorySkippedCGNegativeCount += 1
+                        pidsForAXCall.append(nil)
+                    }
+                }
+
+            default:
+                // Unknown / prohibited activation policies — the outer
+                // eligibility filter already restricts to .regular +
+                // .accessory. Belt-and-suspenders: if a future policy
+                // leaks through, AX-enumerate rather than silently drop.
+                pidsForAXCall.append(app.pid)
+            }
+        }
+
+        return PrefilterClassification(
+            pidsForAXCall: pidsForAXCall,
+            regularCount: regularCount,
+            accessoryCount: accessoryCount,
+            accessoryCGPositiveCount: accessoryCGPositiveCount,
+            accessorySkippedCGNegativeCount: accessorySkippedCGNegativeCount,
+            accessoryBypassedCount: accessoryBypassedCount
+        )
+    }
+
+    /// Instrumented variant of `enumerateAppsBoundedConcurrent`. Returns
+    /// the same per-app-window results plus `BoundedConcurrentMapMetrics`
+    /// that the caller uses to log the actually-observed peak parallelism
+    /// and the top-N slowest apps by AX round-trip duration. Purely
+    /// diagnostic — never influences result ordering, filtering, or
+    /// downstream cascade behavior.
+    ///
+    /// Accepts an optional-pid array so the accessory CG-negative
+    /// prefilter can pass `.none` for skipped positions. Skipped entries
+    /// return `[]` without making an AX call — the array shape is
+    /// preserved so the caller's downstream `for (index, app) in
+    /// runningApps.enumerated()` loop can still read
+    /// `perAppWindows[index]` at the correct offset. Peak-in-flight
+    /// still reflects only the real AX calls (skipped positions don't
+    /// occupy worker slots meaningfully; they resolve immediately).
+    nonisolated private static func enumerateAppsBoundedConcurrentWithMetrics(
+        pidsOrSkip: [pid_t?],
+        maxConcurrency: Int
+    ) async -> (perApp: [[EnumeratedWindow]], metrics: BoundedConcurrentMapMetrics) {
+        let (results, metrics) = await BoundedConcurrentMap.mapWithMetrics(
+            pidsOrSkip, maxConcurrency: maxConcurrency
+        ) { (maybePid: pid_t?) -> [EnumeratedWindow] in
+            guard let pid = maybePid else { return [] }
+            guard let app = NSRunningApplication(processIdentifier: pid) else {
+                return []
+            }
+            return AXWindowEnumerator.windows(of: app)
+        }
+        return (results, metrics)
     }
 }

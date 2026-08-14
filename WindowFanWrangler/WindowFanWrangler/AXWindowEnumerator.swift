@@ -30,7 +30,15 @@ enum AXWindowEnumerator {
     /// Logs a single summary line per call. Cascade calls this up to
     /// 8 times per invocation, so per-step logging was producing >30
     /// console lines per cascade and burying real signal.
-    static func windows(of app: NSRunningApplication) -> [EnumeratedWindow] {
+    ///
+    /// `nonisolated` so the bounded concurrent all-apps enumeration
+    /// in `CascadeOrchestrator` can call this from cooperative-executor
+    /// tasks (not the main actor). Safe: creates its own per-call
+    /// `AXUIElementCreateApplication(pid)` handle, uses no shared
+    /// mutable state, and the only AppKit surface it touches
+    /// (`NSScreen.screens` inside `isBackdropOrFullscreen`) is
+    /// documented safe to read from any thread.
+    nonisolated static func windows(of app: NSRunningApplication) -> [EnumeratedWindow] {
         let appName = app.localizedName ?? "?"
         let appElement = AXUIElementCreateApplication(app.processIdentifier)
 
@@ -175,7 +183,7 @@ enum AXWindowEnumerator {
     /// non-settable. Both are needed because a user could legitimately
     /// resize a normal window to exactly display size — but that
     /// window would still report settable=true.
-    private static func isBackdropOrFullscreen(
+    nonisolated private static func isBackdropOrFullscreen(
         frameAX: CGRect,
         element: AXUIElement
     ) -> Bool {
@@ -196,13 +204,13 @@ enum AXWindowEnumerator {
 
     // MARK: - AX attribute helpers
 
-    private static func stringAttribute(_ key: String, of element: AXUIElement) -> String? {
+    nonisolated private static func stringAttribute(_ key: String, of element: AXUIElement) -> String? {
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(element, key as CFString, &value) == .success else { return nil }
         return value as? String
     }
 
-    private static func boolAttribute(_ key: String, of element: AXUIElement) -> Bool? {
+    nonisolated private static func boolAttribute(_ key: String, of element: AXUIElement) -> Bool? {
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(element, key as CFString, &value) == .success else { return nil }
         return value as? Bool
@@ -210,7 +218,7 @@ enum AXWindowEnumerator {
 
     /// Reads the current frame of a single window in AX (top-left global)
     /// coordinates. Returns nil if AX refuses to give us position or size.
-    static func currentFrame(of axWindow: AXUIElement) -> CGRect? {
+    nonisolated static func currentFrame(of axWindow: AXUIElement) -> CGRect? {
         var positionValue: CFTypeRef?
         var sizeValue: CFTypeRef?
 

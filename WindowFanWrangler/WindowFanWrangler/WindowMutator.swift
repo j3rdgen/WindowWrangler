@@ -107,6 +107,48 @@ enum WindowMutator {
         return successes
     }
 
+    /// One row of per-window timing data from `applyBatchInstrumented`.
+    /// Same order as the input `moves` array — the caller can zip these
+    /// back to their planned identity to compute per-PID totals /
+    /// slowest-write / etc. `succeeded` mirrors the plain `applyBatch`
+    /// per-move result.
+    struct BatchWriteTiming {
+        let axWindow: AXUIElement
+        let durationSeconds: Double
+        let succeeded: Bool
+    }
+
+    /// Instrumented variant of `applyBatch`. Same sequential semantics —
+    /// executes each `setFrame` in input order, returns the total
+    /// success count — but additionally records the wall-clock duration
+    /// of each individual `setFrame` call. The caller uses this to
+    /// distinguish "one slow write dominates" from "sum across many
+    /// windows dominates" without needing to hook into the mutator
+    /// itself.
+    ///
+    /// Overhead: one `CFAbsoluteTimeGetCurrent()` pair per window plus
+    /// one struct allocation. Negligible next to a cross-process AX
+    /// write.
+    static func applyBatchInstrumented(
+        _ moves: [(axWindow: AXUIElement, target: CGRect)]
+    ) -> (successCount: Int, timings: [BatchWriteTiming]) {
+        var successes = 0
+        var timings: [BatchWriteTiming] = []
+        timings.reserveCapacity(moves.count)
+        for move in moves {
+            let t0 = CFAbsoluteTimeGetCurrent()
+            let ok = setFrame(move.target, of: move.axWindow)
+            let dt = CFAbsoluteTimeGetCurrent() - t0
+            if ok { successes += 1 }
+            timings.append(BatchWriteTiming(
+                axWindow: move.axWindow,
+                durationSeconds: dt,
+                succeeded: ok
+            ))
+        }
+        return (successes, timings)
+    }
+
     /// Writes ONLY the window's position — no size dance. Faster than
     /// `setFrame` (single AX write vs. three) so it's suitable for
     /// per-frame calls during an interactive drag. `cocoaFrame` is the
