@@ -61,6 +61,27 @@ final class SelectionOverlay {
     /// currently used by the coordinator.
     private var suspended = false
 
+    /// Cascade acknowledgement-pulse rectangles in Cocoa global
+    /// coordinates. Rendered with the same dashed-outline style as
+    /// `selectionFrames`, but modulated by `pulseOpacity` so the pulse
+    /// controller can flash ON→OFF→ON→OFF without creating and
+    /// destroying panels per phase. Empty when no pulse is active.
+    ///
+    /// This is a purely cosmetic acknowledgement — it does NOT influence
+    /// Lasso behavior, Cascade membership, or any AX operation. The
+    /// underlying rectangles come from a cheap CG snapshot, not
+    /// authoritative AX enumeration, so CG blind-spot apps (Notes,
+    /// Podcasts, Grammarly) may not blink even though they DO cascade
+    /// correctly. That cosmetic discrepancy is deliberate.
+    private var pulseRects: [CGRect] = []
+
+    /// Alpha multiplier applied to the pulse-outline stroke + fill.
+    /// Toggled between 1.0 (visible) and 0.0 (invisible) by
+    /// `CascadeFeedbackController` to produce the blink. Kept as a
+    /// float rather than a bool so a future implementation could fade
+    /// if needed — but current spec calls for a hard ON/OFF toggle.
+    private var pulseOpacity: CGFloat = 1.0
+
     /// Set once we've subscribed to screen-parameter change
     /// notifications. Prevents duplicate subscriptions.
     private var screenChangeObserver: NSObjectProtocol?
@@ -129,6 +150,22 @@ final class SelectionOverlay {
     ) {
         self.selectionFrames = selectionFrames
         self.frontmostFrame = frontmostFrame
+        updateAllPanels()
+    }
+
+    /// Atomic update of the Cascade acknowledgement-pulse rectangles
+    /// and opacity in a single panel refresh. Called by
+    /// `CascadeFeedbackController` for each ON/OFF blink phase.
+    ///
+    /// Passing an empty `rects` array clears the pulse (panel hides on
+    /// the next update cycle if no other content is present). Non-empty
+    /// rects + opacity=0 keeps the panel visible but draws nothing —
+    /// this is the "true OFF" phase of the blink, chosen over
+    /// panel-hide/show churn to avoid `orderFrontRegardless()` /
+    /// `orderOut()` thrash between phases.
+    func setPulseState(rects: [CGRect], opacity: CGFloat) {
+        pulseRects = rects
+        pulseOpacity = max(0, min(1, opacity))
         updateAllPanels()
     }
 
@@ -256,13 +293,22 @@ final class SelectionOverlay {
                 guard let rect = frontmostFrame, rect.intersects(displayFrame) else { return nil }
                 return rect
             }()
+            let pulseForDisplay = pulseRects.filter { $0.intersects(displayFrame) }
+            // Panel stays visible while pulse rects exist even at
+            // opacity 0 — the pulse controller wants "flash off" not
+            // "orderOut / orderFront churn". Panel hides only when
+            // `pulseRects` is CLEARED (blink complete), which happens
+            // via the controller's final `setPulseState(rects: [], …)`.
             let hasContent = !framesForDisplay.isEmpty
                 || lassoForDisplay != nil
                 || frontmostForDisplay != nil
+                || !pulseForDisplay.isEmpty
 
             view.selectionFrames = framesForDisplay
             view.lassoRect = lassoForDisplay
             view.frontmostFrame = frontmostForDisplay
+            view.pulseRects = pulseForDisplay
+            view.pulseOpacity = pulseOpacity
             view.needsDisplay = true
 
             if hasContent {
@@ -295,6 +341,15 @@ private final class OverlayView: NSView {
     /// corners for the multi-window resize feature. Nil when no
     /// selection exists or during an active drag / resize.
     var frontmostFrame: CGRect?
+
+    /// Cascade acknowledgement-pulse rectangles (Cocoa global coords)
+    /// filtered to this display. Rendered with the same dashed-outline
+    /// style as `selectionFrames`, scaled by `pulseOpacity`.
+    var pulseRects: [CGRect] = []
+
+    /// Multiplier for the pulse outline's stroke + fill alpha. 1.0 for
+    /// the ON phase of the blink, 0.0 for the OFF phase.
+    var pulseOpacity: CGFloat = 1.0
 
     static let handleVisualRadius: CGFloat = 9
     static let handleHitRadius: CGFloat = 16
@@ -334,6 +389,35 @@ private final class OverlayView: NSView {
             path.lineWidth = strokeWidth
             path.setLineDash(dashPattern, count: dashPattern.count, phase: 0)
             path.stroke()
+        }
+
+        // Cascade acknowledgement pulse — same dashed-outline style
+        // as selection frames, alpha-scaled by pulseOpacity. Skip
+        // entirely when opacity ≈ 0 or rects empty. Rendered BEFORE
+        // the lasso rubber-band and resize handles so any concurrent
+        // Lasso interaction visually dominates.
+        if !pulseRects.isEmpty && pulseOpacity > 0.001 {
+            let pulseStroke = accent.withAlphaComponent(0.57 * pulseOpacity)
+            let pulseFill = accent.withAlphaComponent(0.0308 * pulseOpacity)
+            for globalFrame in pulseRects {
+                let local = globalFrame.offsetBy(
+                    dx: -windowOriginInScreenCoords.x,
+                    dy: -windowOriginInScreenCoords.y
+                )
+                let strokeRect = local.insetBy(dx: totalInset, dy: totalInset)
+                let cornerRadius = max(0, windowCornerRadius - halfStroke)
+                let path = NSBezierPath(
+                    roundedRect: strokeRect,
+                    xRadius: cornerRadius,
+                    yRadius: cornerRadius
+                )
+                pulseFill.setFill()
+                path.fill()
+                pulseStroke.setStroke()
+                path.lineWidth = strokeWidth
+                path.setLineDash(dashPattern, count: dashPattern.count, phase: 0)
+                path.stroke()
+            }
         }
 
         if let global = lassoRect {

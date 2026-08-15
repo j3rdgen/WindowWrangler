@@ -896,7 +896,8 @@ final class CascadeOrchestrator {
     func performCascadeAllApps(
         direction: CascadeDirection,
         targetScreen: NSScreen? = nil,
-        shortcutReceivedAt: CFAbsoluteTime? = nil
+        shortcutReceivedAt: CFAbsoluteTime? = nil,
+        onFirstWriteWillDispatch: (@MainActor () -> Void)? = nil
     ) async {
         // Origin timestamp for the per-generation latency trace. When
         // called from a keyboard shortcut, the shortcut handler stamps
@@ -1681,6 +1682,16 @@ final class CascadeOrchestrator {
 
         trace.firstWriteDispatch = CascadeLatencyTrace.now()
         trace.initialBatchStart = trace.firstWriteDispatch
+
+        // Cascade acknowledgement-pulse dismiss hook. Fired here — the
+        // exact instant Cascade commits to visible external motion —
+        // so the cosmetic pulse tears down instantly instead of
+        // overlapping with real window movement. Not awaited: the
+        // callback is a synchronous setter that flips overlay state
+        // and cancels the pending phase timers. Zero latency added to
+        // the write path.
+        onFirstWriteWillDispatch?()
+
         let (count1, timings) = WindowMutator.applyBatchInstrumented(allMoves)
         trace.initialBatchComplete = CascadeLatencyTrace.now()
         trace.firstWriteReturned = trace.initialBatchComplete

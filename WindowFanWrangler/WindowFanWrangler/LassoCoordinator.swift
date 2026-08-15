@@ -26,7 +26,7 @@ final class LassoCoordinator {
     /// ensures only one of Lasso / Plot is active at a time; the
     /// tap forwards left-mouse events to whichever mode is enabled.
     var sharedEventMonitor: GlobalEventMonitor { eventMonitor }
-    private let overlay = SelectionOverlay()
+    private let overlay: SelectionOverlay
     private let modeHint = LassoModeHint()
     let selection: WindowSelection
 
@@ -130,8 +130,17 @@ final class LassoCoordinator {
     private var willSleepObserver: NSObjectProtocol?
     private var sessionInactiveObserver: NSObjectProtocol?
 
-    init(selection: WindowSelection) {
+    /// `overlay` is injected so the app can share ONE `SelectionOverlay`
+    /// instance between Lasso rendering and the Cascade acknowledgement
+    /// pulse. `CascadeFeedbackController` calls a distinct
+    /// `setPulseState(rects:opacity:)` method on the same overlay —
+    /// no Lasso behavioral state is ever touched by the pulse code.
+    /// Required parameter (no default) because `SelectionOverlay()` is
+    /// MainActor-isolated and cannot be default-constructed in a
+    /// nonisolated context.
+    init(selection: WindowSelection, overlay: SelectionOverlay) {
         self.selection = selection
+        self.overlay = overlay
         wireEvents()
         wireIdleSafetyObservers()
     }

@@ -66,7 +66,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
     /// Orchestrates the M5 lasso flow (input → hit-test → selection
     /// → overlay rendering). Held strongly so its monitors stay alive
     /// for the app's lifetime.
-    private lazy var lassoCoordinator = LassoCoordinator(selection: windowSelection)
+    /// Shared per-display overlay renderer. Owned at app scope so
+    /// `LassoCoordinator` and `CascadeFeedbackController` can render
+    /// to the same panels without one instance's per-display panels
+    /// stacking on top of the other's. Neither consumer touches the
+    /// other's rendering slots (Lasso writes `showLassoRect` /
+    /// `setSelectionFrames`, Cascade pulse writes `setPulseState`).
+    private let selectionOverlay = SelectionOverlay()
+
+    private lazy var lassoCoordinator = LassoCoordinator(
+        selection: windowSelection,
+        overlay: selectionOverlay
+    )
+
+    /// Cascade acknowledgement-pulse controller. Draws the immediate
+    /// ON→OFF→ON→OFF flash around currently-visible windows so the
+    /// user sees Window Wrangler react instantly, independent of any
+    /// external app's AX latency. Purely cosmetic — never blocks
+    /// `performCascadeAllApps`, never mutates Lasso / Plot / Cascade
+    /// state, never issues AX calls. Feature-flagged via
+    /// `useCascadeAcknowledgementPulse` so it can be disabled if it
+    /// ever feels wrong.
+    private lazy var cascadeFeedbackController = CascadeFeedbackController(
+        overlay: selectionOverlay
+    )
+
+    /// Master flag for the Cascade acknowledgement-pulse feature. Set
+    /// to `false` to fully disable the pulse (all shortcut handlers
+    /// bypass the blink; the controller is never invoked). Retained
+    /// as a named constant so future rollback is one line rather than
+    /// picking apart the shortcut handler.
+    private let useCascadeAcknowledgementPulse = true
 
     /// Owns Plot Mode — the single-window snap-to-drawn-area flow.
     /// Shares the GlobalEventMonitor tap with Lasso; the two modes
@@ -372,12 +402,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
         let shortcutReceivedAt = CascadeLatencyTrace.now()
         endPlotBeforeConflictingAction()
         let mouseDisplay = CoordinateSpace.screen(containing: NSEvent.mouseLocation)
+
+        // Cascade acknowledgement pulse (parallel to Cascade — never
+        // awaited). Snapshot visible windows via the cheap CG-backed
+        // enumerator, kick off the ON→OFF→ON→OFF blink, capture the
+        // generation. The dismiss closure below fires from inside the
+        // orchestrator right before its first geometry write so the
+        // cosmetic pulse tears down instantly when the real cascade
+        // starts. Purely cosmetic — CG blind-spot apps (Notes /
+        // Podcasts / Grammarly) may not blink even though the actual
+        // Cascade will still move them via AX.
+        let pulseGeneration: UInt64
+        if useCascadeAcknowledgementPulse {
+            let rects = CrossAppWindowEnumerator.allVisibleWindows()
+                .map { $0.frame }
+            pulseGeneration = cascadeFeedbackController.blink(rects: rects)
+        } else {
+            pulseGeneration = 0
+        }
+
         runAfterMenuDismiss { [weak self] in
             Task { @MainActor in
                 await self?.cascadeOrchestrator.performCascadeAllApps(
                     direction: direction,
                     targetScreen: mouseDisplay,
-                    shortcutReceivedAt: shortcutReceivedAt
+                    shortcutReceivedAt: shortcutReceivedAt,
+                    onFirstWriteWillDispatch: { [weak self] in
+                        // Fire-and-forget setter. `dismiss(generation:)`
+                        // no-ops if a newer pulse has superseded this
+                        // one, so a slow cascade whose pulse already
+                        // ended naturally is safe too.
+                        self?.cascadeFeedbackController.dismiss(
+                            generation: pulseGeneration
+                        )
+                    }
                 )
             }
         }
@@ -753,6 +811,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
         Log.app.notice("applicationWillTerminate — releasing lasso + shortcut taps")
         lassoCoordinator.stop()
         shortcuts.stop()
+        // Cancel any pending Cascade acknowledgement-pulse phase
+        // timers so a late-firing asyncAfter cannot resurrect the
+        // overlay after teardown.
+        cascadeFeedbackController.stop()
     }
 
     // MARK: - Menu/shortcut timing
