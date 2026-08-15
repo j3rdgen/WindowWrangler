@@ -297,10 +297,13 @@ TabInfo {
 
 ### 6.4 Sandbox / entitlements
 
-- **Not sandboxed.** The app runs outside App Sandbox because sandboxed apps cannot read other apps' windows via AX.
-- **`NSAppleEventsUsageDescription`** in `Info.plist` explains why the app requests Automation permission.
-- **No hardened runtime yet** — development builds are self-signed. A production build would enable hardened runtime as a notarization prerequisite.
-- **Not distributable via Mac App Store** — MAS requires sandbox, which breaks cross-app AX. Developer ID + direct distribution is the natural production path.
+- **Not sandboxed** and will remain so. The app runs outside App Sandbox because sandboxed apps cannot read other apps' windows via AX. `ENABLE_APP_SANDBOX = NO` is set on both Debug and Release configurations and the entitlements file deliberately omits `com.apple.security.app-sandbox`. This is an intentional architectural constraint, not an oversight.
+- **Hardened Runtime is enabled** on both Debug and Release configurations (`ENABLE_HARDENED_RUNTIME = YES`). Verification on ad-hoc-signed Release builds shows `codesign` flags `0x10002(adhoc,runtime)` — the `runtime` bit is active. Under Xcode's dev ad-hoc signing on Debug, Xcode auto-emits `"Disabling hardened runtime with ad-hoc codesigning"`; that's an Apple-imposed dev-only relaxation and does not affect a real Developer ID / notarization build.
+- **Entitlements file:** `WindowFanWrangler/WindowWrangler.entitlements` — declares only `com.apple.security.automation.apple-events = true`. No Hardened Runtime exception entitlements (no `disable-library-validation`, no `allow-jit`, no `allow-unsigned-executable-memory`, no `allow-dyld-environment-variables`). If notarization ever refuses the app, the correct response is to investigate the specific cause, not to add exception entitlements.
+- **`NSAppleEventsUsageDescription`** in `Info.plist` explains why the app requests Automation permission. Sourced via `INFOPLIST_KEY_NSAppleEventsUsageDescription` build setting; the wording is a product decision.
+- **`get-task-allow` in Release**: Xcode's automatic dev-team ad-hoc signing leaves `get-task-allow = true` in place on both Debug AND Release builds — this is Xcode's development-signing default, not a project setting. Xcode's Archive → Distribute App flow strips `get-task-allow` when signing with a real Developer ID certificate. Confirm absence on the final notarized artifact via `codesign -d --entitlements :- <path>`.
+- **Not distributable via Mac App Store** — MAS requires sandbox, which breaks cross-app AX. Developer ID + direct distribution is the only viable path.
+- **Distribution readiness caveat:** the current Debug and Release builds are ad-hoc signed by Xcode's automatic dev signing. Full distribution readiness (Developer ID Application certificate, notarization) is still pending — see §8. The final notarized build MUST be re-tested for Accessibility and Apple Events permissions because the signing identity change may fragment TCC's per-signature records.
 
 ### 6.5 Security surface
 
@@ -357,22 +360,27 @@ Where the app sits between "runs on my machine" and "shippable to strangers."
 
 - Builds and runs from Xcode on the developer's Mac.
 - Every claimed feature works in that environment.
-- Self-signed for local execution.
+- Ad-hoc signed by Xcode's automatic dev signing.
+- **Hardened Runtime enabled** on Debug + Release build settings; verified active on ad-hoc-signed Release (`codesign` flags = `0x10002(adhoc,runtime)`).
+- **`com.apple.security.automation.apple-events` entitlement** wired to the app target via `WindowFanWrangler/WindowWrangler.entitlements`.
+- **No Hardened Runtime exception entitlements** declared (no `disable-library-validation`, no `allow-jit`, etc.).
+- App Sandbox intentionally absent — unchanged architectural constraint.
 - Accessibility + Automation permission flows behave correctly.
 
 ### 8.2 Gaps between prototype and shippable production
 
 **Code signing and identity.**
-- Currently: local self-sign ("Sign to Run Locally").
-- Production needs: Developer ID Application certificate from Apple Developer Program membership ($99/year), a stable Team ID that TCC keys against permanently, hardened runtime enabled.
+- Currently: ad-hoc signed with Hardened Runtime settings in place. Xcode's dev ad-hoc signing does not fully validate Hardened Runtime; a real Developer ID cert will.
+- Production needs: Developer ID Application certificate from Apple Developer Program membership ($99/year), a stable Team ID that TCC keys against permanently.
 
 **Notarization.**
 - Currently: not notarized.
-- Production needs: notarized via Apple's automated malware scan. Required for Gatekeeper to allow distribution to non-development-team users without ⌃-click bypass.
+- Production needs: notarized via Apple's automated malware scan. Required for Gatekeeper to allow distribution to non-development-team users without ⌃-click bypass. **After the first real Developer ID / notarized build, Accessibility and Apple Events permissions MUST be re-tested** — the signing identity change fragments TCC's per-signature records, so users (including the developer on their own machine) may need to re-grant permissions once.
 
 **Entitlements review.**
-- Currently: minimal (Accessibility, AppleEvents).
+- Currently: `com.apple.security.automation.apple-events` (added for external-browser Automation). No other exception entitlements declared.
 - Production may need: Full Disk Access entitlement (to eliminate the Files & Folders TCC prompts on document restore for macOS Sequoia+). Requires Apple's manual review and justification.
+- Xcode's automatic dev-team ad-hoc signing leaves `com.apple.security.get-task-allow = true` on the local build; Xcode's Archive → Distribute App flow strips this when signing with the real Developer ID cert. Verify absence on the final notarized artifact via `codesign -d --entitlements :- <path>`.
 
 **Distribution channel.**
 - Currently: none. No installer, no DMG, no website.

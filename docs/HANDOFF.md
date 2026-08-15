@@ -120,16 +120,26 @@ Bundle identifier is `com.jmw3.WindowWrangler`. Change it to your Team's namespa
 
 ### What production would require
 
-Not implemented, but worth documenting the gap:
+Some of this is now in place. Full list:
 
-1. **Developer ID or Apple Distribution certificate** for stable code signing.
-2. **Team ID** — anchors TCC records to a persistent identity so grants survive rebuilds.
-3. **Notarization** — Apple's automated malware scan; required for Gatekeeper to allow the app on other users' machines without ⌃-click bypass.
-4. **Entitlements review** for:
-   - `com.apple.security.automation.apple-events` — already used, needs entry per target browser bundle ID in `Info.plist`'s `NSAppleEventsUsageDescription` context.
-   - **Full Disk Access** (if you want to eliminate the Files & Folders TCC prompts on document restore for Sequoia+). This requires Apple's manual review.
-5. **Info.plist hardening** — usage description strings that Apple's reviewer wants to see for every gated capability.
-6. **MAS distribution** would additionally require sandbox entitlements, which would likely break the cross-app AX behavior (sandboxed apps can't read other apps' windows). MAS is probably not a viable path; Developer ID + direct distribution is the natural route.
+1. **Developer ID or Apple Distribution certificate** for stable code signing. *(Still needed — the ad-hoc dev signing does not produce a distributable artifact.)*
+2. **Team ID** — anchors TCC records to a persistent identity so grants survive rebuilds. *(Comes with the Developer ID cert.)*
+3. **Notarization** — Apple's automated malware scan; required for Gatekeeper to allow the app on other users' machines without ⌃-click bypass. *(Still needed.)*
+4. **Hardened Runtime** — ✅ **enabled** on both Debug and Release build settings. Verified active on ad-hoc-signed Release (`codesign` flags = `0x10002(adhoc,runtime)`). Xcode auto-emits `"Disabling hardened runtime with ad-hoc codesigning"` on Debug — that's an Apple dev-only relaxation, not a build issue.
+5. **Entitlements**:
+   - ✅ `com.apple.security.automation.apple-events` — declared in `WindowFanWrangler/WindowWrangler.entitlements`, wired via the app target's `CODE_SIGN_ENTITLEMENTS` build setting.
+   - ✅ **No Hardened Runtime exception entitlements** (no `disable-library-validation`, `allow-jit`, `allow-unsigned-executable-memory`, `allow-dyld-environment-variables`, `disable-executable-page-protection`).
+   - ✅ **App Sandbox intentionally absent** — sandbox breaks cross-app AX; unsandboxed is a permanent architectural constraint.
+   - **Full Disk Access** — not requested. If the Files & Folders TCC prompts on document restore for Sequoia+ become a support issue, this can be added, but requires Apple's manual review.
+6. **`NSAppleEventsUsageDescription`** — present in `Info.plist` via `INFOPLIST_KEY_NSAppleEventsUsageDescription` build setting. Wording is a product decision; do not modify without explicit intent.
+7. **MAS distribution** requires sandbox, which would break cross-app AX. Not a viable path; Developer ID + direct distribution is the only route.
+
+**When the real Developer ID / notarized build is produced:**
+- Re-run `codesign -d --entitlements :- <path>` on the notarized artifact and confirm `com.apple.security.get-task-allow` is absent (Xcode's Archive → Distribute flow strips it automatically).
+- Re-test Accessibility permission (may need re-grant — signature identity changed).
+- Re-test Automation permission for every supported browser (may need re-grant — signature identity changed).
+- Confirm Corral capture + Recall restore + Plot Chromium bounds + Cascade Chromium repair all work end-to-end.
+- Only after that end-to-end validation should the notarized build be considered distribution-ready.
 
 The distinction that matters most: **notarization gives the app a stable Team ID that TCC keys against.** Every rebuild in development changes the signature; TCC's per-signature records fragment, leading to the "granted but doesn't work" state described below. Notarized production builds have one signature that persists.
 
