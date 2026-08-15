@@ -379,11 +379,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
     private func shortcutCascade(direction: CascadeDirection) {
         endPlotBeforeConflictingAction()
         let mouseDisplay = CoordinateSpace.screen(containing: NSEvent.mouseLocation)
+
+        // Cascade acknowledgement pulse for single-app cascade —
+        // scoped ONLY to the resolved target app's windows on the
+        // target display so the outlines match exactly what will
+        // move. Uses `CrossAppWindowEnumerator.allVisibleWindows()`
+        // (the cheap CG snapshot) filtered by owner PID + display.
+        // Slight drift is possible if frontmost changes between here
+        // and the orchestrator's own `resolveTargetApp()`; the pulse
+        // is cosmetic, so a mildly-inaccurate outline is fine.
+        //
+        // Cascade dispatch is delayed by exactly the pulse duration
+        // so the pulse fully completes and its outlines clear before
+        // any window motion begins — same "pulse-then-move" sequence
+        // as the All-Apps path. On the fast/warm single-app cascade
+        // path this replaces visible overlap with clean visual
+        // separation; on slow paths the 150ms extra is imperceptible.
+        let cascadeDelay: TimeInterval
+        let pulseGeneration: UInt64
+        if useCascadeAcknowledgementPulse,
+           let targetApp = resolveTargetApp() {
+            let targetPID = targetApp.processIdentifier
+            let rects = CrossAppWindowEnumerator.allVisibleWindows()
+                .filter { $0.ownerPID == targetPID }
+                .filter { win in
+                    guard let disp = mouseDisplay else { return true }
+                    return win.frame.intersects(disp.frame)
+                }
+                .map { $0.frame }
+            pulseGeneration = cascadeFeedbackController.blink(rects: rects)
+            cascadeDelay = cascadeFeedbackController.pulseDuration
+        } else {
+            pulseGeneration = 0
+            cascadeDelay = 0
+        }
+
         runAfterMenuDismiss { [weak self] in
-            self?.cascadeOrchestrator.performCascade(
-                direction: direction,
-                targetScreen: mouseDisplay
-            )
+            DispatchQueue.main.asyncAfter(deadline: .now() + cascadeDelay) { [weak self] in
+                self?.cascadeOrchestrator.performCascade(
+                    direction: direction,
+                    targetScreen: mouseDisplay,
+                    onFirstWriteWillDispatch: { [weak self] in
+                        self?.cascadeFeedbackController.dismiss(
+                            generation: pulseGeneration
+                        )
+                    }
+                )
+            }
         }
     }
 
@@ -403,40 +445,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
         endPlotBeforeConflictingAction()
         let mouseDisplay = CoordinateSpace.screen(containing: NSEvent.mouseLocation)
 
-        // Cascade acknowledgement pulse (parallel to Cascade — never
-        // awaited). Snapshot visible windows via the cheap CG-backed
-        // enumerator, kick off the ON→OFF→ON→OFF blink, capture the
-        // generation. The dismiss closure below fires from inside the
-        // orchestrator right before its first geometry write so the
-        // cosmetic pulse tears down instantly when the real cascade
-        // starts. Purely cosmetic — CG blind-spot apps (Notes /
-        // Podcasts / Grammarly) may not blink even though the actual
-        // Cascade will still move them via AX.
+        // Cascade acknowledgement pulse. Snapshot visible windows via
+        // the cheap CG-backed enumerator, kick off the pulse
+        // synchronously. CG blind-spot apps (Notes / Podcasts /
+        // Grammarly) may not blink; the actual Cascade will still
+        // move them via AX. That cosmetic gap is deliberate — CG is
+        // not authoritative.
+        //
+        // Cascade dispatch is delayed by exactly the pulse duration
+        // so the pulse fully completes and its outlines clear BEFORE
+        // any window motion begins. On the fast/warm Cascade path
+        // (~100-225ms shortcut→firstWrite) the pulse was previously
+        // overlapping window motion, leaving static outlines behind
+        // moving windows — user-reported "lag." Sequencing them
+        // sacrifices ~150ms of raw reaction time in exchange for
+        // clean visual separation. On the slow (Zoom-open ~1500ms)
+        // path the extra 150ms is imperceptible.
+        //
+        // The `onFirstWriteWillDispatch` dismiss hook stays as
+        // belt-and-suspenders — with the delay in place the pulse
+        // will always be complete by the time it fires, so the
+        // callback becomes a benign no-op.
+        let cascadeDelay: TimeInterval
         let pulseGeneration: UInt64
         if useCascadeAcknowledgementPulse {
             let rects = CrossAppWindowEnumerator.allVisibleWindows()
                 .map { $0.frame }
             pulseGeneration = cascadeFeedbackController.blink(rects: rects)
+            cascadeDelay = cascadeFeedbackController.pulseDuration
         } else {
             pulseGeneration = 0
+            cascadeDelay = 0
         }
 
         runAfterMenuDismiss { [weak self] in
-            Task { @MainActor in
-                await self?.cascadeOrchestrator.performCascadeAllApps(
-                    direction: direction,
-                    targetScreen: mouseDisplay,
-                    shortcutReceivedAt: shortcutReceivedAt,
-                    onFirstWriteWillDispatch: { [weak self] in
-                        // Fire-and-forget setter. `dismiss(generation:)`
-                        // no-ops if a newer pulse has superseded this
-                        // one, so a slow cascade whose pulse already
-                        // ended naturally is safe too.
-                        self?.cascadeFeedbackController.dismiss(
-                            generation: pulseGeneration
-                        )
-                    }
-                )
+            DispatchQueue.main.asyncAfter(deadline: .now() + cascadeDelay) { [weak self] in
+                Task { @MainActor in
+                    await self?.cascadeOrchestrator.performCascadeAllApps(
+                        direction: direction,
+                        targetScreen: mouseDisplay,
+                        shortcutReceivedAt: shortcutReceivedAt,
+                        onFirstWriteWillDispatch: { [weak self] in
+                            self?.cascadeFeedbackController.dismiss(
+                                generation: pulseGeneration
+                            )
+                        }
+                    )
+                }
             }
         }
     }

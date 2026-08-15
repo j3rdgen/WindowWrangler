@@ -486,7 +486,11 @@ final class CascadeOrchestrator {
     /// is unchanged from before.
     ///
     /// See file-level doc comment for the reliability stack.
-    func performCascade(direction: CascadeDirection, targetScreen: NSScreen? = nil) {
+    func performCascade(
+        direction: CascadeDirection,
+        targetScreen: NSScreen? = nil,
+        onFirstWriteWillDispatch: (@MainActor () -> Void)? = nil
+    ) {
         guard isTrusted() else {
             Log.cascade.error("Aborted: AX permission not granted")
             return
@@ -549,6 +553,13 @@ final class CascadeOrchestrator {
             width: screen.width * cascadeWindowSizeFraction,
             height: screen.height * cascadeWindowSizeFraction
         )
+
+        // Cascade acknowledgement-pulse dismiss hook. With the
+        // pulse-duration delay the shortcut handler applies before
+        // dispatching this call, the pulse is virtually always
+        // complete by the time execution reaches here — the callback
+        // is a no-op dismiss for supersession safety.
+        onFirstWriteWillDispatch?()
 
         let count1 = applyCascadePass(
             windows: windows,

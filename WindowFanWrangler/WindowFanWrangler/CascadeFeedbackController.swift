@@ -40,18 +40,26 @@ import AppKit
 import Foundation
 import os
 
-/// Shape of the acknowledgement pulse. Tuned to match the feel of
-/// `PlotOverlay`'s selection pulse — one-shot expand-then-shrink with
-/// alpha fade — so both cosmetic feedback surfaces in the app share a
-/// visual vocabulary.
+/// Shape of the acknowledgement pulse. Same expand-then-shrink and
+/// alpha-fade shape as `PlotOverlay`'s selection pulse, but shorter —
+/// the pulse should feel like it happens BEFORE cascade motion, not
+/// alongside it. On a fast Cascade (Zoom closed) the observed
+/// shortcut→firstWrite is ~225ms; targeting ~150ms total pulse leaves
+/// the acknowledgement fully complete before real window movement
+/// begins on the fast path, while still giving the eye enough frames
+/// to read the expand-then-shrink curve as smooth. On slow Cascade
+/// (Zoom open, ~1.5s) the pulse still fires-and-forgets exactly the
+/// same way — user sees prompt acknowledgement, then waits for the
+/// external AX to unblock.
 private enum PulseTuning {
-    /// Total pulse duration in seconds. Plot's selection pulse is
-    /// 0.28s; landing is 0.34s. 0.30s sits comfortably between them
-    /// and inside the earlier spec's 250-350ms window.
-    static let totalDuration: TimeInterval = 0.30
-    /// Peak outward expansion in points. Plot's landing pulse uses 6;
-    /// Cascade windows are larger and benefit from a slightly bolder
-    /// pop, but staying at 6 keeps the visual disciplined.
+    /// Total pulse duration in seconds. Chosen to complete visibly
+    /// before the fast-path shortcut→firstWrite (~225ms) so the
+    /// pulse and real window motion don't overlap on the good case.
+    /// At 60fps that's ~9 frames — enough to read the expand curve
+    /// as a smooth pop rather than a step.
+    static let totalDuration: TimeInterval = 0.15
+    /// Peak outward expansion in points. Unchanged from the prior
+    /// tuning — visual character stays identical, only speed changes.
     static let expandPoints: CGFloat = 6
     /// Timer tick — ~60fps redraw while the pulse is on screen. Cheap
     /// because each panel only redraws its own small content region.
@@ -108,6 +116,15 @@ final class CascadeFeedbackController {
     }
 
     // MARK: - Public API
+
+    /// Total duration of one complete pulse, in seconds. Exposed so
+    /// the shortcut handler can delay Cascade dispatch by this much —
+    /// ensuring the pulse fully completes and its outlines clear
+    /// BEFORE any window motion begins. Without that delay, a fast
+    /// warm Cascade (~100-225ms) overlaps the pulse's fade tail,
+    /// leaving static outlines sitting at pre-cascade positions while
+    /// windows visibly move away — the "lag" the user reported.
+    var pulseDuration: TimeInterval { PulseTuning.totalDuration }
 
     /// Start a fresh single-pulse animation around the given rects.
     /// Returns the generation id — pass it back to `dismiss(generation:)`
