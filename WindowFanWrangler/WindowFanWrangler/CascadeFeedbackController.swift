@@ -41,25 +41,34 @@ import Foundation
 import os
 
 /// Shape of the acknowledgement pulse. Same expand-then-shrink and
-/// alpha-fade shape as `PlotOverlay`'s selection pulse, but shorter —
-/// the pulse should feel like it happens BEFORE cascade motion, not
-/// alongside it. On a fast Cascade (Zoom closed) the observed
-/// shortcut→firstWrite is ~225ms; targeting ~150ms total pulse leaves
-/// the acknowledgement fully complete before real window movement
-/// begins on the fast path, while still giving the eye enough frames
-/// to read the expand-then-shrink curve as smooth. On slow Cascade
-/// (Zoom open, ~1.5s) the pulse still fires-and-forgets exactly the
-/// same way — user sees prompt acknowledgement, then waits for the
-/// external AX to unblock.
+/// alpha-fade shape as `PlotOverlay`'s selection pulse.
+///
+/// The shortcut handler delays Cascade dispatch by exactly this
+/// pulse duration, so the pulse-then-cascade sequence is:
+///
+///   t=0        shortcut received, pulse begins
+///   t=0.25s    pulse completes, cascade dispatch begins
+///   t=0.25s+E  cascade first frame write (E = enumeration/planning)
+///
+/// The ~250ms pulse is bounded above the "choppy" threshold (~180ms
+/// was still borderline at 60fps) and below the "feels slow" threshold
+/// (~300ms felt draggy in earlier tuning). At 60fps that's ~15 frames
+/// — smooth to the eye — and matches Plot's selection pulse (0.28s)
+/// closely enough that both feedback surfaces share pacing.
+///
+/// The extra pre-cascade time also gives macOS a small settling
+/// window (modifier key release completes, recently-activated app's
+/// AX proxy has a moment to warm up, WindowServer is idle). Whether
+/// this materially improves reliability is speculative — the primary
+/// motivation is animation smoothness — but if it helps at all, it's
+/// free.
 private enum PulseTuning {
-    /// Total pulse duration in seconds. Chosen to complete visibly
-    /// before the fast-path shortcut→firstWrite (~225ms) so the
-    /// pulse and real window motion don't overlap on the good case.
-    /// At 60fps that's ~9 frames — enough to read the expand curve
-    /// as a smooth pop rather than a step.
-    static let totalDuration: TimeInterval = 0.15
-    /// Peak outward expansion in points. Unchanged from the prior
-    /// tuning — visual character stays identical, only speed changes.
+    /// Total pulse duration in seconds. Also the delay applied before
+    /// Cascade dispatch, so the pulse fully completes before window
+    /// motion begins.
+    static let totalDuration: TimeInterval = 0.25
+    /// Peak outward expansion in points. Unchanged — visual character
+    /// stays identical across duration tunings.
     static let expandPoints: CGFloat = 6
     /// Timer tick — ~60fps redraw while the pulse is on screen. Cheap
     /// because each panel only redraws its own small content region.
