@@ -128,7 +128,7 @@ Distribution pipeline is now in place. Full list:
 4. **Notarization** — ✅ **enabled**. `scripts/notarize.sh` submits DMG + PKG to Apple's notary service using a keychain profile named `window-wrangler-notary` (set up once via `xcrun notarytool store-credentials`; no credentials in the repo).
 5. **Hardened Runtime** — ✅ enforced on the signed .app. `codesign -dv` reports `Runtime Version=…` + `Authority=Developer ID Application`.
 6. **Entitlements**:
-   - ✅ `com.apple.security.automation.apple-events` — declared in `WindowFanWrangler/WindowWrangler.entitlements`.
+   - ✅ `com.apple.security.automation.apple-events` — declared in `WindowWrangler/WindowWrangler/WindowWrangler.entitlements`.
    - ✅ **No Hardened Runtime exception entitlements** (verified by `scripts/release.sh`).
    - ✅ **App Sandbox intentionally absent** — sandbox breaks cross-app AX; unsandboxed is a permanent architectural constraint.
    - ✅ **`get-task-allow` absent from Release** — Xcode's Distribute App flow strips it automatically; `scripts/release.sh` verifies absence.

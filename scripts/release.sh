@@ -49,7 +49,7 @@ readonly BUNDLE_ID="com.jmw3.WindowWrangler"
 readonly APP_NAME="Window Wrangler"
 
 readonly REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-readonly XCODEPROJ="${REPO_ROOT}/WindowFanWrangler/WindowWrangler.xcodeproj"
+readonly XCODEPROJ="${REPO_ROOT}/WindowWrangler/WindowWrangler.xcodeproj"
 readonly SCHEME="WindowWrangler"
 
 readonly DIST_DIR="${REPO_ROOT}/dist"

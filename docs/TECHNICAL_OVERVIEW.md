@@ -27,7 +27,7 @@ macOS window management utility. Sits alongside apps like Rectangle, Magnet, Moo
 - **User-facing name:** Window Wrangler
 - **Bundle identifier:** `com.jmw3.WindowWrangler`
 - **GitHub repo:** `WindowWrangler`
-- **Local folder / Xcode target:** `WindowFan` / `WindowFanWrangler` (legacy from an earlier working name; a handoff developer can rename during production polish)
+- **Xcode project + source folder + test target:** `WindowWrangler` / `WindowWranglerTests` (matches product name). Outermost repo folder is still `WindowFan/` for legacy reasons — filesystem-only, no code depends on it.
 
 Any customer-facing surface uses "Window Wrangler."
 
@@ -299,7 +299,7 @@ TabInfo {
 
 - **Not sandboxed** and will remain so. The app runs outside App Sandbox because sandboxed apps cannot read other apps' windows via AX. `ENABLE_APP_SANDBOX = NO` is set on both Debug and Release configurations and the entitlements file deliberately omits `com.apple.security.app-sandbox`. This is an intentional architectural constraint, not an oversight.
 - **Hardened Runtime is enabled** on both Debug and Release configurations (`ENABLE_HARDENED_RUNTIME = YES`). Verification on ad-hoc-signed Release builds shows `codesign` flags `0x10002(adhoc,runtime)` — the `runtime` bit is active. Under Xcode's dev ad-hoc signing on Debug, Xcode auto-emits `"Disabling hardened runtime with ad-hoc codesigning"`; that's an Apple-imposed dev-only relaxation and does not affect a real Developer ID / notarization build.
-- **Entitlements file:** `WindowFanWrangler/WindowWrangler.entitlements` — declares only `com.apple.security.automation.apple-events = true`. No Hardened Runtime exception entitlements (no `disable-library-validation`, no `allow-jit`, no `allow-unsigned-executable-memory`, no `allow-dyld-environment-variables`). If notarization ever refuses the app, the correct response is to investigate the specific cause, not to add exception entitlements.
+- **Entitlements file:** `WindowWrangler/WindowWrangler/WindowWrangler.entitlements` — declares only `com.apple.security.automation.apple-events = true`. No Hardened Runtime exception entitlements (no `disable-library-validation`, no `allow-jit`, no `allow-unsigned-executable-memory`, no `allow-dyld-environment-variables`). If notarization ever refuses the app, the correct response is to investigate the specific cause, not to add exception entitlements.
 - **`NSAppleEventsUsageDescription`** in `Info.plist` explains why the app requests Automation permission. Sourced via `INFOPLIST_KEY_NSAppleEventsUsageDescription` build setting; the wording is a product decision.
 - **`get-task-allow` in Release**: Xcode's automatic dev-team ad-hoc signing leaves `get-task-allow = true` in place on both Debug AND Release builds — this is Xcode's development-signing default, not a project setting. Xcode's Archive → Distribute App flow strips `get-task-allow` when signing with a real Developer ID certificate. Confirm absence on the final notarized artifact via `codesign -d --entitlements :- <path>`.
 - **Not distributable via Mac App Store** — MAS requires sandbox, which breaks cross-app AX. Developer ID + direct distribution is the only viable path.
@@ -362,7 +362,7 @@ Where the app sits between "runs on my machine" and "shippable to strangers."
 - Every claimed feature works in that environment.
 - **Developer ID Application signed** (`7V4AJFNJKM`, Northstar-Purpose Enterprises LLC) via `scripts/release.sh` — produces `dist/WindowWrangler-<version>.dmg` (DMG signed with Developer ID Application) and `dist/WindowWrangler-<version>.pkg` (installer signed with Developer ID Installer).
 - **Hardened Runtime enforced** — signed .app reports `Authority=Developer ID Application` + `Runtime Version=…` + `Timestamp=…` (secure).
-- **`com.apple.security.automation.apple-events` entitlement** wired to the app target via `WindowFanWrangler/WindowWrangler.entitlements`.
+- **`com.apple.security.automation.apple-events` entitlement** wired to the app target via `WindowWrangler/WindowWrangler/WindowWrangler.entitlements`.
 - **No Hardened Runtime exception entitlements** declared (no `disable-library-validation`, no `allow-jit`, no `allow-unsigned-executable-memory`, no `allow-dyld-environment-variables`, no `disable-executable-page-protection`). Xcode's Distribute App flow strips `get-task-allow` from the release .app automatically.
 - **App Sandbox intentionally absent** — unchanged architectural constraint.
 - **Notarized + stapled** via `scripts/notarize.sh` (uses a notarytool keychain profile named `window-wrangler-notary`; no credentials in the repo).
