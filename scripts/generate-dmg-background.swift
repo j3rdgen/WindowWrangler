@@ -48,10 +48,12 @@ NSColor(calibratedWhite: 0.97, alpha: 1.0).setFill()
 NSRect(x: 0, y: 0, width: width, height: height).fill()
 
 // Arrow from app-icon-side to Applications-icon-side.
-// Icon centers are at (140, 180) and (500, 180).
-// Arrow shaft sits between them at y=180, leaving ~60pt gap
+// Icon centers are at (140, 230) and (500, 230) in Cocoa
+// coordinates from bottom (icons drawn by Finder at AppleScript
+// top-left y=130, so vertical center = 360-130 = 230 in Cocoa).
+// Arrow shaft sits between them at y=230, leaving ~60pt gap
 // around each icon so the arrow doesn't overlap the icon glyphs.
-let arrowY: CGFloat = 180
+let arrowY: CGFloat = 230
 let arrowStart: CGFloat = 210
 let arrowEnd: CGFloat = 430
 let arrowHeadSize: CGFloat = 14
