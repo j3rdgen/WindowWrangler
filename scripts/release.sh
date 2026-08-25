@@ -230,20 +230,103 @@ ${sig_info}"
 build_dmg() {
     DMG_PATH="${DIST_DIR}/WindowWrangler-${VERSION}.dmg"
     local staging="${BUILD_DIR}/dmg-staging"
+    local temp_dmg="${BUILD_DIR}/temp.dmg"
+    local background_src="${REPO_ROOT}/assets/dmg-background.png"
+
     log "Building DMG at ${DMG_PATH}…"
-    rm -rf "${staging}" "${DMG_PATH}"
+    rm -rf "${staging}" "${DMG_PATH}" "${temp_dmg}"
     mkdir -p "${staging}"
+
+    # Stage: the codesigned .app, an Applications symlink for the
+    # drag-to-install UX, and the background image in a hidden folder.
     # cp -R preserves the codesigned .app bit-for-bit (ditto is
-    # equivalent; either works). Do NOT re-touch the .app after this.
+    # equivalent). Do NOT re-touch the .app after this.
     cp -R "${EXPORTED_APP}" "${staging}/"
     ln -s /Applications "${staging}/Applications"
+
+    if [[ -f "${background_src}" ]]; then
+        mkdir -p "${staging}/.background"
+        cp "${background_src}" "${staging}/.background/background.png"
+    else
+        log "WARNING: ${background_src} missing — DMG will use plain white background."
+        log "         Regenerate via: swift scripts/generate-dmg-background.swift assets/dmg-background.png"
+    fi
+
+    # Two-phase build. Phase 1: create a writable UDRW DMG so we can
+    # mount it, tell Finder to arrange the window (icon positions,
+    # background image, window bounds), and save the .DS_Store that
+    # captures those settings. Phase 2: convert to the compressed
+    # read-only UDZO format we actually ship, then sign.
+    #
+    # Size 30m is enough overhead for the .app (~1.5MB signed) + the
+    # background image + .DS_Store metadata. Undersizing here would
+    # make Finder unable to save its layout.
     hdiutil create \
         -volname "${APP_NAME}" \
         -srcfolder "${staging}" \
-        -ov \
-        -format UDZO \
-        "${DMG_PATH}" \
+        -fs HFS+ \
+        -format UDRW \
+        -size 30m \
+        "${temp_dmg}" \
         > /dev/null
+
+    # Attach RW so AppleScript can mutate Finder's view.
+    local attach_output
+    attach_output="$(hdiutil attach -readwrite -noverify -noautoopen "${temp_dmg}")"
+    local mount_point
+    mount_point="$(echo "${attach_output}" | grep -o '/Volumes/[^[:space:]]*' | tail -1)"
+    [[ -n "${mount_point}" && -d "${mount_point}" ]] \
+        || fail "Failed to determine DMG mount point"
+
+    # Apply the Finder layout ONLY if the background image is present —
+    # a bare white window is still a valid DMG, just less polished.
+    if [[ -f "${background_src}" ]]; then
+        log "Applying DMG window layout via Finder AppleScript…"
+        # Icon coordinates chosen to line up under the arrow drawn by
+        # scripts/generate-dmg-background.swift: app at (140, 180),
+        # Applications at (500, 180), inside a 640×360 window.
+        # AppleScript uses top-left window bounds; icon positions are
+        # relative to the window content, top-left origin. First-run
+        # invocation of Finder scripting will prompt for Automation
+        # permission — grant it once and it persists for future
+        # release.sh runs.
+        osascript <<APPLESCRIPT
+tell application "Finder"
+    tell disk "${APP_NAME}"
+        open
+        set current view of container window to icon view
+        set toolbar visible of container window to false
+        set statusbar visible of container window to false
+        set the bounds of container window to {200, 120, 840, 480}
+        set viewOptions to the icon view options of container window
+        set arrangement of viewOptions to not arranged
+        set icon size of viewOptions to 128
+        set background picture of viewOptions to file ".background:background.png"
+        set position of item "${APP_NAME}.app" of container window to {140, 180}
+        set position of item "Applications" of container window to {500, 180}
+        close
+        open
+        update without registering applications
+        delay 1
+    end tell
+end tell
+APPLESCRIPT
+        # Give Finder a beat to flush .DS_Store to the mounted volume
+        # before we detach — otherwise the layout can be lost.
+        sync
+        sleep 1
+    fi
+
+    hdiutil detach "${mount_point}" > /dev/null \
+        || fail "Failed to detach ${mount_point}"
+
+    # Phase 2: convert to compressed read-only shipping format.
+    hdiutil convert "${temp_dmg}" \
+        -format UDZO \
+        -imagekey zlib-level=9 \
+        -o "${DMG_PATH}" \
+        > /dev/null
+    rm -f "${temp_dmg}"
 
     log "Signing DMG with Developer ID Application…"
     codesign --sign "${APPLICATION_IDENTITY}" --timestamp "${DMG_PATH}"
