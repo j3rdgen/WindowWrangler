@@ -82,9 +82,14 @@ let captionAttributes: [NSAttributedString.Key: Any] = [
 ]
 let captionString = NSAttributedString(string: caption, attributes: captionAttributes)
 let captionSize = captionString.size()
+// Caption baseline y measured from the bottom of the 640×360 window.
+// Bottom edge of the 128pt icons sits near y=116; icon labels add
+// another ~25pt beneath. Caption at y=45 leaves ~46pt of breathing
+// room above and ~45pt below — visually centered in the space
+// between the icon row and the window bottom edge.
 let captionRect = NSRect(
     x: (width - captionSize.width) / 2,
-    y: 70,
+    y: 45,
     width: captionSize.width,
     height: captionSize.height
 )
