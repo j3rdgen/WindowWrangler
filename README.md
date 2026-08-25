@@ -23,7 +23,7 @@ open WindowWrangler/WindowWrangler.xcodeproj
 
 The project uses Xcode's synchronized file-system group — new `.swift` files in `WindowWrangler/WindowWrangler/` are auto-picked up without editing the `.pbxproj`.
 
-The bundle identifier is `com.jmw3.WindowWrangler`. The user-facing name is **Window Wrangler**. The Xcode project, source folder, test target, and inner container are all named `WindowWrangler` / `WindowWranglerTests` — matching the product name. The only remaining legacy path is the outermost repo folder itself (`WindowFan/`), which is a filesystem-only rename that touches no code.
+The bundle identifier is `com.jmw3.WindowWrangler`. The user-facing name is **Window Wrangler**. The repo folder, Xcode project, source folder, and test target are all named `WindowWrangler` / `WindowWranglerTests` — matching the product name throughout.
 
 ## First launch
 
