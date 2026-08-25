@@ -180,7 +180,7 @@ Codebase is organized around strict separation of concerns:
 - **UI modules** render dedicated pieces (`SelectionOverlay`, `LassoModeHint`, `PlotOverlay`, `PlotModeHint`, `CorralNamePill`, `CorralReleaseMenu`, `CorralToast`, `MenuBuilder`, `OnboardingWindowController`).
 - **App shell** wires everything together (`WindowWranglerApp`, `WindowWranglerActions`, `GlobalShortcuts`, `MenuBarIcon`).
 
-~35 Swift source files, ~9,500 lines of code, plus a `Window WranglerTests` target with 7 test files and 96 currently-passing XCTest cases (see §12.3).
+~35 Swift source files, ~9,500 lines of code, plus a `WindowWranglerTests` target with 7 test files and 96 currently-passing XCTest cases (see §12.3).
 
 ### 3.3 Coordinate spaces
 
@@ -702,7 +702,7 @@ Menu-bar toggle wires `SMAppService.mainApp.register()`. Managed via the standar
 ### 12.5 Repo state
 
 - **~35 Swift source files** in the app target, ~10,500 LOC.
-- **Single Xcode project**, one app target + one test target (`Window WranglerTests`) with 141 passing XCTest cases.
+- **Single Xcode project**, one app target + one test target (`WindowWranglerTests`) with 141 passing XCTest cases.
 - **git tag `MVP-1.0`** anchors the MVP shippable state at commit `55b6807`. Follow-on work lives on branch `cascade-flicker-refinement`; current head as of this document is `5c8b90b` (Plot cursor hit-test AX fallback), preceded by `d7086e8` (three-round Cascade z-order flicker refinement).
 - **git remote:** `origin` → private GitHub repo. Local commits are pushed after each substantial change.
 - **No external dependencies** — pure Foundation + AppKit + ApplicationServices + ServiceManagement. No CocoaPods, no Swift Package Manager dependencies, no Carthage.

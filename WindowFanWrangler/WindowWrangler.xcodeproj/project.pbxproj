@@ -12,24 +12,24 @@
 			containerPortal = 5E437F0B2FC604C500F0B093 /* Project object */;
 			proxyType = 1;
 			remoteGlobalIDString = 5E437F122FC604C500F0B093;
-			remoteInfo = WindowFanWrangler;
+			remoteInfo = WindowWrangler;
 		};
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
-		5E437F132FC604C500F0B093 /* WindowFanWrangler.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; name = WindowFanWrangler.app; path = "Window Wrangler.app"; sourceTree = BUILT_PRODUCTS_DIR; };
-		5E437FA12FD0B9A600F0B093 /* Window WranglerTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "Window WranglerTests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
+		5E437F132FC604C500F0B093 /* Window Wrangler.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Window Wrangler.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		5E437FA12FD0B9A600F0B093 /* WindowWranglerTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = WindowWranglerTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
-		5E437F152FC604C500F0B093 /* WindowFanWrangler */ = {
+		5E437F152FC604C500F0B093 /* WindowWrangler */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
-			path = WindowFanWrangler;
+			path = WindowWrangler;
 			sourceTree = "<group>";
 		};
-		5E437FA22FD0B9A600F0B093 /* Window WranglerTests */ = {
+		5E437FA22FD0B9A600F0B093 /* WindowWranglerTests */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
-			path = "Window WranglerTests";
+			path = WindowWranglerTests;
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
@@ -55,8 +55,8 @@
 		5E437F0A2FC604C500F0B093 = {
 			isa = PBXGroup;
 			children = (
-				5E437F152FC604C500F0B093 /* WindowFanWrangler */,
-				5E437FA22FD0B9A600F0B093 /* Window WranglerTests */,
+				5E437F152FC604C500F0B093 /* WindowWrangler */,
+				5E437FA22FD0B9A600F0B093 /* WindowWranglerTests */,
 				5E437F142FC604C500F0B093 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -64,8 +64,8 @@
 		5E437F142FC604C500F0B093 /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				5E437F132FC604C500F0B093 /* WindowFanWrangler.app */,
-				5E437FA12FD0B9A600F0B093 /* Window WranglerTests.xctest */,
+				5E437F132FC604C500F0B093 /* Window Wrangler.app */,
+				5E437FA12FD0B9A600F0B093 /* WindowWranglerTests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -73,9 +73,9 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
-		5E437F122FC604C500F0B093 /* WindowFanWrangler */ = {
+		5E437F122FC604C500F0B093 /* WindowWrangler */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = 5E437F1E2FC604C600F0B093 /* Build configuration list for PBXNativeTarget "WindowFanWrangler" */;
+			buildConfigurationList = 5E437F1E2FC604C600F0B093 /* Build configuration list for PBXNativeTarget "WindowWrangler" */;
 			buildPhases = (
 				5E437F0F2FC604C500F0B093 /* Sources */,
 				5E437F102FC604C500F0B093 /* Frameworks */,
@@ -86,18 +86,18 @@
 			dependencies = (
 			);
 			fileSystemSynchronizedGroups = (
-				5E437F152FC604C500F0B093 /* WindowFanWrangler */,
+				5E437F152FC604C500F0B093 /* WindowWrangler */,
 			);
-			name = WindowFanWrangler;
+			name = WindowWrangler;
 			packageProductDependencies = (
 			);
-			productName = WindowFanWrangler;
-			productReference = 5E437F132FC604C500F0B093 /* WindowFanWrangler.app */;
+			productName = WindowWrangler;
+			productReference = 5E437F132FC604C500F0B093 /* Window Wrangler.app */;
 			productType = "com.apple.product-type.application";
 		};
-		5E437FA02FD0B9A600F0B093 /* Window WranglerTests */ = {
+		5E437FA02FD0B9A600F0B093 /* WindowWranglerTests */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = 5E437FA72FD0B9A600F0B093 /* Build configuration list for PBXNativeTarget "Window WranglerTests" */;
+			buildConfigurationList = 5E437FA72FD0B9A600F0B093 /* Build configuration list for PBXNativeTarget "WindowWranglerTests" */;
 			buildPhases = (
 				5E437F9D2FD0B9A600F0B093 /* Sources */,
 				5E437F9E2FD0B9A600F0B093 /* Frameworks */,
@@ -109,13 +109,13 @@
 				5E437FA62FD0B9A600F0B093 /* PBXTargetDependency */,
 			);
 			fileSystemSynchronizedGroups = (
-				5E437FA22FD0B9A600F0B093 /* Window WranglerTests */,
+				5E437FA22FD0B9A600F0B093 /* WindowWranglerTests */,
 			);
-			name = "Window WranglerTests";
+			name = WindowWranglerTests;
 			packageProductDependencies = (
 			);
-			productName = "Window WranglerTests";
-			productReference = 5E437FA12FD0B9A600F0B093 /* Window WranglerTests.xctest */;
+			productName = WindowWranglerTests;
+			productReference = 5E437FA12FD0B9A600F0B093 /* WindowWranglerTests.xctest */;
 			productType = "com.apple.product-type.bundle.unit-test";
 		};
 /* End PBXNativeTarget section */
@@ -137,7 +137,7 @@
 					};
 				};
 			};
-			buildConfigurationList = 5E437F0E2FC604C500F0B093 /* Build configuration list for PBXProject "WindowFanWrangler" */;
+			buildConfigurationList = 5E437F0E2FC604C500F0B093 /* Build configuration list for PBXProject "WindowWrangler" */;
 			developmentRegion = en;
 			hasScannedForEncodings = 0;
 			knownRegions = (
@@ -151,8 +151,8 @@
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
-				5E437F122FC604C500F0B093 /* WindowFanWrangler */,
-				5E437FA02FD0B9A600F0B093 /* Window WranglerTests */,
+				5E437F122FC604C500F0B093 /* WindowWrangler */,
+				5E437FA02FD0B9A600F0B093 /* WindowWranglerTests */,
 			);
 		};
 /* End PBXProject section */
@@ -194,7 +194,7 @@
 /* Begin PBXTargetDependency section */
 		5E437FA62FD0B9A600F0B093 /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
-			target = 5E437F122FC604C500F0B093 /* WindowFanWrangler */;
+			target = 5E437F122FC604C500F0B093 /* WindowWrangler */;
 			targetProxy = 5E437FA52FD0B9A600F0B093 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
@@ -323,7 +323,7 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
-				CODE_SIGN_ENTITLEMENTS = WindowFanWrangler/WindowWrangler.entitlements;
+				CODE_SIGN_ENTITLEMENTS = WindowWrangler/WindowWrangler.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
@@ -358,7 +358,7 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
-				CODE_SIGN_ENTITLEMENTS = WindowFanWrangler/WindowWrangler.entitlements;
+				CODE_SIGN_ENTITLEMENTS = WindowWrangler/WindowWrangler.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
@@ -397,7 +397,7 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 26.5;
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "com.jmw3.Window-WranglerTests";
+				PRODUCT_BUNDLE_IDENTIFIER = "com.jmw3.WindowWranglerTests";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = NO;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
@@ -417,7 +417,7 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 26.5;
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "com.jmw3.Window-WranglerTests";
+				PRODUCT_BUNDLE_IDENTIFIER = "com.jmw3.WindowWranglerTests";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = NO;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
@@ -431,7 +431,7 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
-		5E437F0E2FC604C500F0B093 /* Build configuration list for PBXProject "WindowFanWrangler" */ = {
+		5E437F0E2FC604C500F0B093 /* Build configuration list for PBXProject "WindowWrangler" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				5E437F1C2FC604C600F0B093 /* Debug */,
@@ -440,7 +440,7 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		5E437F1E2FC604C600F0B093 /* Build configuration list for PBXNativeTarget "WindowFanWrangler" */ = {
+		5E437F1E2FC604C600F0B093 /* Build configuration list for PBXNativeTarget "WindowWrangler" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				5E437F1F2FC604C600F0B093 /* Debug */,
@@ -449,7 +449,7 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		5E437FA72FD0B9A600F0B093 /* Build configuration list for PBXNativeTarget "Window WranglerTests" */ = {
+		5E437FA72FD0B9A600F0B093 /* Build configuration list for PBXNativeTarget "WindowWranglerTests" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				5E437FA82FD0B9A600F0B093 /* Debug */,

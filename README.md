@@ -18,12 +18,12 @@ A macOS menu-bar utility for arranging windows across apps. Cascade every visibl
 Open the project in Xcode and press **⌘R**:
 
 ```
-open WindowFanWrangler/WindowFanWrangler.xcodeproj
+open WindowFanWrangler/WindowWrangler.xcodeproj
 ```
 
-The project uses Xcode's synchronized file-system group — new `.swift` files in `WindowFanWrangler/WindowFanWrangler/` are auto-picked up without editing the `.pbxproj`.
+The project uses Xcode's synchronized file-system group — new `.swift` files in `WindowFanWrangler/WindowWrangler/` are auto-picked up without editing the `.pbxproj`.
 
-The bundle identifier is `com.jmw3.WindowWrangler`. The user-facing name is **Window Wrangler**. The GitHub repo is `WindowWrangler`; the local folder and Xcode target names still say `WindowFan` / `WindowFanWrangler` for legacy reasons (a handoff developer can collapse these during production polish).
+The bundle identifier is `com.jmw3.WindowWrangler`. The user-facing name is **Window Wrangler**. The Xcode project, source folder, and test target are all now named `WindowWrangler` / `WindowWranglerTests` — matching the product name. The one remaining legacy path is the outermost repo folder `WindowFan/` and the `.xcodeproj`'s enclosing folder `WindowFanWrangler/`; those are safe filesystem-only renames a handoff developer can do without touching any code.
 
 ## First launch
 

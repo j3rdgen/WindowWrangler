@@ -240,7 +240,7 @@ The lasso overlay draws in Cocoa space (that's what NSPanel and NSView use). The
 
 ## Testing
 
-**141 tests currently passing**, all XCTest, running under the `Window WranglerTests` target (Xcode filesystem-synchronized group — new test files in that folder are auto-picked up). Coverage is on the pure-geometry / pure-decision modules; the orchestrators remain user-validated through Console logs.
+**141 tests currently passing**, all XCTest, running under the `WindowWranglerTests` target (Xcode filesystem-synchronized group — new test files in that folder are auto-picked up). Coverage is on the pure-geometry / pure-decision modules; the orchestrators remain user-validated through Console logs.
 
 Current test files:
 
