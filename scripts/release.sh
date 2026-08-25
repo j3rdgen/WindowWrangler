@@ -95,6 +95,16 @@ check_certs() {
 
 check_clean_tree() {
     log "Verifying git tree is clean (no uncommitted TRACKED changes)…"
+    # Refresh the stat cache first — otherwise `git diff-index` can
+    # false-positive on files whose content is identical but whose
+    # mtime changed (e.g., after a checkout, a rebuild that re-touched
+    # tracked files, or hdiutil operations on staged folders). Without
+    # this, release.sh would occasionally fail with "TRACKED changes"
+    # on a truly-clean tree until the operator ran `git status` by
+    # hand. `--refresh` writes the updated stat cache and prints
+    # nothing for clean files.
+    git -C "${REPO_ROOT}" update-index --refresh > /dev/null 2>&1 || true
+
     # `git diff-index HEAD --` catches modifications to tracked files
     # (staged or unstaged) but ignores untracked files. That's the
     # distinction that matters for a release: mid-edit changes to code
