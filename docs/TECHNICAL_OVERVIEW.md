@@ -360,35 +360,37 @@ Where the app sits between "runs on my machine" and "shippable to strangers."
 
 - Builds and runs from Xcode on the developer's Mac.
 - Every claimed feature works in that environment.
-- Ad-hoc signed by Xcode's automatic dev signing.
-- **Hardened Runtime enabled** on Debug + Release build settings; verified active on ad-hoc-signed Release (`codesign` flags = `0x10002(adhoc,runtime)`).
+- **Developer ID Application signed** (`7V4AJFNJKM`, Northstar-Purpose Enterprises LLC) via `scripts/release.sh` — produces `dist/WindowWrangler-<version>.dmg` (DMG signed with Developer ID Application) and `dist/WindowWrangler-<version>.pkg` (installer signed with Developer ID Installer).
+- **Hardened Runtime enforced** — signed .app reports `Authority=Developer ID Application` + `Runtime Version=…` + `Timestamp=…` (secure).
 - **`com.apple.security.automation.apple-events` entitlement** wired to the app target via `WindowFanWrangler/WindowWrangler.entitlements`.
-- **No Hardened Runtime exception entitlements** declared (no `disable-library-validation`, no `allow-jit`, etc.).
-- App Sandbox intentionally absent — unchanged architectural constraint.
+- **No Hardened Runtime exception entitlements** declared (no `disable-library-validation`, no `allow-jit`, no `allow-unsigned-executable-memory`, no `allow-dyld-environment-variables`, no `disable-executable-page-protection`). Xcode's Distribute App flow strips `get-task-allow` from the release .app automatically.
+- **App Sandbox intentionally absent** — unchanged architectural constraint.
+- **Notarized + stapled** via `scripts/notarize.sh` (uses a notarytool keychain profile named `window-wrangler-notary`; no credentials in the repo).
+- **PPPC deployment profiles** for MDM-managed fleets: `deployment/WindowWrangler-Accessibility-PPPC.mobileconfig` (pre-approves Accessibility) and `deployment/WindowWrangler-AppleEvents-PPPC.mobileconfig` (pre-approves Automation for Google Chrome + Safari; other supported browsers documented in [PPPC-AppleEvents-Receiver-Requirements.md](../deployment/PPPC-AppleEvents-Receiver-Requirements.md)).
 - Accessibility + Automation permission flows behave correctly.
 
-### 8.2 Gaps between prototype and shippable production
+### 8.2 Distribution artifacts + pipeline
 
-**Code signing and identity.**
-- Currently: ad-hoc signed with Hardened Runtime settings in place. Xcode's dev ad-hoc signing does not fully validate Hardened Runtime; a real Developer ID cert will.
-- Production needs: Developer ID Application certificate from Apple Developer Program membership ($99/year), a stable Team ID that TCC keys against permanently.
+The release pipeline lives in two scripts that fail closed on any error:
 
-**Notarization.**
-- Currently: not notarized.
-- Production needs: notarized via Apple's automated malware scan. Required for Gatekeeper to allow distribution to non-development-team users without ⌃-click bypass. **After the first real Developer ID / notarized build, Accessibility and Apple Events permissions MUST be re-tested** — the signing identity change fragments TCC's per-signature records, so users (including the developer on their own machine) may need to re-grant permissions once.
+- `scripts/release.sh` — offline half. Certificate check → clean-tree check → xcodebuild archive → export → codesign verification (Authority, Team ID, Hardened Runtime, secure timestamp, apple-events entitlement, absence of app-sandbox / get-task-allow / runtime exceptions) → DMG (signed with Developer ID Application) → PKG (signed with Developer ID Installer) → SHA-256 checksums → verification report in `dist/release-verification.txt`.
+- `scripts/notarize.sh` — network half. notarytool keychain-profile check → submit DMG + PKG to Apple's notary service → wait for Accepted → staple → validate → Gatekeeper assessment (spctl / pkgutil) → verify the .app inside the mounted DMG → append notarization results to the verification report.
 
-**Entitlements review.**
-- Currently: `com.apple.security.automation.apple-events` (added for external-browser Automation). No other exception entitlements declared.
-- Production may need: Full Disk Access entitlement (to eliminate the Files & Folders TCC prompts on document restore for macOS Sequoia+). Requires Apple's manual review and justification.
-- Xcode's automatic dev-team ad-hoc signing leaves `com.apple.security.get-task-allow = true` on the local build; Xcode's Archive → Distribute App flow strips this when signing with the real Developer ID cert. Verify absence on the final notarized artifact via `codesign -d --entitlements :- <path>`.
+Both scripts hard-code the Team ID `7V4AJFNJKM` and organization name; changing the enrolled Apple Developer team means updating both. Credentials are never in the repo — notarytool auth is a login-keychain profile the operator sets up once via `xcrun notarytool store-credentials`.
 
-**Distribution channel.**
-- Currently: none. No installer, no DMG, no website.
-- Production paths available:
-  - **Direct download** — DMG or zip hosted on a website. Requires notarization for Gatekeeper acceptance. Simplest path for a paid utility.
-  - **Homebrew Cask** — community distribution channel. Requires public repo + notarized binary.
-  - **Mac App Store** — NOT VIABLE with current architecture. MAS requires app sandbox; sandboxed apps cannot read other apps' windows via AX. Adopting MAS would require gutting the cross-app functionality.
-  - **Setapp** — subscription bundle for Mac utilities. Requires their curation process.
+### 8.3 Remaining production polish (not blocking distribution)
+
+- **Full Disk Access entitlement** — currently deferred. Adding it would eliminate the macOS Sequoia+ "Files & Folders" TCC prompts that appear when Corral Recall restores saved documents from `~/Documents` / `~/Desktop` / `~/Downloads`. Requires Apple's manual review + justification. Not blocking direct distribution; adds polish for heavy Corral users.
+- **Auto-update mechanism** — currently absent. Sparkle (or equivalent) + a manifest served from a website would let installed users receive updates without redistributing PKGs. Not required for the first shipped release; users update by installing the newer PKG manually.
+- **Website + support surface** — currently absent. Not blocking distribution to direct customers who receive the DMG through other channels; required before public listing.
+
+### 8.4 Distribution channels available now
+
+- **Direct download** — DMG or PKG hosted anywhere. Gatekeeper accepts silently thanks to notarization + stapling.
+- **Enterprise MDM** — PKG + PPPC profiles land through any major MDM (Jamf / Kandji / Intune / Mosyle). Instructions in [deployment/MDM-DEPLOYMENT.md](../deployment/MDM-DEPLOYMENT.md).
+- **Homebrew Cask** — supported once a public repo hosts the notarized artifacts.
+- **Mac App Store** — NOT VIABLE and will not become viable. MAS requires app sandbox; sandboxed apps cannot read other apps' windows via AX. This is an intentional architectural boundary, not an oversight.
+- **Setapp** — possible if the curation process is pursued; artifact format is already compatible.
 
 **Update mechanism.**
 - Currently: none. Rebuild from Xcode.

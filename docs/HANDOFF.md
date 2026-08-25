@@ -120,26 +120,44 @@ Bundle identifier is `com.jmw3.WindowWrangler`. Change it to your Team's namespa
 
 ### What production would require
 
-Some of this is now in place. Full list:
+Distribution pipeline is now in place. Full list:
 
-1. **Developer ID or Apple Distribution certificate** for stable code signing. *(Still needed — the ad-hoc dev signing does not produce a distributable artifact.)*
-2. **Team ID** — anchors TCC records to a persistent identity so grants survive rebuilds. *(Comes with the Developer ID cert.)*
-3. **Notarization** — Apple's automated malware scan; required for Gatekeeper to allow the app on other users' machines without ⌃-click bypass. *(Still needed.)*
-4. **Hardened Runtime** — ✅ **enabled** on both Debug and Release build settings. Verified active on ad-hoc-signed Release (`codesign` flags = `0x10002(adhoc,runtime)`). Xcode auto-emits `"Disabling hardened runtime with ad-hoc codesigning"` on Debug — that's an Apple dev-only relaxation, not a build issue.
-5. **Entitlements**:
-   - ✅ `com.apple.security.automation.apple-events` — declared in `WindowFanWrangler/WindowWrangler.entitlements`, wired via the app target's `CODE_SIGN_ENTITLEMENTS` build setting.
-   - ✅ **No Hardened Runtime exception entitlements** (no `disable-library-validation`, `allow-jit`, `allow-unsigned-executable-memory`, `allow-dyld-environment-variables`, `disable-executable-page-protection`).
+1. **Developer ID Application certificate** — ✅ **installed** (`Northstar-Purpose Enterprises LLC`, Team ID `7V4AJFNJKM`).
+2. **Developer ID Installer certificate** — ✅ **installed** (same identity).
+3. **Team ID** — ✅ `7V4AJFNJKM`. TCC now keys grants against this persistent identity; grants survive every rebuild through `scripts/release.sh`.
+4. **Notarization** — ✅ **enabled**. `scripts/notarize.sh` submits DMG + PKG to Apple's notary service using a keychain profile named `window-wrangler-notary` (set up once via `xcrun notarytool store-credentials`; no credentials in the repo).
+5. **Hardened Runtime** — ✅ enforced on the signed .app. `codesign -dv` reports `Runtime Version=…` + `Authority=Developer ID Application`.
+6. **Entitlements**:
+   - ✅ `com.apple.security.automation.apple-events` — declared in `WindowFanWrangler/WindowWrangler.entitlements`.
+   - ✅ **No Hardened Runtime exception entitlements** (verified by `scripts/release.sh`).
    - ✅ **App Sandbox intentionally absent** — sandbox breaks cross-app AX; unsandboxed is a permanent architectural constraint.
-   - **Full Disk Access** — not requested. If the Files & Folders TCC prompts on document restore for Sequoia+ become a support issue, this can be added, but requires Apple's manual review.
-6. **`NSAppleEventsUsageDescription`** — present in `Info.plist` via `INFOPLIST_KEY_NSAppleEventsUsageDescription` build setting. Wording is a product decision; do not modify without explicit intent.
-7. **MAS distribution** requires sandbox, which would break cross-app AX. Not a viable path; Developer ID + direct distribution is the only route.
+   - ✅ **`get-task-allow` absent from Release** — Xcode's Distribute App flow strips it automatically; `scripts/release.sh` verifies absence.
+   - **Full Disk Access** — not requested. Adding it would eliminate the Sequoia+ "Files & Folders" TCC prompts during Corral Recall. Requires Apple's manual review; deferred.
+7. **`NSAppleEventsUsageDescription`** — present in `Info.plist` via `INFOPLIST_KEY_NSAppleEventsUsageDescription` build setting. Wording is a product decision; do not modify without explicit intent.
+8. **PPPC profiles** — ✅ generated for enterprise MDM. `deployment/WindowWrangler-Accessibility-PPPC.mobileconfig` + `deployment/WindowWrangler-AppleEvents-PPPC.mobileconfig`. Deployment instructions in `deployment/MDM-DEPLOYMENT.md`.
+9. **MAS distribution** requires sandbox, which would break cross-app AX. Not viable and not pursued; Developer ID + direct distribution is the route.
 
-**When the real Developer ID / notarized build is produced:**
-- Re-run `codesign -d --entitlements :- <path>` on the notarized artifact and confirm `com.apple.security.get-task-allow` is absent (Xcode's Archive → Distribute flow strips it automatically).
-- Re-test Accessibility permission (may need re-grant — signature identity changed).
-- Re-test Automation permission for every supported browser (may need re-grant — signature identity changed).
-- Confirm Corral capture + Recall restore + Plot Chromium bounds + Cascade Chromium repair all work end-to-end.
-- Only after that end-to-end validation should the notarized build be considered distribution-ready.
+### Release workflow
+
+Two scripts, fail-closed:
+
+```
+scripts/release.sh    # Cert check → archive → sign → verify → DMG → PKG → checksums
+scripts/notarize.sh   # Submit → wait → staple → validate → Gatekeeper assessment
+```
+
+Artifacts land in `dist/`. Report in `dist/release-verification.txt` captures version, git commit, Team ID, identities, SHA-256s, and the designated requirement used in PPPC.
+
+### Retest checklist after a new signed / notarized release
+
+Because macOS TCC keys against the signing identity + version, changing signatures CAN fragment existing grants. After every notarized release:
+
+- Re-test Accessibility permission on the developer's own Mac (may need re-grant).
+- Re-test Automation permission for every installed supported browser (may need re-grant).
+- Confirm Corral capture + Recall restore + Plot Chromium bounds + Cascade Chromium repair work end-to-end.
+- Test the fresh DMG install on a Mac (or user account) that has never seen Window Wrangler before — validates Gatekeeper acceptance, first-run permission flow, cascade / lasso / plot / corral / recall / restore.
+- For MDM releases, validate on one managed test Mac: install PKG + push both PPPC profiles, then confirm no permission dialogs appear during normal use.
+- Only after that end-to-end validation should the release be considered shippable to end users.
 
 The distinction that matters most: **notarization gives the app a stable Team ID that TCC keys against.** Every rebuild in development changes the signature; TCC's per-signature records fragment, leading to the "granted but doesn't work" state described below. Notarized production builds have one signature that persists.
 
