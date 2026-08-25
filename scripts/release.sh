@@ -297,11 +297,15 @@ build_dmg() {
     # Automation and re-run.
     if [[ -f "${background_src}" ]]; then
         log "Applying DMG window layout via Finder AppleScript…"
-        local applescript_output applescript_status
         # Icon coordinates chosen to line up under the arrow drawn by
         # scripts/generate-dmg-background.swift: app at (140, 180),
         # Applications at (500, 180), inside a 640×360 window.
-        applescript_output="$(osascript <<APPLESCRIPT 2>&1
+        #
+        # Structured as `if <command>; then …` so `set -e` doesn't
+        # abort the script when Automation permission is denied —
+        # the `if` context suppresses the errexit for this branch.
+        local applescript_output
+        if applescript_output="$(osascript <<APPLESCRIPT 2>&1
 tell application "Finder"
     tell disk "${APP_NAME}"
         open
@@ -322,20 +326,18 @@ tell application "Finder"
     end tell
 end tell
 APPLESCRIPT
-)"
-        applescript_status=$?
-        if [[ ${applescript_status} -ne 0 ]]; then
-            log "WARNING: DMG layout AppleScript failed (exit ${applescript_status})."
+)"; then
+            # Give Finder a beat to flush .DS_Store to the mounted volume
+            # before we detach — otherwise the layout can be lost.
+            sync
+            sleep 1
+        else
+            log "WARNING: DMG layout AppleScript failed."
             log "         ${applescript_output}"
             log "         Continuing without arranged layout — DMG still installs correctly."
             log "         To enable the arrow-visual install UX: System Settings →"
             log "         Privacy & Security → Automation → your Terminal app → Finder ON,"
             log "         then re-run this script."
-        else
-            # Give Finder a beat to flush .DS_Store to the mounted volume
-            # before we detach — otherwise the layout can be lost.
-            sync
-            sleep 1
         fi
     fi
 
