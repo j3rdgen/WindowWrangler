@@ -83,13 +83,15 @@ let captionAttributes: [NSAttributedString.Key: Any] = [
 let captionString = NSAttributedString(string: caption, attributes: captionAttributes)
 let captionSize = captionString.size()
 // Caption baseline y measured from the bottom of the 640×360 window.
-// Bottom edge of the 128pt icons sits near y=116; icon labels add
-// another ~25pt beneath. Caption at y=45 leaves ~46pt of breathing
-// room above and ~45pt below — visually centered in the space
-// between the icon row and the window bottom edge.
+// Finder draws its icon labels lower than a naive geometry calculation
+// suggests (the label baseline sits closer to the caption than icon-
+// bottom + typical-gap predicts), so we push the caption down further
+// than pure math would recommend. y=25 gives ~25pt of clearance from
+// the bottom edge while still leaving visible daylight between the
+// icon labels and the caption.
 let captionRect = NSRect(
     x: (width - captionSize.width) / 2,
-    y: 45,
+    y: 25,
     width: captionSize.width,
     height: captionSize.height
 )
