@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>PayloadType</key>
+	<string>Configuration</string>
+	<key>PayloadVersion</key>
+	<integer>1</integer>
+	<key>PayloadIdentifier</key>
+	<string>com.jmw3.WindowWrangler.pppc.appleevents</string>
+	<key>PayloadUUID</key>
+	<string>39A1E771-11BF-45CE-9929-C3560598A457</string>
+	<key>PayloadDisplayName</key>
+	<string>Window Wrangler — Automation (Apple Events) Permissions</string>
+	<key>PayloadDescription</key>
+	<string>Pre-approves Automation (Apple Events) permission for Window Wrangler to send events to supported browsers. Currently covers Google Chrome (which the same signature also authorizes for Chrome Beta / Dev / Canary) and Safari. Other supported browsers (Brave, Edge, Opera, Vivaldi) need their receiver Code Requirement extracted on a Mac where the browser is installed before they can be added to this profile — see deployment/PPPC-AppleEvents-Receiver-Requirements.md.</string>
+	<key>PayloadOrganization</key>
+	<string>Northstar-Purpose Enterprises LLC</string>
+	<key>PayloadScope</key>
+	<string>System</string>
+	<key>PayloadContent</key>
+	<array>
+		<dict>
+			<key>PayloadType</key>
+			<string>com.apple.TCC.configuration-profile-policy</string>
+			<key>PayloadVersion</key>
+			<integer>1</integer>
+			<key>PayloadIdentifier</key>
+			<string>com.jmw3.WindowWrangler.pppc.appleevents.payload</string>
+			<key>PayloadUUID</key>
+			<string>0477F052-C42C-4AFB-911A-D3B972283FE1</string>
+			<key>PayloadDisplayName</key>
+			<string>Privacy Preferences Policy Control</string>
+			<key>PayloadDescription</key>
+			<string>Grants Window Wrangler Apple Events send permission to Chrome + Safari for Corral browser-tab capture / Recall restore / Plot native-bounds path / Cascade Chromium native repair.</string>
+			<key>PayloadOrganization</key>
+			<string>Northstar-Purpose Enterprises LLC</string>
+			<key>PayloadEnabled</key>
+			<true/>
+			<key>Services</key>
+			<dict>
+				<key>AppleEvents</key>
+				<array>
+					<dict>
+						<key>Identifier</key>
+						<string>com.jmw3.WindowWrangler</string>
+						<key>IdentifierType</key>
+						<string>bundleID</string>
+						<key>CodeRequirement</key>
+						<string>anchor apple generic and identifier "com.jmw3.WindowWrangler" and (certificate leaf[field.1.2.840.113635.100.6.1.9] or certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = "7V4AJFNJKM")</string>
+						<key>AEReceiverIdentifier</key>
+						<string>com.google.Chrome</string>
+						<key>AEReceiverIdentifierType</key>
+						<string>bundleID</string>
+						<key>AEReceiverCodeRequirement</key>
+						<string>(identifier "com.google.Chrome" or identifier "com.google.Chrome.beta" or identifier "com.google.Chrome.dev" or identifier "com.google.Chrome.canary") and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = EQHXZ8M8AV</string>
+						<key>Allowed</key>
+						<true/>
+						<key>Authorization</key>
+						<string>Allow</string>
+						<key>Comment</key>
+						<string>Chrome receiver requirement is Google's Team ID EQHXZ8M8AV. Note: this single Code Requirement's OR-of-identifiers also covers Chrome Beta / Dev / Canary — one entry, four channels.</string>
+					</dict>
+					<dict>
+						<key>Identifier</key>
+						<string>com.jmw3.WindowWrangler</string>
+						<key>IdentifierType</key>
+						<string>bundleID</string>
+						<key>CodeRequirement</key>
+						<string>anchor apple generic and identifier "com.jmw3.WindowWrangler" and (certificate leaf[field.1.2.840.113635.100.6.1.9] or certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = "7V4AJFNJKM")</string>
+						<key>AEReceiverIdentifier</key>
+						<string>com.apple.Safari</string>
+						<key>AEReceiverIdentifierType</key>
+						<string>bundleID</string>
+						<key>AEReceiverCodeRequirement</key>
+						<string>identifier "com.apple.Safari" and anchor apple</string>
+						<key>Allowed</key>
+						<true/>
+						<key>Authorization</key>
+						<string>Allow</string>
+						<key>Comment</key>
+						<string>Safari receiver requirement is the minimal platform-Apple anchor — Safari is bundled with macOS.</string>
+					</dict>
+				</array>
+			</dict>
+		</dict>
+	</array>
+</dict>
+</plist>

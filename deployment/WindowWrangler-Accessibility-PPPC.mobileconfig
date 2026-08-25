@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>PayloadType</key>
+	<string>Configuration</string>
+	<key>PayloadVersion</key>
+	<integer>1</integer>
+	<key>PayloadIdentifier</key>
+	<string>com.jmw3.WindowWrangler.pppc.accessibility</string>
+	<key>PayloadUUID</key>
+	<string>1F77BD97-B326-43BC-B733-D6DCDF83AE1A</string>
+	<key>PayloadDisplayName</key>
+	<string>Window Wrangler — Accessibility Permission</string>
+	<key>PayloadDescription</key>
+	<string>Pre-approves the Accessibility permission Window Wrangler requires to read and move windows across applications. Deploy via MDM to Macs where Window Wrangler is installed at /Applications/Window Wrangler.app.</string>
+	<key>PayloadOrganization</key>
+	<string>Northstar-Purpose Enterprises LLC</string>
+	<key>PayloadScope</key>
+	<string>System</string>
+	<key>PayloadContent</key>
+	<array>
+		<dict>
+			<key>PayloadType</key>
+			<string>com.apple.TCC.configuration-profile-policy</string>
+			<key>PayloadVersion</key>
+			<integer>1</integer>
+			<key>PayloadIdentifier</key>
+			<string>com.jmw3.WindowWrangler.pppc.accessibility.payload</string>
+			<key>PayloadUUID</key>
+			<string>5F4C1254-5B89-4CD4-BBD1-09BB952991FC</string>
+			<key>PayloadDisplayName</key>
+			<string>Privacy Preferences Policy Control</string>
+			<key>PayloadDescription</key>
+			<string>Grants Window Wrangler Accessibility access.</string>
+			<key>PayloadOrganization</key>
+			<string>Northstar-Purpose Enterprises LLC</string>
+			<key>PayloadEnabled</key>
+			<true/>
+			<key>Services</key>
+			<dict>
+				<key>Accessibility</key>
+				<array>
+					<dict>
+						<key>Identifier</key>
+						<string>com.jmw3.WindowWrangler</string>
+						<key>IdentifierType</key>
+						<string>bundleID</string>
+						<key>CodeRequirement</key>
+						<string>anchor apple generic and identifier "com.jmw3.WindowWrangler" and (certificate leaf[field.1.2.840.113635.100.6.1.9] or certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = "7V4AJFNJKM")</string>
+						<key>Allowed</key>
+						<true/>
+						<key>Authorization</key>
+						<string>Allow</string>
+						<key>Comment</key>
+						<string>Window Wrangler requires Accessibility to enumerate and move windows owned by other applications. Without this permission, Cascade / Lasso / Plot / Corral / Restore / Selection Cascade all fail.</string>
+					</dict>
+				</array>
+			</dict>
+		</dict>
+	</array>
+</dict>
+</plist>
