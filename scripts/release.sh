@@ -270,13 +270,18 @@ build_dmg() {
         "${temp_dmg}" \
         > /dev/null
 
-    # Attach RW so AppleScript can mutate Finder's view.
-    local attach_output
-    attach_output="$(hdiutil attach -readwrite -noverify -noautoopen "${temp_dmg}")"
+    # Attach RW so AppleScript can mutate Finder's view. Ask for a
+    # plist we can parse reliably — the plain-text output uses tabs
+    # and the mount point contains a space (/Volumes/Window Wrangler),
+    # which trips naive whitespace parsers.
+    local attach_plist
+    attach_plist="$(hdiutil attach -readwrite -noverify -noautoopen -plist "${temp_dmg}")"
     local mount_point
-    mount_point="$(echo "${attach_output}" | grep -o '/Volumes/[^[:space:]]*' | tail -1)"
+    mount_point="$(echo "${attach_plist}" \
+        | plutil -convert xml1 -o - - \
+        | xmllint --xpath "string(//key[.='mount-point']/following-sibling::string[1])" - 2>/dev/null)"
     [[ -n "${mount_point}" && -d "${mount_point}" ]] \
-        || fail "Failed to determine DMG mount point"
+        || fail "Failed to determine DMG mount point (got: '${mount_point}')"
 
     # Apply the Finder layout ONLY if the background image is present —
     # a bare white window is still a valid DMG, just less polished.
