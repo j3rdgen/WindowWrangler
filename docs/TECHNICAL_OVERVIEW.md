@@ -4,7 +4,7 @@ Comprehensive product technical profile. Read this document when you need to rea
 
 **Audience:** external AI planning agents (or human strategists) preparing business plans, marketing plans, GTM plans, ICP research, competitive positioning, or roadmap prioritization from this project. Not a developer guide; see [`HANDOFF.md`](HANDOFF.md) for that.
 
-**Currency:** as of MVP-1.0 (git tag `MVP-1.0`, commit `55b6807`, July 2026) plus a follow-on refinement pass on branch `cascade-flicker-refinement` (through commit `5c8b90b`, August 2026) that added **Plot Mode**, **Chromium native-bounds transport**, the **bounded z-order settlement pipeline** with its subsequent three-round refinement (**observation-starvation escalation** + **pass-4 observe-first with progress-gated walk #2** + **two-phase correction ownership with a geometry-quiescence barrier**), and a **Plot cursor hit-test AX-only fallback** that lets users re-plot the same window immediately without exit-and-manually-resize interruptions. All are reflected in §2 and §3 below. Later commits may add features not reflected here.
+**Currency:** as of MVP-1.0 (git tag `MVP-1.0`, commit `55b6807`, July 2026) plus a follow-on refinement pass (originally branch `cascade-flicker-refinement`, merged to `main` at commit `5c8b90b`, August 2026) that added **Plot Mode**, **Chromium native-bounds transport**, the **bounded z-order settlement pipeline** with its subsequent three-round refinement (**observation-starvation escalation** + **pass-4 observe-first with progress-gated walk #2** + **two-phase correction ownership with a geometry-quiescence barrier**), and a **Plot cursor hit-test AX-only fallback** that lets users re-plot the same window immediately without exit-and-manually-resize interruptions. Since then a full **distribution pipeline** has shipped (Developer ID signing, Apple notarization, DMG + PKG, MDM PPPC profiles — see §8). All are reflected in §2, §3, and §8 below. Later commits may add features not reflected here.
 
 **How to use this document:** Section §14 at the bottom tells you which sections to pull from for which kinds of questions. If you're pressed for time, read §1, §2, §8, §9, §13, §14 first — those alone let you make sound positioning and pricing judgments.
 
@@ -33,10 +33,10 @@ Any customer-facing surface uses "Window Wrangler."
 
 ### 1.4 Current status
 
-- **MVP-1.0 complete + post-MVP refinement pass in flight.** All in-scope prototype features shipped and validated by the author on their daily-driver machine. Follow-on additions on branch `cascade-flicker-refinement`: Plot Mode (single-window precision placement), Chromium native-bounds transport (reliable resize where AX writes silently revert on Chrome/Brave/Edge/Opera/Vivaldi/Chromium), a bounded z-order settlement pipeline shared by All-Apps and Selection Cascade (identity-based persistent-drift detection + async serialized reconstruction + late recommit, all budget-capped), and a subsequent three-round refinement of that pipeline that collapsed cold-cascade retry flicker from 5-11 visible re-stackings to 1-2 (observation-starvation escalation + pass-4 observe-first with progress-gated walk #2 + two-phase correction ownership with geometry-quiescence barrier). Also a Plot cursor hit-test AX-only fallback that fixes the "can't re-plot the same window immediately after plotting" repro.
-- **Personal prototype, not distributed.** Runs from Xcode as a local build. No code signing beyond self-sign. No notarization. No public download. No Mac App Store presence.
+- **MVP-1.0 complete + post-MVP refinement pass merged + distribution pipeline shipped.** All in-scope prototype features shipped and validated by the author on their daily-driver machine. Follow-on additions (originally branch `cascade-flicker-refinement`, since merged to `main`): Plot Mode (single-window precision placement), Chromium native-bounds transport (reliable resize where AX writes silently revert on Chrome/Brave/Edge/Opera/Vivaldi/Chromium), a bounded z-order settlement pipeline shared by All-Apps and Selection Cascade (identity-based persistent-drift detection + async serialized reconstruction + late recommit, all budget-capped), and a subsequent three-round refinement of that pipeline that collapsed cold-cascade retry flicker from 5-11 visible re-stackings to 1-2 (observation-starvation escalation + pass-4 observe-first with progress-gated walk #2 + two-phase correction ownership with geometry-quiescence barrier). Also a Plot cursor hit-test AX-only fallback that fixes the "can't re-plot the same window immediately after plotting" repro.
+- **Distribution ready.** Developer ID–signed, Apple-notarized DMG + PKG produced by `scripts/release.sh` + `scripts/notarize.sh`; MDM PPPC profiles under `deployment/`. Not yet publicly listed on a download page or in the Mac App Store, but the artifacts are shippable to individual testers or MDM-managed fleets today. See §8.
 - **Solo developer, AI-assisted.** The project owner is not a professional developer; the code was authored primarily by Claude Code with the owner directing feature scope, testing every commit, and making product decisions.
-- **Two-week development timeline** for the MVP-1.0 feature set. Corral (M8) was the largest single milestone. Post-MVP refinements landed in follow-on sessions.
+- **Two-week development timeline** for the MVP-1.0 feature set. Corral (M8) was the largest single milestone. Post-MVP refinements + distribution pipeline landed in follow-on sessions.
 
 ---
 
@@ -180,7 +180,7 @@ Codebase is organized around strict separation of concerns:
 - **UI modules** render dedicated pieces (`SelectionOverlay`, `LassoModeHint`, `PlotOverlay`, `PlotModeHint`, `CorralNamePill`, `CorralReleaseMenu`, `CorralToast`, `MenuBuilder`, `OnboardingWindowController`).
 - **App shell** wires everything together (`WindowWranglerApp`, `WindowWranglerActions`, `GlobalShortcuts`, `MenuBarIcon`).
 
-~35 Swift source files, ~9,500 lines of code, plus a `WindowWranglerTests` target with 7 test files and 96 currently-passing XCTest cases (see §12.3).
+~41 Swift source files, ~17,800 lines of code, plus a `WindowWranglerTests` target with 15 test files and ~198 currently-passing XCTest cases (see §12.3).
 
 ### 3.3 Coordinate spaces
 
@@ -303,13 +303,13 @@ TabInfo {
 - **`NSAppleEventsUsageDescription`** in `Info.plist` explains why the app requests Automation permission. Sourced via `INFOPLIST_KEY_NSAppleEventsUsageDescription` build setting; the wording is a product decision.
 - **`get-task-allow` in Release**: Xcode's automatic dev-team ad-hoc signing leaves `get-task-allow = true` in place on both Debug AND Release builds — this is Xcode's development-signing default, not a project setting. Xcode's Archive → Distribute App flow strips `get-task-allow` when signing with a real Developer ID certificate. Confirm absence on the final notarized artifact via `codesign -d --entitlements :- <path>`.
 - **Not distributable via Mac App Store** — MAS requires sandbox, which breaks cross-app AX. Developer ID + direct distribution is the only viable path.
-- **Distribution readiness caveat:** the current Debug and Release builds are ad-hoc signed by Xcode's automatic dev signing. Full distribution readiness (Developer ID Application certificate, notarization) is still pending — see §8. The final notarized build MUST be re-tested for Accessibility and Apple Events permissions because the signing identity change may fragment TCC's per-signature records.
+- **Distribution readiness:** shipped. `scripts/release.sh` produces a Developer ID Application–signed .app + DMG and a Developer ID Installer–signed PKG; `scripts/notarize.sh` submits both to Apple, staples the ticket, and runs Gatekeeper verification. Artifacts land in `dist/` as `WindowWrangler-1.0.dmg` + `WindowWrangler-1.0.pkg`. See §8 for the full pipeline. First installs on a machine that had the ad-hoc Debug/Release variant present may still need to reauthorize Accessibility + Automation because the signing-identity change fragments TCC's per-signature records.
 
 ### 6.5 Security surface
 
 Threats a security-minded user should consider:
 - The app is a menu-bar utility with broad Accessibility permission — it has the technical ability to read + move any window on the system. A malicious version of the app could exfiltrate window titles + document paths + browser URLs.
-- The app is not code-signed for public distribution. Users installing an MVP-1.0 build accept the local-development trust context.
+- Shipped artifacts are Developer ID–signed and Apple-notarized (see §8). Users installing the DMG/PKG get standard Gatekeeper trust; earlier ad-hoc-signed local builds do not.
 - Automation permission per-browser means the app can send arbitrary AppleScript to those browsers — same trust considerations as any AppleScript-capable app.
 
 None of these threats are actively exploited by the current code, but a customer evaluating the app for enterprise use would want a signed + notarized production build with a documented security posture before deployment.
@@ -401,19 +401,19 @@ Both scripts hard-code the Team ID `7V4AJFNJKM` and organization name; changing 
 - Production minimum: a landing page describing the app, a download link, a support email or issue tracker, a privacy policy (even a one-page one), a license page.
 
 **Legal.**
-- Currently: "all rights reserved" as informal MVP status.
-- Production needs: formal LICENSE file (proprietary or open source — decision), privacy policy, terms of use if collecting payment.
+- LICENSE file at the repo root ([`LICENSE`](../LICENSE)) — proprietary / all rights reserved.
+- Still open for a distributed product: privacy policy, terms of use if collecting payment.
 
 **Payment / distribution flow (if paid).**
 - Currently: no payment mechanism.
 - Production paths: Paddle, Fastspring, Gumroad, Stripe + custom license server, MAS in-app purchase (if MAS path viable — it's not).
 
-### 8.3 What notarization would fix from the current parking lot
+### 8.5 What notarization now fixes from the earlier parking lot
 
-- **Stale TCC records after rebuilds** — a stable Team ID means grants persist across app updates. Eliminates the "granted but doesn't work" state that plagues heavy-development sessions.
-- **Files & Folders prompts on document restore** — with Full Disk Access entitlement (which requires notarization + review), the per-folder prompts disappear.
+- **Stale TCC records after rebuilds** — a stable Team ID means grants persist across app updates. Eliminates the "granted but doesn't work" state that plagued heavy-development sessions with ad-hoc dev signatures.
+- **Files & Folders prompts on document restore** — with a Full Disk Access entitlement (added once the app is under Developer ID + notarization, as it now is), the per-folder prompts disappear. That entitlement itself is deferred pending Apple review; the underlying blocker is gone.
 
-### 8.4 What notarization would NOT fix
+### 8.6 What notarization does NOT fix
 
 - **Multi-Space (Virtual Desktop) restore placement** — macOS-inherent, no public API. Only SIP-off private APIs can solve.
 - **Cross-app AX latency** on group drag / cascade of slow apps — inherent to the AX event routing between processes.
@@ -687,23 +687,23 @@ Menu-bar toggle wires `SMAppService.mainApp.register()`. Managed via the standar
 
 - **Primary test rig:** developer's daily-driver MacBook. macOS 26.5 (Tahoe), Retina Built-in Display, various external displays connected during some sessions.
 - **Manual + observational for orchestrators.** Cascade orchestration, lasso flow, Plot commit path, corral save/restore, and cross-app behavior are all validated by the developer running the app and inspecting Console logs (`subsystem:com.jmw3.WindowWrangler`).
-- **XCTest coverage on pure-decision modules.** 141 tests currently passing across 10 files: `CoordinateSpaceTests`, `FanGeometryTests`, `WindowSelectionTests`, `BrowserBoundsMatcherTests` (the ambiguity-safe Chromium-window matcher), `CascadePlanningTests` (the deterministic planning-size resolver), `CascadeZOrderDriftTests` (identity-based persistent-drift detection + final-status matrix), `SelectionCascadeSettlementTests` (parity with All-Apps + shared-timing invariants), `CascadeZOrderStarvationTests` (observation-starvation detector + exact cold-start trace regression), `CascadeZOrderProgressTests` (walk-#2 gate + structural plateau regressions), and `CascadeZOrderCorrectionOwnershipTests` (two-phase correction-owner + geometry-quiescence gen-24 regression). Test target is filesystem-synchronized — new files auto-picked up.
+- **XCTest coverage on pure-decision modules.** ~198 tests currently passing across 15 files: `CoordinateSpaceTests`, `FanGeometryTests`, `WindowSelectionTests`, `BrowserBoundsMatcherTests` (the ambiguity-safe Chromium-window matcher), `CascadePlanningTests` (the deterministic planning-size resolver), `CascadeZOrderDriftTests` (identity-based persistent-drift detection + final-status matrix), `SelectionCascadeSettlementTests` (parity with All-Apps + shared-timing invariants), `CascadeZOrderStarvationTests` (observation-starvation detector + exact cold-start trace regression), `CascadeZOrderProgressTests` (walk-#2 gate + structural plateau regressions), `CascadeZOrderCorrectionOwnershipTests` (two-phase correction-owner + geometry-quiescence gen-24 regression), `AccessoryPrefilterTests` (accessory-window prefilter), `BoundedConcurrentMapTests` (bounded per-app AX enumeration), `CascadeFeedbackControllerTests`, `CascadeLatencyTraceTests` (DEBUG stage-timing traces), and `CGWindowSnapshotTests`. Test target is filesystem-synchronized — new files auto-picked up.
 - **What's been tested extensively:** cascade in every direction, lasso across many app configurations, corral save/restore with mixed app types, browser tab capture with Chrome (extensive), Safari (moderate), Brave / Edge / Vivaldi / Opera (spot-check), Plot Mode with Chromium and non-Chromium targets.
 - **What's been tested lightly:** multi-display configurations, macOS versions other than 26.5, edge cases like extreme window counts.
 - **What has NOT been tested:** older macOS versions (13, 14, 15), Apple Silicon vs Intel distinctions, Firefox (not supported), enterprise MDM environments, apps with unusual AX behavior beyond what's covered in the parking lot.
 
 ### 12.4 Development tooling
 
-- Xcode 26.5+ with default settings, local self-signing.
+- Xcode 26.5+ for day-to-day development (default settings, Xcode-managed ad-hoc signing). Release artifacts are produced by `scripts/release.sh` + `scripts/notarize.sh` with the Developer ID Application + Installer certificates from the login keychain — see §8.
 - Console.app for log stream inspection (`subsystem:com.jmw3.WindowWrangler`).
-- git with all commits on `main` branch (no feature branches during prototype phase).
-- No CI/CD, no automated builds.
+- git with all commits on `main` branch (direct-commit style throughout the prototype phase; the post-MVP `cascade-flicker-refinement` branch was merged before distribution).
+- No CI/CD, no automated builds — the release pipeline runs locally on the maintainer's machine.
 
 ### 12.5 Repo state
 
-- **~35 Swift source files** in the app target, ~10,500 LOC.
-- **Single Xcode project**, one app target + one test target (`WindowWranglerTests`) with 141 passing XCTest cases.
-- **git tag `MVP-1.0`** anchors the MVP shippable state at commit `55b6807`. Follow-on work lives on branch `cascade-flicker-refinement`; current head as of this document is `5c8b90b` (Plot cursor hit-test AX fallback), preceded by `d7086e8` (three-round Cascade z-order flicker refinement).
+- **~41 Swift source files** in the app target, ~17,800 LOC.
+- **Single Xcode project**, one app target + one test target (`WindowWranglerTests`) with ~198 passing XCTest cases across 15 files.
+- **git tag `MVP-1.0`** anchors the MVP shippable state at commit `55b6807`. Follow-on refinements (originally branch `cascade-flicker-refinement`, since merged to `main`) reached commit `5c8b90b` (Plot cursor hit-test AX fallback), preceded by `d7086e8` (three-round Cascade z-order flicker refinement). Distribution pipeline commits followed.
 - **git remote:** `origin` → private GitHub repo. Local commits are pushed after each substantial change.
 - **No external dependencies** — pure Foundation + AppKit + ApplicationServices + ServiceManagement. No CocoaPods, no Swift Package Manager dependencies, no Carthage.
 
@@ -715,10 +715,8 @@ This section exists specifically so external AI planners **don't invent features
 
 ### Not currently shipping
 
-- **Not on Mac App Store.** No MAS listing, no App Store rating, no App Store reviews.
-- **Not code-signed for public distribution.** Development build only.
-- **Not notarized.** Gatekeeper will warn on other users' Macs.
-- **No download page, no website, no marketing surface.** Zero distribution presence.
+- **Not on Mac App Store.** No MAS listing, no App Store rating, no App Store reviews. Will not be viable — MAS requires sandbox, sandbox breaks cross-app AX.
+- **Signed and notarized artifacts exist but no public download page or marketing surface.** `dist/` produces Developer ID–signed, Apple-notarized `WindowWrangler-1.0.dmg` + `WindowWrangler-1.0.pkg`, distributable to individual testers or MDM-managed fleets today. No hosted download URL, no website, no marketing surface yet.
 - **No paid tier.** No free tier either (nothing to purchase — the app doesn't exist commercially).
 - **No user accounts.** Nothing to sign up for. No login.
 - **No cloud sync.** Corrals are local-only, per-machine.
@@ -736,7 +734,7 @@ This section exists specifically so external AI planners **don't invent features
 - **No telemetry.** No analytics. No crash reporting. Nothing sent anywhere.
 - **No support surface.** No email, no forum, no issue tracker, no support hotline.
 - **No collaborative features.** Cannot share corrals with other users.
-- **No team / enterprise / MDM support.**
+- **MDM deployment materials shipped** (Accessibility PPPC + Apple Events PPPC + receiver requirements + deployment doc, under `deployment/`), but no built-in team / license-management / centralized-policy features inside the app itself.
 - **No calendar integration.** No time-based automation.
 - **No AI features.** No LLM integration. No "smart layout suggestions." No categorization of your windows.
 - **No layout preview thumbnails.** The release menu is a text-only list.
@@ -834,4 +832,4 @@ Ask the human user in your session, don't guess. They can go back to the develop
 
 ---
 
-*End of document. Currency: MVP-1.0 (git tag `MVP-1.0`, commit `55b6807`, July 2026) plus post-MVP refinements on branch `cascade-flicker-refinement` through commit `5c8b90b` (August 2026) — Plot Mode, Chromium native-bounds transport, bounded z-order settlement pipeline with three-round refinement (observation-starvation escalation, pass-4 observe-first with progress-gated walk #2, two-phase correction ownership with geometry-quiescence barrier), and Plot cursor hit-test AX-only fallback.*
+*End of document. Currency: MVP-1.0 (git tag `MVP-1.0`, commit `55b6807`, July 2026) plus post-MVP refinements (originally branch `cascade-flicker-refinement`, merged to `main` at commit `5c8b90b`, August 2026) — Plot Mode, Chromium native-bounds transport, bounded z-order settlement pipeline with three-round refinement (observation-starvation escalation, pass-4 observe-first with progress-gated walk #2, two-phase correction ownership with geometry-quiescence barrier), and Plot cursor hit-test AX-only fallback. Since then a full distribution pipeline has shipped: Developer ID–signed, Apple-notarized DMG + PKG in `dist/`, plus MDM PPPC profiles under `deployment/`.*

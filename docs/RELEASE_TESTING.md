@@ -52,9 +52,9 @@ Confirm each of these works using their default shortcuts:
 - Cascade All Apps Down-Left (`⌃⌥⌘[`) — pulse then cascade opposite direction.
 - Single-app Cascade Down-Right (`⌃⌥⌘.`) — pulses only frontmost app's windows, then cascades them.
 - Single-app Cascade Down-Left (`⌃⌥⌘,`) — same, opposite direction.
-- Lasso: hold Option+W, click-drag across windows — rubber-band selects them.
-- Lasso group drag: drag any selected window — the group moves together.
-- Plot Mode: menu → Enter Plot Mode → click a window → drag to reposition.
+- Lasso: `⌃⌥⌘C` to toggle lasso mode, then click-drag across windows to rubber-band select them; `⌃⌥⌘C` or `Esc` exits.
+- Lasso group drag: with a lasso selection active, drag any selected window — the group moves together.
+- Plot Mode: `⌃⌥⌘P` to toggle → click a window → drag to reposition; `⌃⌥⌘P` or `Esc` exits.
 - Restore Previous Layout (menu → Restore Previous Layout) after a cascade — windows return to pre-cascade positions.
 
 Multi-display: if the test Mac has more than one display, verify the same shortcuts work on the display the mouse cursor is on, without pulling windows off other displays.

@@ -1,6 +1,6 @@
-Window Wrangler (working folder: WindowFan)
+Window Wrangler
 Project overview
-A macOS menu bar utility for arranging windows. Two core mechanics: (1) cascade — stagger a set of windows in a fan layout that preserves title bar and tab visibility; (2) lasso — hold Option+W and click-drag to rubber-band-select windows across apps, then operate on them as a group (apply cascade, or drag them as one). This is a personal prototype phase — NOT for distribution yet. Goal is to validate the core mechanics on my own machine before hiring a developer for production polish.
+A macOS menu bar utility for arranging windows. Two core mechanics: (1) cascade — stagger a set of windows in a fan layout that preserves title bar and tab visibility; (2) lasso — press `⌃⌥⌘C` to enter a persistent lasso mode, then click-drag to rubber-band-select windows across apps and operate on them as a group (apply cascade, or drag them as one); press `⌃⌥⌘C` or `Esc` to exit. The MVP has been validated on the author's machine and the distribution pipeline (Developer ID signing + Apple notarization + DMG/PKG + MDM PPPC profiles) is shipped and green — see the "Distribution / release engineering — ✅ shipped" line below for entry points.
 The product name everywhere user-facing is "Window Wrangler". The GitHub repo, the outer local folder, the Xcode project, the source folder, and the test target are all named `WindowWrangler` (matching the product). The bundle identifier is `com.jmw3.WindowWrangler`. There are no legacy path names remaining — historical `WindowFan` / `WindowFanWrangler` naming was collapsed via a sequence of L1/L2/L3 renames documented in git history.
 My profile
 I am a non-developer using AI as the primary code author. I can read code at a high level, run commands you give me, and describe behavior I observe — but I cannot debug Swift errors on my own. When something doesn't work, I'll describe what I see and you'll diagnose. Be explicit and step-by-step.
@@ -26,7 +26,7 @@ Scope: IN for prototype
 Menu bar app
 Accessibility permission onboarding
 Cascade frontmost app's windows in both directions (down-right and down-left)
-Lasso selection: hold Option+W and click-drag to rubber-band-select windows across apps. Selection persists. Visual highlights via transparent overlay window.
+Lasso selection: press `⌃⌥⌘C` to toggle a persistent lasso mode, then click-drag to rubber-band-select windows across apps. Selection persists. Visual highlights via transparent overlay window.
 Apply cascade to the lasso selection (Cascade Selected Down-Right / Down-Left)
 Multi-window group drag: dragging any selected window moves the whole group with a Finder-style cluster preview at the cursor; snap to final positions on release. Works seamlessly across multiple displays (single extended coordinate space via AX). Limited to the current Space — see OUT scope.
 Keyboard shortcuts to cascade and to restore previous layout
@@ -56,8 +56,8 @@ Parking lot (deferred — revisit later, not blocking current milestones)
 Source-control / project hygiene items I want to handle later, not now:
 - Push the repo to a private GitHub remote so the code is backed up off this Mac (currently the repo only exists locally; if the SSD dies, everything is lost). One-time auth setup needed.
 - Tag completed milestones in git (e.g., `git tag M4`, `M5`) so they're navigable by name instead of commit SHA.
-- Add a README.md at the project root summarizing what the app is, how to build it, and prerequisites — first file a handoff developer would look for.
-- Add a LICENSE file (default "all rights reserved" is fine for prototype but should be explicit).
+- ~~Add a README.md at the project root summarizing what the app is, how to build it, and prerequisites — first file a handoff developer would look for.~~ ✅ Done — see [README.md](README.md).
+- ~~Add a LICENSE file (default "all rights reserved" is fine for prototype but should be explicit).~~ ✅ Done — see [LICENSE](LICENSE) (proprietary, all rights reserved).
 - Audit `.gitignore` to confirm no build artifacts / DerivedData / sensitive files are tracked.
 - Adopt a feature-branch + PR workflow (currently committing straight to `main`). Not needed for solo work; matters at handoff.
 - Set up release builds with semantic versioning (e.g., `0.1.0`). Relevant when we move toward distribution, not before.

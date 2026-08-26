@@ -2,7 +2,7 @@
 
 A macOS menu-bar utility for arranging windows across apps. Cascade every visible window in a title-bar-preserving fan layout, lasso windows across apps with click-and-drag, save named window groups ("Corrals") that restore later — including browser tabs — and precision-place any window into a drawn rectangle with **Plot Mode**.
 
-**Status:** MVP-1.0 + Plot / native-Chromium transport / two-phase z-order correction ownership + geometry-quiescence barrier. Personal prototype. Not distributed.
+**Status:** MVP-1.0 + Plot / native-Chromium transport / two-phase z-order correction ownership + geometry-quiescence barrier. Distribution pipeline shipped: Developer ID–signed, Apple-notarized DMG + PKG in `dist/`, plus MDM PPPC profiles under `deployment/` — see [`docs/RELEASE_TESTING.md`](docs/RELEASE_TESTING.md).
 
 ---
 
@@ -88,4 +88,4 @@ With that setting off, Corral restore always creates windows on your current Des
 
 ## License
 
-All rights reserved — personal prototype.
+Proprietary — all rights reserved. See [`LICENSE`](LICENSE) for the full terms.
