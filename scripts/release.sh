@@ -268,6 +268,19 @@ build_dmg() {
     # captures those settings. Phase 2: convert to the compressed
     # read-only UDZO format we actually ship, then sign.
     #
+    # Detach any stale "Window Wrangler*" volumes left over from a
+    # previous run or from a Finder-triggered open. If one is still
+    # mounted, macOS names the new mount "Window Wrangler 1" and the
+    # AppleScript below (which targets the disk by its display name)
+    # would silently operate on the STALE volume instead of the one
+    # we just built, producing a bare unstyled DMG.
+    for stale_mount in /Volumes/"${APP_NAME}"*; do
+        if [[ -d "${stale_mount}" ]]; then
+            log "Detaching stale mount: ${stale_mount}"
+            hdiutil detach "${stale_mount}" -force > /dev/null 2>&1 || true
+        fi
+    done
+
     # Size 30m is enough overhead for the .app (~1.5MB signed) + the
     # background image + .DS_Store metadata. Undersizing here would
     # make Finder unable to save its layout.
@@ -293,6 +306,13 @@ build_dmg() {
     [[ -n "${mount_point}" && -d "${mount_point}" ]] \
         || fail "Failed to determine DMG mount point (got: '${mount_point}')"
 
+    # The AppleScript below targets Finder's disk by NAME. If a stale
+    # "Window Wrangler" was mounted (see defensive detach above) macOS
+    # names our fresh mount "Window Wrangler 1" — so read the actual
+    # display name from the mount point rather than assuming APP_NAME.
+    local mount_name
+    mount_name="$(basename "${mount_point}")"
+
     # Apply the Finder layout ONLY if the background image is present —
     # a bare white window is still a valid DMG, just less polished.
     #
@@ -317,7 +337,7 @@ build_dmg() {
         local applescript_output
         if applescript_output="$(osascript <<APPLESCRIPT 2>&1
 tell application "Finder"
-    tell disk "${APP_NAME}"
+    tell disk "${mount_name}"
         open
         set current view of container window to icon view
         set toolbar visible of container window to false
