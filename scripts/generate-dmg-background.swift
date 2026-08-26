@@ -76,28 +76,9 @@ head.lineJoinStyle = .round
 NSColor(calibratedWhite: 0.55, alpha: 1.0).setStroke()
 head.stroke()
 
-// Caption below the icon row.
-let caption = "Drag Window Wrangler to Applications"
-let captionAttributes: [NSAttributedString.Key: Any] = [
-    .font: NSFont.systemFont(ofSize: 15, weight: .medium),
-    .foregroundColor: NSColor(calibratedWhite: 0.30, alpha: 1.0),
-]
-let captionString = NSAttributedString(string: caption, attributes: captionAttributes)
-let captionSize = captionString.size()
-// Caption baseline y measured from the bottom of the 640×360 window.
-// Finder draws its icon labels lower than a naive geometry calculation
-// suggests (the label baseline sits closer to the caption than icon-
-// bottom + typical-gap predicts), so we push the caption down further
-// than pure math would recommend. y=25 gives ~25pt of clearance from
-// the bottom edge while still leaving visible daylight between the
-// icon labels and the caption.
-let captionRect = NSRect(
-    x: (width - captionSize.width) / 2,
-    y: 25,
-    width: captionSize.width,
-    height: captionSize.height
-)
-captionString.draw(in: captionRect)
+// Caption intentionally omitted — the arrow between the app icon and
+// the Applications symlink is self-explanatory and the caption crowded
+// the layout on typical Mac displays.
 
 image.unlockFocus()
 
