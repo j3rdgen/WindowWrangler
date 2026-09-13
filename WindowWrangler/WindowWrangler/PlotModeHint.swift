@@ -125,7 +125,7 @@ final class PlotModeHint {
             .fullScreenAuxiliary,
             .canJoinAllSpaces,
         ]
-        p.sharingType = .none
+        p.sharingType = .readOnly
 
         let bg = NSView(frame: frame)
         bg.wantsLayer = true

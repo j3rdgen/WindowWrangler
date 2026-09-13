@@ -281,7 +281,7 @@ final class CorralNamePill {
             .fullScreenAuxiliary,
             .canJoinAllSpaces,
         ]
-        panel.sharingType = .none
+        panel.sharingType = .readOnly
         panel.contentView = contentView
         return panel
     }

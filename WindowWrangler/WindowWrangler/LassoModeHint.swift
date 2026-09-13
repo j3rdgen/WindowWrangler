@@ -101,7 +101,7 @@ final class LassoModeHint {
             .fullScreenAuxiliary,
             .canJoinAllSpaces,
         ]
-        p.sharingType = .none
+        p.sharingType = .readOnly
 
         // Background: dark translucent capsule.
         let bg = NSView(frame: frame)

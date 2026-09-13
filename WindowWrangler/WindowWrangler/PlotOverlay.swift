@@ -197,7 +197,7 @@ final class PlotOverlay {
             .ignoresCycle,
             .fullScreenAuxiliary,
         ]
-        panel.sharingType = .none
+        panel.sharingType = .readOnly
         panel.animationBehavior = .none
         panel.setFrame(screen.frame, display: false)
 

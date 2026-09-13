@@ -159,7 +159,7 @@ final class CorralToast {
             .fullScreenAuxiliary,
             .canJoinAllSpaces,
         ]
-        panel.sharingType = .none
+        panel.sharingType = .readOnly
         panel.contentView = bg
 
         centerCorralPanel(panel)

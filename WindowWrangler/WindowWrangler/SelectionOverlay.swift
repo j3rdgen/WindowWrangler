@@ -244,7 +244,7 @@ final class SelectionOverlay {
             .ignoresCycle,
             .fullScreenAuxiliary,
         ]
-        panel.sharingType = .none
+        panel.sharingType = .readOnly
         // Suppress AppKit's implicit window animations.
         panel.animationBehavior = .none
 

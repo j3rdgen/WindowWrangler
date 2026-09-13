@@ -156,7 +156,7 @@ final class CorralReleaseMenu {
             .fullScreenAuxiliary,
             .canJoinAllSpaces,
         ]
-        panel.sharingType = .none
+        panel.sharingType = .readOnly
         panel.contentView = content
         self.panel = panel
 
