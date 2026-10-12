@@ -35,4 +35,9 @@ import AppKit
     /// Toggles the Login Item registration — the "Launch at Login"
     /// checkbox in the menu.
     @objc func toggleLaunchAtLogin()
+    /// Tab X-Ray spike (tab-duplicate-xray branch) — scans running
+    /// browser processes and logs their AX + AppleScript tab exposure
+    /// to Console under subsystem `com.jmw3.WindowWrangler`,
+    /// category `tabXray`. Investigation only; no UI side-effects.
+    @objc func debugScanBrowserTabs()
 }

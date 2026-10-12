@@ -115,6 +115,7 @@ enum MenuBuilder {
 
         menu.addItem(.separator())
         addLaunchAtLoginItem(to: menu, target: target, enabled: state.launchAtLoginEnabled)
+        addDebugScanBrowserTabsItem(to: menu, target: target)
         addQuitItem(to: menu)
 
         return menu
@@ -416,6 +417,24 @@ enum MenuBuilder {
             action: #selector(NSApplication.terminate(_:)),
             keyEquivalent: "q"
         )
+        item.isEnabled = true
+        menu.addItem(item)
+    }
+
+    /// Tab X-Ray spike item (tab-duplicate-xray branch).
+    /// Triggers a one-shot scan of running browsers and dumps the AX +
+    /// AppleScript tab exposure to Console under subsystem
+    /// `com.jmw3.WindowWrangler`, category `tabXray`.
+    private static func addDebugScanBrowserTabsItem(
+        to menu: NSMenu,
+        target: WindowWranglerActions
+    ) {
+        let item = NSMenuItem(
+            title: "Debug: Scan Browser Tabs → Console",
+            action: #selector(WindowWranglerActions.debugScanBrowserTabs),
+            keyEquivalent: ""
+        )
+        item.target = target
         item.isEnabled = true
         menu.addItem(item)
     }

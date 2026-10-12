@@ -62,4 +62,8 @@ enum Log {
 
     /// Plot feature — single-window snap-to-drawn-area mode.
     static let plot       = Logger(subsystem: subsystem, category: "plot")
+
+    /// Tab X-Ray spike (tab-duplicate-xray branch) — AX / AppleScript
+    /// probe output. Remove when the spike resolves.
+    static let tabXray    = Logger(subsystem: subsystem, category: "tabXray")
 }

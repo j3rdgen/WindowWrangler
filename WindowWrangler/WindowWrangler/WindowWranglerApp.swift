@@ -829,6 +829,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
         rebuildMenu()
     }
 
+    // MARK: - Tab X-Ray spike (tab-duplicate-xray branch)
+
+    @objc func debugScanBrowserTabs() {
+        TabEnumerator.scanAndLog()
+    }
+
     // MARK: - Zombie prevention + clean shutdown
 
     /// On launch, force-terminates any other Window Wrangler process
