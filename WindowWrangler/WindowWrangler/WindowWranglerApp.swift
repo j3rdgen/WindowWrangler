@@ -516,19 +516,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
             guard let self,
                   let app = note.userInfo?[NSWorkspace.applicationUserInfoKey]
                     as? NSRunningApplication else { return }
-            // Skip ourselves — never want to operate on our own (zero) windows.
-            if app.bundleIdentifier == Bundle.main.bundleIdentifier { return }
-            self.lastUserApp = app
-
-            // If the onboarding window is open, an app activation is
-            // very likely the user switching BACK from System Settings
-            // after toggling our permission. Force an immediate
-            // permission re-check so the onboarding window can dismiss
-            // without waiting for the next poll tick — keeps the
-            // "closes automatically" promise honest.
+            // Force an immediate permission re-check on ANY app
+            // activation while the onboarding window is open — the
+            // user has very likely just toggled our permission in
+            // System Settings and is bouncing back. This includes the
+            // Cmd+Tab-back-to-us case (`app.bundleIdentifier ==
+            // Bundle.main.bundleIdentifier`), which is especially
+            // important when the onboarding window and System Settings
+            // live on different Spaces: a timer-only poll gets
+            // throttled while our only visible window is stranded on a
+            // non-active Space, and the event-driven path here is what
+            // keeps the "closes automatically" promise honest. Must
+            // run BEFORE the self-bundle short-circuit below.
             if self.onboardingWindow != nil {
                 self.permission.forceRecheck()
             }
+            // Skip ourselves for lastUserApp tracking — never want to
+            // operate on our own (zero) windows.
+            if app.bundleIdentifier == Bundle.main.bundleIdentifier { return }
+            self.lastUserApp = app
         }
     }
 
