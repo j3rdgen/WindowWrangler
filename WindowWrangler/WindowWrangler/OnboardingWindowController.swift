@@ -41,6 +41,18 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate {
         // the user sees it on launch; it just doesn't block other apps
         // once they're activated.
         window.level = .normal
+        // Follow the user across Spaces. The user grants Accessibility
+        // in System Settings, which commonly lives on a different Space
+        // from where our prompt was created. When our only visible
+        // window is stranded on a non-active Space, macOS throttles our
+        // process (App Nap-ish), the permission poll timer stops firing
+        // reliably, and the "I granted it, why won't the prompt close"
+        // symptom appears. canJoinAllSpaces keeps the prompt in view
+        // wherever the user is working, which keeps the poll alive AND
+        // means the prompt auto-dismisses within a second of the toggle
+        // flip no matter which Space the user flipped it from.
+        // fullScreenAuxiliary lets it coexist with full-screen apps too.
+        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
 
         self.init(window: window)
         window.delegate = self
