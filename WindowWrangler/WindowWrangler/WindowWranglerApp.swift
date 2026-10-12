@@ -74,6 +74,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
     /// `setSelectionFrames`, Cascade pulse writes `setPulseState`).
     private let selectionOverlay = SelectionOverlay()
 
+    /// Tab Markers overlay (tab-duplicate-xray branch). Shows thin
+    /// colored bars above every duplicate browser tab so the user can
+    /// see at a glance which tabs are the same URL. Toggled via
+    /// ⌃⌥⌘D or the menu-bar item.
+    private let tabMarkerOverlay = TabMarkerOverlay()
+
     private lazy var lassoCoordinator = LassoCoordinator(
         selection: windowSelection,
         overlay: selectionOverlay
@@ -361,6 +367,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
             keyCode: KeyCode.p,
             action: { [weak self] in self?.togglePlotFromMenu() },
             label: "Plot (Snap Window to Drawn Area)"
+        ))
+
+        // Tab Markers (tab-duplicate-xray branch). Toggles the colored
+        // duplicate-tab marker overlay for the browsers Window Wrangler
+        // supports. MVP is Chrome-only; expands to the full Chromium
+        // family + Safari in later sessions.
+        shortcuts.register(.init(
+            modifiers: modifiers,
+            keyCode: KeyCode.d,
+            action: { [weak self] in self?.toggleTabMarkers() },
+            label: "Toggle Tab Markers"
         ))
     }
 
@@ -698,7 +715,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
             hasSnapshot: cascadeOrchestrator.hasSnapshot,
             corrals: corralStore.corrals,
             corralsAtCap: corralStore.isAtCap,
-            launchAtLoginEnabled: LoginItemManager.isEnabled
+            launchAtLoginEnabled: LoginItemManager.isEnabled,
+            tabMarkersActive: tabMarkerOverlay.isActive
         )
         statusItem?.menu = MenuBuilder.build(state: state, target: self)
     }
@@ -833,6 +851,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
 
     @objc func debugScanBrowserTabs() {
         TabEnumerator.scanAndLog()
+    }
+
+    @objc func toggleTabMarkers() {
+        tabMarkerOverlay.toggle()
+        rebuildMenu()
     }
 
     // MARK: - Zombie prevention + clean shutdown

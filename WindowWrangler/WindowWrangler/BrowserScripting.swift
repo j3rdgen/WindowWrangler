@@ -529,8 +529,14 @@ enum BrowserScripting {
     /// Returns the cached snapshot if it's still fresh (< 15s old);
     /// nil if the cache is empty or stale. Main-actor since the cache
     /// is main-actor-guarded.
+    ///
+    /// Internal (not private) so overlays with a tight render budget —
+    /// TabMarkerOverlay in particular — can read cache without ever
+    /// triggering the synchronous AppleScript fetch inside
+    /// `snapshotBrowserWindows`. A render tick that blocks on
+    /// AppleScript freezes the whole app for seconds.
     @MainActor
-    private static func cachedSnapshot(for bundleID: String) -> [BrowserWindowSnapshot]? {
+    static func cachedSnapshot(for bundleID: String) -> [BrowserWindowSnapshot]? {
         guard let entry = snapshotCache[bundleID] else { return nil }
         guard CFAbsoluteTimeGetCurrent() - entry.capturedAt < cacheMaxAge else { return nil }
         return entry.snapshot

@@ -40,4 +40,7 @@ import AppKit
     /// to Console under subsystem `com.jmw3.WindowWrangler`,
     /// category `tabXray`. Investigation only; no UI side-effects.
     @objc func debugScanBrowserTabs()
+    /// Tab Markers (tab-duplicate-xray branch) — toggles the colored
+    /// duplicate-tab markers overlay on and off. Bound to ⌃⌥⌘D.
+    @objc func toggleTabMarkers()
 }

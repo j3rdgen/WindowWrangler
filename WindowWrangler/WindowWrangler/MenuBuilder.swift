@@ -44,6 +44,9 @@ enum MenuBuilder {
         /// Whether the app is currently registered to launch at
         /// login. Drives the checkmark on the "Launch at Login" item.
         let launchAtLoginEnabled: Bool
+        /// Are the duplicate-tab markers currently visible on screen?
+        /// Drives the checkmark on the Tab Markers toggle.
+        let tabMarkersActive: Bool
     }
 
     /// Builds a fresh NSMenu reflecting `state`. Menu items are wired
@@ -113,6 +116,13 @@ enum MenuBuilder {
             addReopenSetupItem(to: menu, target: target)
         }
 
+        menu.addItem(.separator())
+        addTabMarkersToggleItem(
+            to: menu,
+            target: target,
+            modifiers: shortcutModifiers,
+            active: state.tabMarkersActive
+        )
         menu.addItem(.separator())
         addLaunchAtLoginItem(to: menu, target: target, enabled: state.launchAtLoginEnabled)
         addDebugScanBrowserTabsItem(to: menu, target: target)
@@ -435,6 +445,29 @@ enum MenuBuilder {
             keyEquivalent: ""
         )
         item.target = target
+        item.isEnabled = true
+        menu.addItem(item)
+    }
+
+    /// Tab Markers toggle (tab-duplicate-xray branch). Shows a check
+    /// mark while the overlay is on screen. Shortcut hint shown is
+    /// purely cosmetic — the actual firing is handled by
+    /// `GlobalShortcuts`, same as every other menu entry here.
+    private static func addTabMarkersToggleItem(
+        to menu: NSMenu,
+        target: WindowWranglerActions,
+        modifiers: NSEvent.ModifierFlags,
+        active: Bool
+    ) {
+        let title = active ? "Hide Tab Markers" : "Show Tab Markers"
+        let item = NSMenuItem(
+            title: title,
+            action: #selector(WindowWranglerActions.toggleTabMarkers),
+            keyEquivalent: "d"
+        )
+        item.keyEquivalentModifierMask = modifiers
+        item.target = target
+        item.state = active ? .on : .off
         item.isEnabled = true
         menu.addItem(item)
     }
