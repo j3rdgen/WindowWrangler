@@ -1556,11 +1556,21 @@ final class CascadeOrchestrator {
                 // Flag-gated: setting `useDeterministicPlanningSizesForAllAppsCascade`
                 // to false restores prior behavior exactly (planning
                 // uses `actualCurrentSize`).
+                // Read the window's advertised minimum via AX (nil when
+                // the app doesn't publish one). Apps like iMovie report
+                // settable=true but still clamp any write below their
+                // minimum; the planner factors that in so slot clamping
+                // reserves enough room and the window doesn't bleed
+                // off-screen on the right/bottom.
+                let advertisedMinSize: CGSize? = isSettable
+                    ? WindowMutator.minSize(window.axElement)
+                    : nil
                 let planningSize: CGSize = useDeterministicPlanningSizesForAllAppsCascade
                     ? CascadePlanning.resolveCascadePlanningSize(
                         currentFrame: window.frame,
                         standardTargetSize: targetSize,
-                        isSizeSettable: isSettable
+                        isSizeSettable: isSettable,
+                        minSize: advertisedMinSize
                     )
                     : actualCurrentSize
 
@@ -1628,17 +1638,42 @@ final class CascadeOrchestrator {
                 } else {
                     // Standard slot placement. `frameSize` is what the
                     // mutator will attempt to write (target size for
-                    // settable, current natural for non-settable);
-                    // `naturalSize` feeds the fitFrame clamp — pass
-                    // `planningSize` so the clamp is deterministic
-                    // (target size for settable → no oversize clamp,
-                    // current for non-settable → preserves existing
-                    // behavior for position-only apps).
+                    // settable, current natural for non-settable).
+                    //
+                    // `naturalSize` feeds the fitFrame CLAMP — not the
+                    // slot plan. Dimension-wise max of (planningSize,
+                    // actualCurrentSize) catches two overflow modes:
+                    //   1) App advertises min > target via AX: handled
+                    //      upstream by `advertisedMinSize` feeding
+                    //      resolveCascadePlanningSize → planningSize
+                    //      already reflects the min.
+                    //   2) App DOESN'T advertise min but still clamps
+                    //      above target (iMovie on current macOS does
+                    //      not expose kAXMinValueAttribute or AXMinSize):
+                    //      without this fallback, planning would hand
+                    //      fitFrame `naturalSize == target` and the
+                    //      post-write actual window would overflow
+                    //      past screen.maxX. actualCurrentSize is the
+                    //      best available proxy — iMovie's current size
+                    //      is at/near its de-facto minimum.
+                    //
+                    // Trade-off: when a user manually resized a window
+                    // bigger than target (e.g., Plot-leftover Chrome at
+                    // 1084pt tall), this clamp uses that bigger size
+                    // for one cascade. On the NEXT cascade — after the
+                    // window has shrunk to target — the clamp uses
+                    // target again. So we converge after one run,
+                    // compared to the pre-fix off-screen overflow which
+                    // never resolved.
                     let frameSize = isSettable ? plannedTarget.size : planningSize
+                    let clampFloor = CGSize(
+                        width: Swift.max(planningSize.width, actualCurrentSize.width),
+                        height: Swift.max(planningSize.height, actualCurrentSize.height)
+                    )
                     target = fitFrame(
                         plannedOrigin: plannedTarget.origin,
                         frameSize: frameSize,
-                        naturalSize: planningSize,
+                        naturalSize: clampFloor,
                         bounds: screen
                     )
                 }
