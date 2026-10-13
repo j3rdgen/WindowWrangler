@@ -166,8 +166,20 @@ private final class PillContentView: NSView {
     // Layout constants — matched to LassoModeHint vertical padding.
     private let hPad: CGFloat = 18
     private let vPad: CGFloat = 9
-    private let gap: CGFloat = 10
     private let buttonSize: CGFloat = 22
+
+    /// Prefix string, up to and including the dot before the glyph
+    /// slot. Set in `set(state:)`; used in `layoutSubviewsManually` to
+    /// compute the button's X by measuring that prefix. Empty when
+    /// no glyph is shown (scanning state).
+    private var prefixUpToGlyph: String = ""
+
+    /// Target alpha for the refresh button. Drives visibility
+    /// without using isHidden — the button is ALWAYS present and
+    /// always laid out at its correct position, so a transition
+    /// from scanning → idle doesn't produce a transient wrong-frame
+    /// flash. 0 during scanning, 1 during idle.
+    private var refreshTargetAlpha: CGFloat = 0
 
     init() {
         super.init(frame: NSRect(x: 0, y: 0, width: 320, height: 32))
@@ -199,7 +211,13 @@ private final class PillContentView: NSView {
         refreshButton.action = #selector(didTapRefresh)
         refreshButton.contentTintColor = .white
         refreshButton.toolTip = "Refresh scan (⌃⌥⌘⇧D)"
-        refreshButton.isHidden = true
+        // Explicit initial frame so the button never exists at
+        // NSZeroRect (which caused a transient glitch on the first
+        // scanning→idle transition before alphaValue took over).
+        refreshButton.frame = NSRect(
+            x: hPad, y: vPad, width: buttonSize, height: buttonSize
+        )
+        refreshButton.alphaValue = 0
         addSubview(refreshButton)
     }
 
@@ -211,16 +229,21 @@ private final class PillContentView: NSView {
         switch state {
         case .scanning:
             label.stringValue = "Plow Mode  ·  scanning Chrome tabs…  ·  Esc to end"
-            refreshButton.isHidden = true
+            prefixUpToGlyph = ""   // no glyph in scanning state
+            refreshTargetAlpha = 0
         case .idle(let secondsAgo):
             let ago: String
             if secondsAgo <= 1 { ago = "just now" }
             else { ago = "\(secondsAgo)s ago" }
             label.stringValue = "Plow Mode  ·  scanned duplicate tabs \(ago)  ·        ·  Esc to end"
-            refreshButton.isHidden = false
+            prefixUpToGlyph = "Plow Mode  ·  scanned duplicate tabs \(ago)  ·  "
+            refreshTargetAlpha = 1
         }
         label.sizeToFit()
         layoutSubviewsManually()
+        // Apply the alpha AFTER layout has settled the button's
+        // position — guarantees no visible-at-wrong-frame flash.
+        refreshButton.alphaValue = refreshTargetAlpha
     }
 
     func intrinsicSize() -> NSSize {
@@ -240,14 +263,14 @@ private final class PillContentView: NSView {
         let labelY = (bounds.height - label.frame.height) / 2
         label.frame.origin = NSPoint(x: hPad, y: labelY)
 
-        if !refreshButton.isHidden {
-            // Overlay the refresh button on top of the glyph-slot in
-            // the label string ("        " between the dots). The label
-            // reserves horizontal space with the spaces; the button
-            // just sits over that region, aligned to the label's y.
-            let textBeforeGlyph = "Plow Mode  ·  scanned \(secondsAgoApproxForLayout())  ·  "
-            let beforeSize = (textBeforeGlyph as NSString).size(
-                withAttributes: [.font: label.font ?? .systemFont(ofSize: 13, weight: .medium)]
+        // Position the refresh button regardless of visibility —
+        // keeps the frame correct across state transitions and view
+        // resizes. Position is derived from the measured prefix width,
+        // so it overlays the "        " empty slot in the label.
+        if !prefixUpToGlyph.isEmpty {
+            let font = label.font ?? .systemFont(ofSize: 13, weight: .medium)
+            let beforeSize = (prefixUpToGlyph as NSString).size(
+                withAttributes: [.font: font]
             )
             let glyphX = hPad + beforeSize.width
             let glyphY = (bounds.height - buttonSize) / 2
@@ -257,23 +280,11 @@ private final class PillContentView: NSView {
         }
     }
 
-    // Secondary extraction so the layout code can measure "the string
-    // up to the glyph slot" accurately. Reads back the current label
-    // value since set(state:) already baked the ago-string into it.
-    private func secondsAgoApproxForLayout() -> String {
-        let s = label.stringValue
-        if let range = s.range(of: "scanned "),
-           let endRange = s.range(of: " ago", range: range.upperBound..<s.endIndex) {
-            return String(s[range.upperBound..<endRange.lowerBound]) + " ago"
-        }
-        return "just now"
-    }
-
     // Pass clicks through everywhere EXCEPT the refresh button's hit
-    // area. Keeps the pill click-through for drag/select over its body
-    // while catching the button tap deliberately.
+    // area WHEN it's visible. Button is treated as not-hittable while
+    // alpha=0 (scanning state), so clicks go straight through.
     override func hitTest(_ point: NSPoint) -> NSView? {
-        if !refreshButton.isHidden {
+        if refreshButton.alphaValue > 0.01 {
             let hit = convert(point, from: superview)
             if refreshButton.frame.insetBy(dx: -4, dy: -4).contains(hit) {
                 return refreshButton
