@@ -35,6 +35,12 @@ final class GlobalShortcuts {
 
     /// One shortcut binding: a modifier set, a virtual key code, and
     /// the closure to invoke when that combination is detected.
+    ///
+    /// `enabledPredicate` lets a binding opt out dynamically — when it
+    /// returns false, the match does NOT fire and the event passes
+    /// through to the focused app. Critical for shortcuts bound to
+    /// bare keys (Esc, letter keys) that would otherwise steal
+    /// commonplace input system-wide. Default nil = always enabled.
     struct Binding {
         let modifiers: NSEvent.ModifierFlags
         /// Virtual key code (kVK_*). See Carbon/HIToolbox/Events.h.
@@ -42,6 +48,23 @@ final class GlobalShortcuts {
         let action: () -> Void
         /// Human-readable label for diagnostic logging.
         let label: String
+        /// Optional gate — if present and returns false, the binding
+        /// does not fire and the event propagates to the focused app.
+        let enabledPredicate: (() -> Bool)?
+
+        init(
+            modifiers: NSEvent.ModifierFlags,
+            keyCode: UInt16,
+            action: @escaping () -> Void,
+            label: String,
+            enabledPredicate: (() -> Bool)? = nil
+        ) {
+            self.modifiers = modifiers
+            self.keyCode = keyCode
+            self.action = action
+            self.label = label
+            self.enabledPredicate = enabledPredicate
+        }
     }
 
     private var bindings: [Binding] = []
@@ -62,6 +85,24 @@ final class GlobalShortcuts {
         Log.shortcuts.notice(
             "GlobalShortcuts: started (CGEventTap keyDown=\(self.eventTap != nil ? "ok" : "FAILED", privacy: .public))"
         )
+        // Phase A diagnostic (tab-duplicate-xray branch) — dump the
+        // full binding list on start so we can confirm what's
+        // registered vs. what the user reports as not firing.
+        for b in bindings {
+            Log.shortcuts.notice(
+                "  binding: \(b.label, privacy: .public) keyCode=\(String(format: "0x%02X", b.keyCode), privacy: .public) mods=\(Self.modDescription(b.modifiers), privacy: .public)"
+            )
+        }
+    }
+
+    /// Human-readable modifier description for diagnostic logging.
+    private static func modDescription(_ mods: NSEvent.ModifierFlags) -> String {
+        var parts: [String] = []
+        if mods.contains(.control)  { parts.append("ctrl") }
+        if mods.contains(.option)   { parts.append("opt") }
+        if mods.contains(.command)  { parts.append("cmd") }
+        if mods.contains(.shift)    { parts.append("shift") }
+        return parts.isEmpty ? "none" : parts.joined(separator: "+")
     }
 
     /// Removes the global event tap.
@@ -153,8 +194,25 @@ final class GlobalShortcuts {
         if cgFlags.contains(.maskControl)   { eventMods.insert(.control) }
         if cgFlags.contains(.maskShift)     { eventMods.insert(.shift) }
 
+        // Phase A diagnostic (tab-duplicate-xray branch): log EVERY
+        // ⌃⌥⌘ chord that reaches our tap, matched or not. Lets us
+        // tell "chord intercepted upstream" (no log line fires) from
+        // "chord reaches us but no binding matches" (we log but don't
+        // fire a Shortcut-fired line). High-signal, low-cost — only
+        // runs when all three primary modifiers are pressed.
+        if eventMods.contains([.control, .option, .command]) {
+            Log.shortcuts.notice(
+                "DIAG ⌃⌥⌘ keyDown reached tap: keyCode=\(String(format: "0x%02X", keyCode), privacy: .public) mods=\(Self.modDescription(eventMods), privacy: .public)"
+            )
+        }
+
         for binding in bindings {
             if keyCode == binding.keyCode && eventMods == binding.modifiers {
+                // Honor dynamic gates (e.g., Esc-to-exit-Plow should
+                // only consume Esc while Plow mode is on).
+                if let predicate = binding.enabledPredicate, !predicate() {
+                    continue
+                }
                 Log.shortcuts.notice("Shortcut fired: \(binding.label, privacy: .public)")
                 binding.action()
                 // Consume — the focused app never sees this event, so
@@ -189,4 +247,5 @@ enum KeyCode {
     static let leftBracket:  UInt16 = 0x21  // kVK_ANSI_LeftBracket
     static let rightBracket: UInt16 = 0x1E  // kVK_ANSI_RightBracket
     static let p:            UInt16 = 0x23  // kVK_ANSI_P
+    static let x:            UInt16 = 0x07  // kVK_ANSI_X
 }

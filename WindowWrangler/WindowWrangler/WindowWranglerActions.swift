@@ -41,6 +41,17 @@ import AppKit
     /// category `tabXray`. Investigation only; no UI side-effects.
     @objc func debugScanBrowserTabs()
     /// Tab Markers (tab-duplicate-xray branch) — toggles the colored
-    /// duplicate-tab markers overlay on and off. Bound to ⌃⌥⌘D.
+    /// duplicate-tab markers overlay on and off. Bound to ⌃⌥⌘X.
     @objc func toggleTabMarkers()
+    /// Tab Markers (tab-duplicate-xray branch) — manually requests
+    /// a fresh scan while the overlay is already active. Bound to
+    /// ⌃⌥⌘⇧X and the floating pill's refresh button. No-op if the
+    /// overlay is OFF.
+    @objc func refreshTabMarkers()
+    /// Phase A diagnostic (tab-duplicate-xray branch) — runs the
+    /// three-strategy AppleScript benchmark against every running
+    /// supported browser and logs timings to Console under
+    /// subsystem com.jmw3.WindowWrangler category tabXray. Takes
+    /// 3–15 seconds per invocation.
+    @objc func debugBenchmarkAppleScript()
 }

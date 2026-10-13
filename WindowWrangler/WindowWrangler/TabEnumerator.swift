@@ -62,6 +62,76 @@ enum TabEnumerator {
         }
     }
 
+    // MARK: - Phase A: AppleScript bulk-retrieval benchmark
+    //
+    // Measures three snapshot strategies back-to-back for every running
+    // supported browser and logs the wall-clock timing of each.
+    //
+    //   A — current fullSnapshotScript (per-tab iteration; baseline)
+    //   B — bulk per-window (reads every tab's URL/title in one access
+    //       per window instead of per-tab)
+    //   C — bulk every-tab-of-every-window (single collection expression
+    //       for URLs/titles/bounds; AppleScript-local serialization)
+    //
+    // Diagnostic-only; not called from the production refresh pipeline.
+    // Takes ~3-15 seconds per invocation; invoke from the debug menu
+    // and let the user wait with Console open. Each strategy is run
+    // once (we're after order-of-magnitude signal, not sub-ms precision)
+    // and the result lengths are compared to catch silent empty returns.
+    //
+    // Verdict decision for Session 2 Part C adoption:
+    //   - If B/C < 1s AND output lengths match A: adopt the fastest.
+    //   - If B/C fail or return empty: keep A, pursue AX notifications
+    //     instead for freshness.
+    //   - If B/C are only marginally faster: keep A, lower refresh rate.
+    static func benchmarkAndLog() {
+        Log.tabXray.notice("─── Phase A AppleScript benchmark ───")
+        let runningApps = NSWorkspace.shared.runningApplications
+        var scanned = 0
+        for app in runningApps {
+            guard let bundleID = app.bundleIdentifier else { continue }
+            guard BrowserScripting.chromiumBundleIDs.contains(bundleID)
+                    || bundleID == BrowserScripting.safariBundleID else { continue }
+            scanned += 1
+            benchmarkOne(app: app, bundleID: bundleID)
+        }
+        if scanned == 0 {
+            Log.tabXray.notice("No supported browsers running — benchmark skipped.")
+        } else {
+            Log.tabXray.notice("─── Benchmark complete (\(scanned, privacy: .public) browser(s)) ───")
+        }
+    }
+
+    private static func benchmarkOne(app: NSRunningApplication, bundleID: String) {
+        let name = app.localizedName ?? bundleID
+        Log.tabXray.notice("Benchmarking \(name, privacy: .public) …")
+
+        let scripts: [(label: String, source: String)] = [
+            ("A: current fullSnapshotScript (per-tab iteration)",
+             BrowserScripting.diagnosticFullSnapshotScript(bundleID: bundleID)),
+            ("B: bulk per-window (URLs/titles of every tab of window i)",
+             BrowserScripting.diagnosticBulkPerWindowScript(bundleID: bundleID)),
+            ("C: bulk every-tab-of-every-window (one expression)",
+             BrowserScripting.diagnosticBulkEveryTabScript(bundleID: bundleID)),
+        ]
+
+        for script in scripts {
+            let (elapsed, result) = BrowserScripting.diagnosticTimedRun(source: script.source)
+            let ms = Int(elapsed * 1000)
+            if let text = result {
+                let windowCount = text.split(separator: "\n").filter { $0.hasPrefix("W\t") }.count
+                let tabCount = text.split(separator: "\n").filter { $0.hasPrefix("T\t") }.count
+                Log.tabXray.notice(
+                    "  \(script.label, privacy: .public) — \(ms, privacy: .public)ms, \(text.count, privacy: .public) chars, \(windowCount, privacy: .public) windows, \(tabCount, privacy: .public) tabs"
+                )
+            } else {
+                Log.tabXray.notice(
+                    "  \(script.label, privacy: .public) — \(ms, privacy: .public)ms, FAILED (timeout or error)"
+                )
+            }
+        }
+    }
+
     // MARK: - Per-app report
 
     @MainActor

@@ -806,6 +806,66 @@ enum BrowserScripting {
     /// save flow's frontend cache read (`snapshotBrowserWindows`) will
     /// then hit the fresh data instead of blocking on AppleScript.
     ///
+    /// Tab Markers (tab-duplicate-xray branch) — the fastest known
+    /// snapshot path for a single browser. Uses the collection-form
+    /// AppleScript (`URL of every tab of every window`) which collapses
+    /// 220+ Apple Events into ~4 for an 8-window / 68-tab Chrome
+    /// session. Expected wall-clock cost: 100–800ms depending on tab
+    /// count, down from ~3–4s with the per-tab iteration script.
+    ///
+    /// Async + background-dispatched; never blocks the caller's thread.
+    /// Returns nil on timeout or empty result; caller can fall back to
+    /// the slower `snapshotBrowserWindows` if required.
+    ///
+    /// Writes to the main-actor snapshot cache on success, so cache
+    /// consumers (TabMarkerOverlay, Corral) see a fresh value.
+    nonisolated static func fetchChromeTabsFast(bundleID: String) async -> [BrowserWindowSnapshot]? {
+        guard isSupportedBrowser(bundleID: bundleID) else { return nil }
+
+        // Variant C first — single bulk expression, fewest round-trips.
+        let scriptC = diagnosticBulkEveryTabScript(bundleID: bundleID)
+        if let text = await runScriptAsync(source: scriptC, timeoutSeconds: 10),
+           !text.isEmpty {
+            let parsed = parseSnapshot(text)
+            if !parsed.isEmpty {
+                await commitSnapshotToCache(bundleID: bundleID, snapshot: parsed)
+                return parsed
+            }
+        }
+
+        // Fallback to Variant B — per-window loop with bulk per-tab
+        // property reads. Still ~5-10× faster than the per-tab iteration
+        // baseline, and more defensive against Chrome versions that
+        // don't like the top-level `every tab of winRefs` form.
+        let scriptB = diagnosticBulkPerWindowScript(bundleID: bundleID)
+        if let text = await runScriptAsync(source: scriptB, timeoutSeconds: 10),
+           !text.isEmpty {
+            let parsed = parseSnapshot(text)
+            if !parsed.isEmpty {
+                await commitSnapshotToCache(bundleID: bundleID, snapshot: parsed)
+                return parsed
+            }
+        }
+
+        return nil
+    }
+
+    /// Writes a non-empty snapshot to the main-actor cache. Separate
+    /// from the fetch so background callers can route the commit back
+    /// to main. Same guards as the primary cache write — nil / empty
+    /// never cached.
+    @MainActor
+    private static func commitSnapshotToCache(
+        bundleID: String,
+        snapshot: [BrowserWindowSnapshot]
+    ) {
+        guard !snapshot.isEmpty else { return }
+        snapshotCache[bundleID] = (
+            snapshot: snapshot,
+            capturedAt: CFAbsoluteTimeGetCurrent()
+        )
+    }
+
     /// Fire-and-forget. Returns immediately. Called from
     /// `LassoCoordinator.toggleLassoMode` when lasso mode turns on —
     /// by the time the user finishes drag-selecting and hits ⌃⌥⌘S,
@@ -1131,6 +1191,100 @@ enum BrowserScripting {
             return out
         end tell
         """
+    }
+
+    // MARK: - Phase A diagnostic scripts (tab-duplicate-xray branch)
+    //
+    // Two bulk-retrieval variants used by TabEnumerator.benchmarkAndLog
+    // to measure whether collection-form AppleScript expressions
+    // ("URL of every tab of window i", "URL of every tab of every
+    // window") substantially reduce the ~3-4s snapshot time Chrome
+    // takes on an 8-window / 68-tab session. Not called from the
+    // production refresh pipeline.
+
+    /// Benchmark variant 1 — one window at a time, but reads EVERY
+    /// tab's URL / title with a single property access per window
+    /// instead of per-tab iteration. Expected AE count: ~3 per window
+    /// (bounds + URLs + titles) = ~24 total for 8 windows.
+    static func diagnosticBulkPerWindowScript(bundleID: String) -> String {
+        let tabTitle = tabTitleProperty(for: bundleID)
+        return """
+        set tabCh to (ASCII character 9)
+        set lf to (ASCII character 10)
+        tell application id "\(bundleID)"
+            set out to ""
+            set winCount to count of windows
+            if winCount > 8 then set winCount to 8
+            repeat with i from 1 to winCount
+                try
+                    set b to bounds of window i
+                    set out to out & "W" & tabCh & (i as string) & tabCh & ((item 1 of b) as string) & tabCh & ((item 2 of b) as string) & tabCh & ((item 3 of b) as string) & tabCh & ((item 4 of b) as string) & lf
+                    set theURLs to URL of every tab of window i
+                    set theTitles to \(tabTitle) of every tab of window i
+                    set tabCount to count of theURLs
+                    repeat with j from 1 to tabCount
+                        try
+                            set out to out & "T" & tabCh & (item j of theURLs as string) & tabCh & (item j of theTitles as string) & lf
+                        end try
+                    end repeat
+                end try
+            end repeat
+            return out
+        end tell
+        """
+    }
+
+    /// Benchmark variant 2 — single bulk expression for everything,
+    /// no outer repeat for the data fetch. Expected AE count: ~4 total
+    /// regardless of tab count (windowCount + bounds-of-every-window
+    /// + URL-of-every-tab-of-every-window + title-of-every-tab-of-every-window).
+    /// The serialization loops are AppleScript-local (no Chrome round-trip).
+    static func diagnosticBulkEveryTabScript(bundleID: String) -> String {
+        let tabTitle = tabTitleProperty(for: bundleID)
+        return """
+        set tabCh to (ASCII character 9)
+        set lf to (ASCII character 10)
+        tell application id "\(bundleID)"
+            set winCount to count of windows
+            if winCount > 8 then set winCount to 8
+            set winRefs to windows 1 thru winCount
+            set allBounds to bounds of winRefs
+            set allURLs to URL of every tab of winRefs
+            set allTitles to \(tabTitle) of every tab of winRefs
+        end tell
+        set out to ""
+        repeat with i from 1 to winCount
+            try
+                set b to item i of allBounds
+                set out to out & "W" & tabCh & (i as string) & tabCh & ((item 1 of b) as string) & tabCh & ((item 2 of b) as string) & tabCh & ((item 3 of b) as string) & tabCh & ((item 4 of b) as string) & lf
+                set theURLs to item i of allURLs
+                set theTitles to item i of allTitles
+                set tabCount to count of theURLs
+                repeat with j from 1 to tabCount
+                    try
+                        set out to out & "T" & tabCh & (item j of theURLs as string) & tabCh & (item j of theTitles as string) & lf
+                    end try
+                end repeat
+            end try
+        end repeat
+        return out
+        """
+    }
+
+    /// Run an arbitrary diagnostic script with wall-clock timing.
+    /// Returns (durationSeconds, output). Caller is responsible for
+    /// invoking this off the main thread for anything long-running.
+    nonisolated static func diagnosticTimedRun(source: String) -> (TimeInterval, String?) {
+        let start = CFAbsoluteTimeGetCurrent()
+        let result = runScriptWithTimeout(source: source, timeoutSeconds: 15)
+        let elapsed = CFAbsoluteTimeGetCurrent() - start
+        return (elapsed, result)
+    }
+
+    /// Exposes the current production snapshot script for benchmarking
+    /// without going through the cache path.
+    static func diagnosticFullSnapshotScript(bundleID: String) -> String {
+        return fullSnapshotScript(bundleID: bundleID)
     }
 
     /// Bounds-only enumeration — one line per window, index + bounds,

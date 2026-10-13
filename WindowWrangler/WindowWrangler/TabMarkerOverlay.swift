@@ -9,12 +9,22 @@
 //  Design intent (per project discussion):
 //  - Markers sit ABOVE each duplicate tab in the title-bar whitespace,
 //    not over the tab itself — favicons and tab titles stay visible.
-//  - Fully click-through (`ignoresMouseEvents = true`). The user closes
-//    duplicates with Chrome's own X; our markers only indicate which
-//    tabs are the same page. Markers refresh at 1Hz while active, so a
-//    close via Chrome's native X updates the display within a second.
+//  - Fully click-through everywhere except the floating pill's refresh
+//    button. The user closes duplicates with Chrome's own X.
 //  - Chrome-only for MVP. Session 3 adds Brave/Edge/Vivaldi/Opera/
 //    Chromium (same AX structure). Safari is Session 4.
+//
+//  Scan architecture (Round 2, tab-duplicate-xray):
+//  - Scans run on demand: on toggle-on, and when the user hits
+//    ⌃⌥⌘⇧X or taps the pill's refresh button.
+//  - During a scan: rainbow pulse animates around every visible Chrome
+//    window and the pill reads "Scanning Chrome tabs…".
+//  - Between scans: markers follow AX tab positions in real time via a
+//    cheap 30Hz position-only tick (never fetches URLs). The pill reads
+//    "Tab Markers · Xs ago" with a refresh glyph.
+//  - URL fetching uses `BrowserScripting.fetchChromeTabsFast` which
+//    runs collection-form AppleScript off-main and typically completes
+//    in a few hundred ms (vs ~3-4s for the per-tab iteration path).
 //
 //  Follows the same per-NSScreen panel pattern as SelectionOverlay and
 //  PlotOverlay — one panel per display, each panel's view draws every
@@ -30,35 +40,47 @@ final class TabMarkerOverlay {
 
     // MARK: - State
 
-    /// True while markers are visible on screen.
+    /// True while markers are visible on screen (overlay toggled ON).
     private(set) var isActive: Bool = false
+
+    /// True while an AppleScript scan is in flight. Drives the rainbow
+    /// pulse animation and the pill's "Scanning Chrome tabs…" text.
+    private(set) var isScanning: Bool = false
+
+    /// When the most recent successful scan completed. Pill reads
+    /// "Xs ago" from this.
+    private var lastScanAt: Date?
 
     /// One panel per NSScreen, keyed by screen's displayID.
     private var panelByDisplay: [CGDirectDisplayID: NSPanel] = [:]
     private var viewByDisplay: [CGDirectDisplayID: MarkerView] = [:]
 
-    /// Fast refresh timer (60Hz). Re-enumerates AX tab POSITIONS only,
-    /// using the cached AppleScript snapshot — never blocks on
-    /// AppleScript. Drives smooth tracking as the user drags/resizes
-    /// browser windows.
-    private var fastRefreshTimer: Timer?
+    /// 30Hz position-only tick. Re-reads AX tab positions for the
+    /// already-colored tabs and re-renders at new coordinates — never
+    /// fetches URLs, never recomputes duplicate groups. Keeps markers
+    /// smoothly glued to tabs as the user drags Chrome windows around.
+    private var movementTimer: Timer?
 
-    /// Slow prefetch timer (every 2s). Kicks off asynchronous
-    /// `BrowserScripting.prefetchAllBrowsers()` to keep the URL cache
-    /// fresh. The fetch itself runs in the background; the fast tick
-    /// only ever reads from the resulting cache.
-    private var prefetchTimer: Timer?
+    /// 60Hz pulse animation tick. Only runs while `isScanning == true`.
+    private var pulseTimer: Timer?
+
+    /// 1Hz pill-state tick. Updates the pill's "Xs ago" label while
+    /// the overlay is active and not currently scanning.
+    private var pillStateTimer: Timer?
+
+    /// Floating status pill (top-right of primary display). Shows
+    /// scan state + refresh button.
+    private let pill = TabMarkerPill()
+
+    /// Monotonic scan generation counter. Each scan() call bumps this;
+    /// completion handlers compare against the current value and drop
+    /// stale results if a newer scan superseded them.
+    private var currentScanGeneration: UInt64 = 0
 
     // MARK: - Public API
 
-    /// Toggles the overlay on or off. No-op during the brief moment
-    /// between activate and the first refresh.
     func toggle() {
-        if isActive {
-            deactivate()
-        } else {
-            activate()
-        }
+        if isActive { deactivate() } else { activate() }
     }
 
     func activate() {
@@ -67,49 +89,114 @@ final class TabMarkerOverlay {
         Log.tabXray.info("TabMarkerOverlay activated")
         createPanelsForAllScreens()
 
-        // Kick off the first prefetch immediately so the cache
-        // populates while the user looks at the markers for the first
-        // time. Everything else from here on reads the cache only.
-        BrowserScripting.prefetchAllBrowsers()
+        pill.onRefreshTapped = { [weak self] in self?.refresh() }
+        pill.show(initialState: .scanning)
 
-        // Fast tick: 60Hz. AX enumeration is microseconds-cheap, so
-        // the entire pipeline (read AX positions, re-match to cached
-        // AppleScript snapshot, re-render) stays well inside a frame
-        // budget. Smooth tracking during window drags/resizes.
-        // Timer scheduled from MainActor context fires on main runloop
-        // — assumeIsolated is the correct bridge back to MainActor
-        // without the Task overhead that would run per tick.
-        fastRefreshTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.refreshNow() }
+        // Movement tracker runs continuously while active — cheap
+        // (AX frame queries are microseconds), keeps markers glued to
+        // moving Chrome windows between scans.
+        movementTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.updateMarkerPositions() }
         }
 
-        // Slow tick: every 2s re-trigger an asynchronous prefetch so
-        // the URL/title cache tracks tab add/remove/close within a
-        // couple of seconds. Prefetch itself runs on a background
-        // thread; this timer just kicks it off.
-        prefetchTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { _ in
-            MainActor.assumeIsolated { BrowserScripting.prefetchAllBrowsers() }
+        // Pill state tick — updates "Xs ago" every second while idle.
+        pillStateTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.refreshPillLabel() }
         }
 
-        // One free render pass so markers appear immediately for
-        // whatever's already in cache (common case: lasso coordinator
-        // has prefetched recently).
-        refreshNow()
+        // Kick the first scan immediately so the rainbow pulse starts
+        // + initial markers land asap.
+        scan()
     }
 
     func deactivate() {
         guard isActive else { return }
         isActive = false
+        isScanning = false
         Log.tabXray.info("TabMarkerOverlay deactivated")
-        fastRefreshTimer?.invalidate()
-        fastRefreshTimer = nil
-        prefetchTimer?.invalidate()
-        prefetchTimer = nil
+
+        movementTimer?.invalidate()
+        movementTimer = nil
+        pulseTimer?.invalidate()
+        pulseTimer = nil
+        pillStateTimer?.invalidate()
+        pillStateTimer = nil
+
+        pill.hide()
+
         for panel in panelByDisplay.values {
             panel.orderOut(nil)
         }
         panelByDisplay.removeAll(keepingCapacity: true)
         viewByDisplay.removeAll(keepingCapacity: true)
+    }
+
+    /// User-triggered refresh (shortcut or pill button). No-op if
+    /// already scanning or if the overlay is off.
+    func refresh() {
+        guard isActive else { return }
+        guard !isScanning else { return }
+        scan()
+    }
+
+    // MARK: - Scan
+
+    /// Kicks off an asynchronous Chrome snapshot. During the scan the
+    /// pill reads "Scanning…" and the rainbow pulse animates around
+    /// every visible Chrome window. On completion, markers update and
+    /// the pulse fades out.
+    private func scan() {
+        currentScanGeneration &+= 1
+        let generation = currentScanGeneration
+        isScanning = true
+        pill.update(state: .scanning)
+        startPulseAnimation()
+
+        Log.tabXray.info("Scan gen=\(generation, privacy: .public) started")
+
+        Task { [weak self] in
+            let snapshot = await BrowserScripting.fetchChromeTabsFast(bundleID: "com.google.Chrome")
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                guard self.isActive else { return }
+                guard generation == self.currentScanGeneration else {
+                    Log.tabXray.info("Scan gen=\(generation, privacy: .public) superseded; dropping result")
+                    return
+                }
+                self.applyScanResult(snapshot: snapshot, generation: generation)
+            }
+        }
+    }
+
+    private func applyScanResult(
+        snapshot: [BrowserScripting.BrowserWindowSnapshot]?,
+        generation: UInt64
+    ) {
+        isScanning = false
+        stopPulseAnimation()
+        lastScanAt = Date()
+
+        if let snapshot {
+            Log.tabXray.info("Scan gen=\(generation, privacy: .public) returned \(snapshot.count, privacy: .public) window(s)")
+            rebuildMarkersFromSnapshot(snapshot)
+        } else {
+            Log.tabXray.info("Scan gen=\(generation, privacy: .public) returned nil (timeout or empty)")
+            // Keep previous markers rendered rather than blanking the
+            // overlay — matches the "momentary visual retention" the
+            // user flagged as acceptable.
+        }
+        refreshPillLabel()
+    }
+
+    private func refreshPillLabel() {
+        guard isActive, !isScanning else { return }
+        let secondsAgo: Int
+        if let ts = lastScanAt {
+            secondsAgo = max(0, Int(Date().timeIntervalSince(ts).rounded()))
+        } else {
+            secondsAgo = 0
+        }
+        pill.update(state: .idle(secondsAgo: secondsAgo))
     }
 
     // MARK: - Panel setup
@@ -159,11 +246,44 @@ final class TabMarkerOverlay {
         return (panel, view)
     }
 
-    // MARK: - Refresh pipeline
+    // MARK: - Position-only refresh (30Hz movement tracking)
 
-    private func refreshNow() {
+    /// Last-COMMITTED AX tab-count signature across Chrome's visible
+    /// windows. Changing signature → tabs were added, removed, or
+    /// moved between windows → trigger an auto-scan so markers reflect
+    /// the new reality within a frame or two.
+    private var lastAXTabSignature: String = ""
+
+    /// Candidate replacement signature, awaiting confirmation. Chrome's
+    /// AX tree briefly flaps when the hover-link status bubble shows
+    /// (tab count drops by 1 for a tick or two, then recovers). We
+    /// require any change to be stable for at least `signatureStableTicks`
+    /// consecutive observations before committing it as a real change
+    /// and triggering a scan.
+    private var pendingSignature: String = ""
+    private var pendingSignatureConsecutiveTicks: Int = 0
+    private static let signatureStableTicks: Int = 3   // ~100ms at 30Hz
+
+    /// Timestamp of the most recent scan START, used for a short
+    /// cooldown so a user rapidly opening / closing tabs doesn't
+    /// trigger a scan-storm. Scans are cheap but still ~500ms of
+    /// background AppleScript work; one per 300ms is plenty.
+    private var lastAutoScanAt: Date?
+
+    /// Minimum interval between auto-triggered scans. User-triggered
+    /// scans (shortcut / pill button / toggle-on) bypass this.
+    private static let autoScanCooldown: TimeInterval = 0.3
+
+    /// Called by the movement timer at 30Hz and once after each
+    /// successful scan. Reads AX tab positions fresh, reuses the
+    /// cached AppleScript snapshot for URL/color data. Never fetches
+    /// unless the AX tab-count signature changes, which signals the
+    /// user closed/opened a tab via Chrome's native UI and we need a
+    /// fresh URL list to recompute duplicates.
+    private func updateMarkerPositions() {
+        // Fast path: render markers from current AX positions + cached
+        // snapshot. Pure read, no AppleScript.
         let markers = computeMarkers()
-        // Distribute markers to the display they fall on.
         var markersByDisplay: [CGDirectDisplayID: [TabMarker]] = [:]
         for marker in markers {
             markersByDisplay[marker.displayID, default: []].append(marker)
@@ -172,6 +292,84 @@ final class TabMarkerOverlay {
             view.markers = markersByDisplay[displayID] ?? []
             view.needsDisplay = true
         }
+
+        // Event-free "did tabs change?" check with debounce.
+        //
+        // Chrome's AX tree briefly flaps when its hover-link status
+        // bubble shows (and in some other transient internal UI
+        // updates): tab count on an affected window drops by 1 for a
+        // tick or two, then recovers. We detect the change but DO NOT
+        // commit it unless the new signature is observed on 3+
+        // consecutive ticks (~100ms at 30Hz). Transient flaps that
+        // last 1-2 ticks are ignored; real tab add/remove, which
+        // persists, triggers a scan with ~100ms added latency.
+        let current = currentAXTabSignature()
+        if current == lastAXTabSignature {
+            // Signature stable — any pending candidate change was a
+            // flap that already recovered. Clear it.
+            pendingSignature = ""
+            pendingSignatureConsecutiveTicks = 0
+        } else if current == pendingSignature {
+            pendingSignatureConsecutiveTicks += 1
+            if pendingSignatureConsecutiveTicks >= Self.signatureStableTicks {
+                lastAXTabSignature = current
+                pendingSignature = ""
+                pendingSignatureConsecutiveTicks = 0
+                if !isScanning {
+                    let now = Date()
+                    let elapsed = lastAutoScanAt.map { now.timeIntervalSince($0) } ?? .infinity
+                    if elapsed >= Self.autoScanCooldown {
+                        lastAutoScanAt = now
+                        scan()
+                    }
+                }
+            }
+        } else {
+            // New candidate change. Start the stability counter.
+            pendingSignature = current
+            pendingSignatureConsecutiveTicks = 1
+            // Seed the baseline on the very first observation after
+            // activate() so the first legitimate stable reading
+            // commits as the baseline without triggering a scan.
+            if lastAXTabSignature.isEmpty {
+                lastAXTabSignature = current
+                pendingSignature = ""
+                pendingSignatureConsecutiveTicks = 0
+            }
+        }
+    }
+
+    /// Fast "did tabs change?" signature. Per-window tab counts in
+    /// AX order, joined. Catches add/remove/move-between-windows
+    /// without needing AppleScript. Signature changes don't need to
+    /// uniquely identify tabs — any delta triggers an auto-scan.
+    private func currentAXTabSignature() -> String {
+        var parts: [String] = []
+        for app in NSWorkspace.shared.runningApplications
+            where app.bundleIdentifier == "com.google.Chrome" {
+            let axApp = AXUIElementCreateApplication(app.processIdentifier)
+            var value: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(
+                axApp, kAXWindowsAttribute as CFString, &value
+            ) == .success, let windows = value as? [AXUIElement] else {
+                continue
+            }
+            for win in windows {
+                let tabs = findTabFrames(under: win, depth: 0)
+                parts.append(String(tabs.count))
+            }
+        }
+        return parts.joined(separator: "|")
+    }
+
+    /// Called by applyScanResult after a scan commits new data to the
+    /// AppleScript cache. Forces one immediate position+color refresh
+    /// so markers appear right away rather than waiting up to 33ms
+    /// for the next movement tick.
+    private func rebuildMarkersFromSnapshot(
+        _ snapshot: [BrowserScripting.BrowserWindowSnapshot]
+    ) {
+        updateMarkerPositions()
     }
 
     /// Returns every marker (duplicate tab) that should be visible on
@@ -508,6 +706,94 @@ final class TabMarkerOverlay {
         guard let b = best, b.distance <= 50 else { return nil }
         return b.window
     }
+
+    // MARK: - Rainbow pulse (scan-in-progress feedback)
+
+    /// Height in AX points of the title-bar + tab-strip region we draw
+    /// the pulse around. Chrome's title bar is ~28pt, tab strip adds
+    /// another ~34pt — 70pt covers both with a few pixels of air.
+    private static let pulseStripHeightAX: CGFloat = 70
+
+    private func startPulseAnimation() {
+        let framesCocoaByDisplay = computeChromePulseFramesCocoa()
+        pulseStartedAt = Date()
+        for (displayID, view) in viewByDisplay {
+            view.pulseFrames = framesCocoaByDisplay[displayID] ?? []
+            view.pulsePhase = 0
+            view.pulseAlpha = 0.45
+            view.needsDisplay = true
+        }
+        pulseTimer?.invalidate()
+        pulseTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.tickPulseAnimation() }
+        }
+    }
+
+    private func stopPulseAnimation() {
+        pulseTimer?.invalidate()
+        pulseTimer = nil
+        pulseStartedAt = nil
+        for view in viewByDisplay.values {
+            view.pulseFrames = []
+            view.pulsePhase = 0
+            view.pulseAlpha = 0
+            view.needsDisplay = true
+        }
+    }
+
+    private func tickPulseAnimation() {
+        guard let started = pulseStartedAt else { return }
+        let elapsed = Date().timeIntervalSince(started)
+        // Phase cycles 0→1 every 1.5s — drives the gradient's hue
+        // rotation around the outline.
+        let phase = CGFloat(elapsed.truncatingRemainder(dividingBy: 1.5) / 1.5)
+        // Refresh pulse rects every ~250ms so a window dragged mid-scan
+        // keeps its outline anchored. Cheap: handful of AX frame reads.
+        let shouldRefreshFrames = Int(elapsed * 4) != Int((elapsed - 1.0 / 60.0) * 4)
+        var framesCocoaByDisplay: [CGDirectDisplayID: [CGRect]]? = nil
+        if shouldRefreshFrames {
+            framesCocoaByDisplay = computeChromePulseFramesCocoa()
+        }
+        for (displayID, view) in viewByDisplay {
+            if let frames = framesCocoaByDisplay?[displayID] {
+                view.pulseFrames = frames
+            }
+            view.pulsePhase = phase
+            view.pulseAlpha = 0.45
+            view.needsDisplay = true
+        }
+    }
+
+    private var pulseStartedAt: Date?
+
+    /// Enumerates Chrome's visible AX windows, computes a pulse rect
+    /// around the top ~70pt of each (title bar + tab strip), converts
+    /// to Cocoa coords, and buckets by display for per-panel rendering.
+    private func computeChromePulseFramesCocoa() -> [CGDirectDisplayID: [CGRect]] {
+        var out: [CGDirectDisplayID: [CGRect]] = [:]
+        for app in NSWorkspace.shared.runningApplications {
+            guard app.bundleIdentifier == "com.google.Chrome" else { continue }
+            let axApp = AXUIElementCreateApplication(app.processIdentifier)
+            var value: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(
+                axApp, kAXWindowsAttribute as CFString, &value
+            ) == .success else { continue }
+            guard let windows = value as? [AXUIElement] else { continue }
+            for win in windows {
+                guard let windowFrameAX = frameOf(win), windowFrameAX.width > 100 else { continue }
+                let pulseAX = CGRect(
+                    x: windowFrameAX.origin.x,
+                    y: windowFrameAX.origin.y,
+                    width: windowFrameAX.width,
+                    height: min(Self.pulseStripHeightAX, windowFrameAX.height)
+                )
+                if let (cocoaRect, displayID) = convertAXToCocoa(pulseAX) {
+                    out[displayID, default: []].append(cocoaRect)
+                }
+            }
+        }
+        return out
+    }
 }
 
 // MARK: - Model
@@ -523,16 +809,33 @@ struct TabMarker {
 // MARK: - View
 
 /// The actual drawing surface. One per NSScreen.
+///
+/// Renders two kinds of content:
+///   1. `markers` — the thin colored bars above duplicate tabs.
+///   2. `pulseFrames` — rainbow spectrum outlines around each visible
+///      Chrome window's tab-strip region, shown ONLY while a scan is
+///      in progress. Hue phase shifts along the outline over time to
+///      give the "scanning" sensation.
 private final class MarkerView: NSView {
     var markers: [TabMarker] = []
-    /// This screen's origin in Cocoa coords — used by hit-testing
-    /// debugging if ever added. For draw itself we work in local coords
-    /// since each panel's frame equals its screen's frame.
+    /// This screen's origin in Cocoa coords — reserved for hit-testing
+    /// / debug diagnostics.
     var screenOriginInCocoa: CGPoint = .zero
+
+    // Pulse state driven by TabMarkerOverlay.tickPulseAnimation.
+    var pulseFrames: [CGRect] = []
+    var pulsePhase: CGFloat = 0        // 0..1, loops
+    var pulseAlpha: CGFloat = 0        // 0..1, 0 = pulse hidden
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+
+        // Draw pulses FIRST so markers paint on top of them.
+        if pulseAlpha > 0 && !pulseFrames.isEmpty {
+            drawPulses(ctx: ctx)
+        }
+
         for marker in markers {
             let r = marker.frameCocoa
             let radius: CGFloat = min(2, r.height / 2)
@@ -541,6 +844,69 @@ private final class MarkerView: NSView {
             ctx.setFillColor(marker.color.cgColor)
             ctx.fillPath()
         }
+    }
+
+    private func drawPulses(ctx: CGContext) {
+        let lineWidth: CGFloat = 4
+        let cornerRadius: CGFloat = 10
+        let inset: CGFloat = -lineWidth / 2
+        // Rainbow stop colors (traditional ROYGBIV) — distinct from the
+        // marker palette so a user scanning a page with real markers
+        // still sees the pulse as "that's the scanning indicator."
+        let stops: [NSColor] = [
+            NSColor(calibratedRed: 1.00, green: 0.00, blue: 0.00, alpha: 1),  // red
+            NSColor(calibratedRed: 1.00, green: 0.50, blue: 0.00, alpha: 1),  // orange
+            NSColor(calibratedRed: 1.00, green: 0.95, blue: 0.00, alpha: 1),  // yellow
+            NSColor(calibratedRed: 0.00, green: 0.85, blue: 0.20, alpha: 1),  // green
+            NSColor(calibratedRed: 0.00, green: 0.55, blue: 1.00, alpha: 1),  // blue
+            NSColor(calibratedRed: 0.40, green: 0.20, blue: 0.80, alpha: 1),  // indigo
+            NSColor(calibratedRed: 0.70, green: 0.30, blue: 0.90, alpha: 1),  // violet
+        ]
+
+        ctx.saveGState()
+        ctx.setLineWidth(lineWidth)
+        for frame in pulseFrames {
+            let rect = frame.insetBy(dx: inset, dy: inset)
+            let path = CGPath(
+                roundedRect: rect,
+                cornerWidth: cornerRadius,
+                cornerHeight: cornerRadius,
+                transform: nil
+            )
+            // Clip to the outline band so the gradient only paints
+            // around the border, not across the inside.
+            ctx.saveGState()
+            ctx.addPath(path)
+            ctx.replacePathWithStrokedPath()
+            ctx.clip()
+
+            // Linear gradient across the band, with hue phase shifted
+            // by pulsePhase so colors appear to flow around the window
+            // over time.
+            let shiftedStops: [NSColor] = Self.phaseShifted(stops, by: pulsePhase)
+            let cgColors = shiftedStops.map { $0.withAlphaComponent(pulseAlpha).cgColor } as CFArray
+            let locations: [CGFloat] = stops.enumerated().map { idx, _ in
+                CGFloat(idx) / CGFloat(stops.count - 1)
+            }
+            if let gradient = CGGradient(
+                colorsSpace: CGColorSpaceCreateDeviceRGB(),
+                colors: cgColors,
+                locations: locations
+            ) {
+                let start = CGPoint(x: rect.minX, y: rect.minY)
+                let end = CGPoint(x: rect.maxX, y: rect.maxY)
+                ctx.drawLinearGradient(gradient, start: start, end: end, options: [])
+            }
+            ctx.restoreGState()
+        }
+        ctx.restoreGState()
+    }
+
+    private static func phaseShifted(_ stops: [NSColor], by phase: CGFloat) -> [NSColor] {
+        guard !stops.isEmpty else { return stops }
+        let offset = Int((phase * CGFloat(stops.count)).truncatingRemainder(dividingBy: CGFloat(stops.count)))
+        if offset == 0 { return stops }
+        return Array(stops[offset...] + stops[..<offset])
     }
 
     override var isFlipped: Bool { false }  // Cocoa coords (bottom-left)

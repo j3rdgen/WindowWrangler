@@ -126,6 +126,7 @@ enum MenuBuilder {
         menu.addItem(.separator())
         addLaunchAtLoginItem(to: menu, target: target, enabled: state.launchAtLoginEnabled)
         addDebugScanBrowserTabsItem(to: menu, target: target)
+        addDebugBenchmarkAppleScriptItem(to: menu, target: target)
         addQuitItem(to: menu)
 
         return menu
@@ -449,6 +450,26 @@ enum MenuBuilder {
         menu.addItem(item)
     }
 
+    /// Phase A benchmark item (tab-duplicate-xray branch).
+    /// Runs three AppleScript snapshot strategies back-to-back for
+    /// every running supported browser and logs the wall-clock timing
+    /// of each. Blocks the UI briefly (3–15 seconds); results land in
+    /// Console under subsystem `com.jmw3.WindowWrangler`, category
+    /// `tabXray`.
+    private static func addDebugBenchmarkAppleScriptItem(
+        to menu: NSMenu,
+        target: WindowWranglerActions
+    ) {
+        let item = NSMenuItem(
+            title: "Debug: AppleScript Benchmark → Console",
+            action: #selector(WindowWranglerActions.debugBenchmarkAppleScript),
+            keyEquivalent: ""
+        )
+        item.target = target
+        item.isEnabled = true
+        menu.addItem(item)
+    }
+
     /// Tab Markers toggle (tab-duplicate-xray branch). Shows a check
     /// mark while the overlay is on screen. Shortcut hint shown is
     /// purely cosmetic — the actual firing is handled by
@@ -459,7 +480,9 @@ enum MenuBuilder {
         modifiers: NSEvent.ModifierFlags,
         active: Bool
     ) {
-        let title = active ? "Hide Tab Markers" : "Show Tab Markers"
+        let title = active
+            ? "Exit Plow Mode (Mark Duplicate Tabs)"
+            : "Enter Plow Mode (Mark Duplicate Tabs)"
         let item = NSMenuItem(
             title: title,
             action: #selector(WindowWranglerActions.toggleTabMarkers),
@@ -470,5 +493,18 @@ enum MenuBuilder {
         item.state = active ? .on : .off
         item.isEnabled = true
         menu.addItem(item)
+
+        // Refresh — only meaningful while Plow Mode is active. Grayed
+        // out otherwise so the user sees it exists but understands the
+        // precondition.
+        let refresh = NSMenuItem(
+            title: "Refresh Plow Mode Scan",
+            action: #selector(WindowWranglerActions.refreshTabMarkers),
+            keyEquivalent: "d"
+        )
+        refresh.keyEquivalentModifierMask = modifiers.union(.shift)
+        refresh.target = target
+        refresh.isEnabled = active
+        menu.addItem(refresh)
     }
 }

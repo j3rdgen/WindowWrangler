@@ -369,15 +369,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
             label: "Plot (Snap Window to Drawn Area)"
         ))
 
-        // Tab Markers (tab-duplicate-xray branch). Toggles the colored
-        // duplicate-tab marker overlay for the browsers Window Wrangler
-        // supports. MVP is Chrome-only; expands to the full Chromium
-        // family + Safari in later sessions.
+        // Tab Markers (tab-duplicate-xray branch). ⌃⌥⌘D toggles the
+        // overlay on/off ("D" for Duplicates). ⌃⌥⌘⇧D asks the active
+        // overlay for a fresh scan without needing to open the menu
+        // or click the pill. MVP is Chrome-only; expands to the full
+        // Chromium family + Safari in later sessions.
+        //
+        // The earlier reported "shortcut didn't fire" was actually
+        // "no visible feedback on toggle" — the overlay WAS activating
+        // but the scan took 3-4s with no indicator so the user
+        // reasonably assumed nothing happened. The rainbow pulse +
+        // floating pill added in Round 2 fix the perception issue;
+        // the chord itself was fine all along.
         shortcuts.register(.init(
             modifiers: modifiers,
             keyCode: KeyCode.d,
             action: { [weak self] in self?.toggleTabMarkers() },
-            label: "Toggle Tab Markers"
+            label: "Toggle Plow Mode"
+        ))
+        shortcuts.register(.init(
+            modifiers: [.control, .option, .command, .shift],
+            keyCode: KeyCode.d,
+            action: { [weak self] in self?.refreshTabMarkers() },
+            label: "Refresh Plow Mode"
+        ))
+
+        // Esc exits Plow Mode. Gated via enabledPredicate so bare Esc
+        // only gets consumed when Plow is actually on screen — Esc
+        // otherwise reaches the focused app untouched (critical: Esc
+        // is a universal "cancel" key, we must not steal it globally).
+        shortcuts.register(.init(
+            modifiers: [],
+            keyCode: KeyCode.escape,
+            action: { [weak self] in
+                guard let self, self.tabMarkerOverlay.isActive else { return }
+                self.toggleTabMarkers()
+            },
+            label: "End Plow Mode (Esc)",
+            enabledPredicate: { [weak self] in
+                self?.tabMarkerOverlay.isActive == true
+            }
         ))
     }
 
@@ -862,6 +893,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
     @objc func toggleTabMarkers() {
         tabMarkerOverlay.toggle()
         rebuildMenu()
+    }
+
+    @objc func refreshTabMarkers() {
+        tabMarkerOverlay.refresh()
+    }
+
+    @objc func debugBenchmarkAppleScript() {
+        // Intentionally blocks main for the 3–15s the benchmark takes.
+        // BrowserScripting.runScriptWithTimeout dispatches each script
+        // to a background queue but then semaphore-waits on the caller,
+        // so this freezes the UI briefly. Acceptable because this is a
+        // user-triggered diagnostic — the user clicked the debug item
+        // because they want timings right now, not a smooth menu.
+        TabEnumerator.benchmarkAndLog()
     }
 
     // MARK: - Zombie prevention + clean shutdown
