@@ -81,6 +81,29 @@ Single-window precision placement — bound to `⌃⌥⌘P`. Click to select, dr
 - **`PlotModeHint.swift`** — the persistent "Press Esc to End Plot Mode" pill. `show()` / `hide()` / `hideImmediately()` / `dim()` / `undim()` (dims to alpha 0.28 after a window is selected so the pill doesn't obscure the drawing area).
 - **`PlotOverlay.swift`** — per-display NSPanel overlays that render the selected-window outline (dashed blue), the live Plot Area preview (translucent fill + snapped-edge emphasis), and the landing pulse around the final settled frame. Generation-guarded so a mode-teardown mid-animation can't leave overlays visible.
 
+### Declutter Mode (Mark Duplicate Tabs)
+
+Duplicate-tab highlighter for Chrome — bound to `⌃⌥⌘D` (toggle) and `⌃⌥⌘⇧D` (refresh). Shows thin colored bars above every tab whose URL also appears in another visible or off-Space Chrome window. Chrome-only in this release; Chromium family and Safari planned.
+
+- **`TabMarkerOverlay.swift`** — the per-screen renderer + scan coordinator. Owns the on/off `isActive` and in-flight `isScanning` state, the per-NSScreen transparent panels (click-through, `.readOnly` sharing so markers appear in screen recordings), and three timers:
+  - `movementTimer` (30Hz): re-reads AX tab positions for already-colored tabs and re-renders. Zero AppleScript cost per tick. Keeps markers glued to Chrome windows during drags.
+  - `pulseTimer` (60Hz, only while scanning): drives the pill's blue-outline pulse phase.
+  - `pillStateTimer` (1Hz): updates the pill's "scanned Xs ago" label while idle.
+  Also hosts the AX tab-count signature + debounce logic: changes must hold for 2 ticks on a strict decrease (close is unambiguous) or 3 ticks for anything else (filters the 1-2 tick hover-link status-bubble flap), then fires `scan()` with a 300ms cooldown. On count mismatch between AX and the cached AppleScript snapshot (transient — tab just closed, snapshot not yet refreshed), renders markers for the FIRST `min(ax, script)` positions rather than blanking the window; one marker may be briefly misaligned but no mass vanish.
+  Window matching is a three-pass greedy assignment in `pairAXToAppleScript`: (1) frame origin within 10pt + matching tab count, (2) within 100pt + matching tab count, (3) tab-count equality + closest-center up to 500pt. Position-primary because both AX and AppleScript report window bounds in the same AX coordinate space; tab-count-only (the previous matcher) misassigned when multiple windows had the same tab count on different Spaces.
+- **`TabMarkerPill.swift`** — floating status pill under the menu bar, mirrors the LassoModeHint / PlotModeHint capsule format (dark translucent, 13pt medium, centered on the active screen). Shows "Declutter Mode · scanning Chrome tabs… · Esc to end" during a scan; "Declutter Mode · scanned duplicate tabs Xs ago · ↻ · Esc to end" when idle. The ↻ is a clickable button (hit-tested only when visible via alphaValue) that triggers an immediate rescan. Hosts a `PulseOutlineView` subview that traces a continuous (NOT dashed) blue stroke in `NSColor.controlAccentColor` just outside the capsule edge, with alpha breathing `sin(π·phase)` while a scan is in progress. The pill grows by `2 × outlineMargin` in both dimensions to reserve stroke room.
+- **`TabEnumerator.swift`** — standalone diagnostic: walks each running Chromium/Safari process's AX tree, logs tab role / position / size / title plus the AppleScript snapshot side-by-side + the `DUPES:` grouping. Wired to a Debug menu item; not called from the production refresh pipeline. Also hosts `benchmarkAndLog()` which runs three AppleScript strategies back-to-back (per-tab iteration vs bulk-per-window vs bulk-every-tab-of-every-window) so the fastest can be verified empirically before adoption.
+- **`BrowserScripting.swift`** additions for Declutter:
+  - `fetchChromeTabsFast(bundleID:) async → [BrowserWindowSnapshot]?` — the production scan path. Uses `diagnosticBulkEveryTabScript` (Variant C: single collection-form expression returning URLs/titles/bounds for every tab of every window — ~4 Apple Events total regardless of tab count) with `diagnosticBulkPerWindowScript` (Variant B: one URL/title read per window) as a fallback. Expected wall-clock cost: 100-800ms vs ~3-4s for the per-tab iteration baseline. Writes successful results to the shared snapshot cache so the next read is instant.
+  - `cachedSnapshot(for:) → [BrowserWindowSnapshot]?` — promoted from `private` to internal so the overlay can read cache without triggering the blocking sync fetch.
+- **`GlobalShortcuts.swift`** additions: `Binding` gains an optional `enabledPredicate: (() -> Bool)?`. Used to register bare `Esc` globally without consuming it in every app — the predicate returns false when Declutter is off, so `Esc` passes through to the focused app in that case.
+
+Design invariants worth preserving:
+- Deterministic scan planning: color assignment uses sorted normalized URLs so a URL's color is stable across scans. The pill's refresh never reshuffles colors just because a new scan ran.
+- No AppleScript on the main-thread tick. All AppleScript runs via `runScriptAsync` on a background queue; the overlay only reads cached results.
+- No cross-feature coupling: Lasso, Plot, Corral, and the Cascade pipeline are untouched. The overlay's panels sit at `.floating + 1` so a Lasso/Plot overlay drawn mid-scan doesn't visually mask Declutter markers.
+- Visibility-to-screen-recordings: all overlays use `sharingType = .readOnly`.
+
 ### Corral
 
 - **`Corral.swift`** — `Corral`, `CorralMember`, `TabInfo` value types. `Codable` for UserDefaults persistence.

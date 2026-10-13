@@ -16,9 +16,10 @@
 //
 //  Scan architecture (Round 2, tab-duplicate-xray):
 //  - Scans run on demand: on toggle-on, and when the user hits
-//    ⌃⌥⌘⇧X or taps the pill's refresh button.
-//  - During a scan: rainbow pulse animates around every visible Chrome
-//    window and the pill reads "Scanning Chrome tabs…".
+//    ⌃⌥⌘⇧D or taps the pill's refresh button.
+//  - During a scan: rainbow pulse animates on the UNDERSIDE of the
+//    pill (flat gradient strip) and the pill reads "scanning Chrome
+//    tabs…". Chrome windows themselves are not decorated.
 //  - Between scans: markers follow AX tab positions in real time via a
 //    cheap 30Hz position-only tick (never fetches URLs). The pill reads
 //    "Tab Markers · Xs ago" with a refresh glyph.
@@ -262,7 +263,14 @@ final class TabMarkerOverlay {
     /// and triggering a scan.
     private var pendingSignature: String = ""
     private var pendingSignatureConsecutiveTicks: Int = 0
-    private static let signatureStableTicks: Int = 3   // ~100ms at 30Hz
+    /// Required consecutive observations of a new signature before
+    /// committing it as a real change and firing a scan. 2 ticks for
+    /// a DECREASE (closes are unambiguous — if the new count held for
+    /// 66ms, it's a real close), 3 for anything else (filters the
+    /// 1-2 tick hover-link flap that briefly drops a tab count then
+    /// recovers).
+    private static let signatureStableTicksDecrease: Int = 2
+    private static let signatureStableTicksOther: Int = 3
 
     /// Timestamp of the most recent scan START, used for a short
     /// cooldown so a user rapidly opening / closing tabs doesn't
@@ -311,7 +319,13 @@ final class TabMarkerOverlay {
             pendingSignatureConsecutiveTicks = 0
         } else if current == pendingSignature {
             pendingSignatureConsecutiveTicks += 1
-            if pendingSignatureConsecutiveTicks >= Self.signatureStableTicks {
+            // Decrease (tab closed) commits faster — close is
+            // unambiguous and users want the marker refresh ASAP.
+            let required = Self.ticksRequiredForTransition(
+                from: lastAXTabSignature,
+                to: current
+            )
+            if pendingSignatureConsecutiveTicks >= required {
                 lastAXTabSignature = current
                 pendingSignature = ""
                 pendingSignatureConsecutiveTicks = 0
@@ -337,6 +351,28 @@ final class TabMarkerOverlay {
                 pendingSignatureConsecutiveTicks = 0
             }
         }
+    }
+
+    /// Classifies a signature transition and returns how many consecutive
+    /// stable observations are required before firing a scan. Pure
+    /// string comparison on the "|"-joined per-window counts; a strict
+    /// decrease (every per-window count is <= and at least one is <)
+    /// is treated as a tab close.
+    private static func ticksRequiredForTransition(
+        from old: String, to new: String
+    ) -> Int {
+        let oldCounts = old.split(separator: "|").compactMap { Int($0) }
+        let newCounts = new.split(separator: "|").compactMap { Int($0) }
+        // Different window arrangement (new/closed window): treat as
+        // "other" — slower debounce so a window appearing and
+        // disappearing in quick succession doesn't trigger scans.
+        guard oldCounts.count == newCounts.count else { return signatureStableTicksOther }
+        var sawDecrease = false
+        for (o, n) in zip(oldCounts, newCounts) {
+            if n > o { return signatureStableTicksOther }
+            if n < o { sawDecrease = true }
+        }
+        return sawDecrease ? signatureStableTicksDecrease : signatureStableTicksOther
     }
 
     /// Fast "did tabs change?" signature. Per-window tab counts in
@@ -419,12 +455,16 @@ final class TabMarkerOverlay {
 
         var markers: [TabMarker] = []
         for (axWindow, appleScriptWindow) in mapping {
-            // Count equality is the sanity check — matched windows
-            // must agree on tab count or we skip. Tab add/remove is
-            // the one scenario this guards against; the next 2s
-            // prefetch refills the cache and we recover.
-            guard axWindow.tabs.count == appleScriptWindow.tabs.count else { continue }
-            for (axIdx, axTab) in axWindow.tabs.enumerated() {
+            // On transient count mismatch (Chrome just closed/opened a
+            // tab, cache not yet refreshed), render markers for the
+            // FIRST min(axCount, scriptCount) positions instead of
+            // blanking the entire window. Correct for close-at-end;
+            // close-at-middle may misalign one marker for ~500ms until
+            // the scan refreshes the cache. Trade-off is deliberate:
+            // one briefly-wrong marker beats every marker vanishing.
+            let safeCount = Swift.min(axWindow.tabs.count, appleScriptWindow.tabs.count)
+            for axIdx in 0..<safeCount {
+                let axTab = axWindow.tabs[axIdx]
                 let scriptTab = appleScriptWindow.tabs[axIdx]
                 let normalized = BrowserScripting.normalizedURL(scriptTab.url)
                 guard let color = colorByURL[normalized] else { continue }
@@ -436,24 +476,92 @@ final class TabMarkerOverlay {
     }
 
     /// Pairs each AX window to the single best-matching AppleScript
-    /// window from `snapshot`. Greedy, unique assignment: once an
-    /// AppleScript window is used, it can't be matched to another AX
-    /// window. Candidate quality is primarily tab-count equality (a
-    /// strong signature during ordinary use), tie-broken by frame
-    /// center distance. Threshold is 500pt — generous enough that a
-    /// window move in flight won't drop markers mid-drag.
+    /// window from `snapshot`. Both sources report window frames in
+    /// AX coordinate space, so position identity is the strongest
+    /// available signal — much stronger than tab-count equality
+    /// (two Chrome windows frequently have identical tab counts).
+    ///
+    /// Multi-pass strategy, each pass stricter than the next:
+    ///
+    ///   Pass 1 — exact-position match (origin within 10pt in both
+    ///            dimensions). Resolves the common case where AX and
+    ///            AppleScript bounds agree to the pixel.
+    ///   Pass 2 — close-position match (origin within 100pt). Catches
+    ///            windows that moved slightly between the AppleScript
+    ///            snapshot and the AX enumeration tick.
+    ///   Pass 3 — tab-count fallback for anything still unmatched,
+    ///            with frame-center distance as tie-breaker. Only
+    ///            fires for the rare case where positions disagree
+    ///            significantly (never seen in practice but keeps the
+    ///            matcher resilient).
+    ///
+    /// Each pass greedily assigns and marks AppleScript candidates
+    /// used so later passes don't double-assign. Passes always honor
+    /// tab-count equality where available — a match with differing
+    /// tab counts gets a severe score penalty and only wins when
+    /// nothing better exists.
     private func pairAXToAppleScript(
         axWindows: [AXWindowTabs],
         snapshot: [BrowserScripting.BrowserWindowSnapshot]
     ) -> [(AXWindowTabs, BrowserScripting.BrowserWindowSnapshot)] {
-        var used = Set<Int>()  // indices into snapshot already matched
+        var used = Set<Int>()
         var result: [(AXWindowTabs, BrowserScripting.BrowserWindowSnapshot)] = []
+        var unmatched: [AXWindowTabs] = []
 
+        // Pass 1 — origin within 10pt + matching tab count (strict).
         for axWindow in axWindows {
+            guard let axFrame = axWindow.windowFrameAX else { continue }
+            let axTabCount = axWindow.tabs.count
+            var pick: Int? = nil
+            for (idx, candidate) in snapshot.enumerated() where !used.contains(idx) {
+                let b = candidate.boundsAX
+                guard abs(b.origin.x - axFrame.origin.x) <= 10,
+                      abs(b.origin.y - axFrame.origin.y) <= 10,
+                      candidate.tabs.count == axTabCount else { continue }
+                pick = idx
+                break
+            }
+            if let p = pick {
+                used.insert(p)
+                result.append((axWindow, snapshot[p]))
+            } else {
+                unmatched.append(axWindow)
+            }
+        }
+
+        // Pass 2 — origin within 100pt + matching tab count (relaxed
+        // position tolerance for windows that moved slightly between
+        // the AppleScript snapshot and the AX enumeration tick).
+        var stillUnmatched: [AXWindowTabs] = []
+        for axWindow in unmatched {
+            guard let axFrame = axWindow.windowFrameAX else { continue }
+            let axTabCount = axWindow.tabs.count
+            var best: (idx: Int, distance: CGFloat)? = nil
+            for (idx, candidate) in snapshot.enumerated() where !used.contains(idx) {
+                let b = candidate.boundsAX
+                let dx = b.origin.x - axFrame.origin.x
+                let dy = b.origin.y - axFrame.origin.y
+                let distance = sqrt(dx * dx + dy * dy)
+                guard distance <= 100, candidate.tabs.count == axTabCount else { continue }
+                if best == nil || distance < best!.distance {
+                    best = (idx, distance)
+                }
+            }
+            if let b = best {
+                used.insert(b.idx)
+                result.append((axWindow, snapshot[b.idx]))
+            } else {
+                stillUnmatched.append(axWindow)
+            }
+        }
+
+        // Pass 3 — tab-count equality anywhere + closest-center fallback.
+        // Last-ditch; only fires when positions have drifted enough that
+        // Pass 1/2 couldn't pin them. Still unique via `used`.
+        for axWindow in stillUnmatched {
             guard let axFrame = axWindow.windowFrameAX else { continue }
             let axCenter = CGPoint(x: axFrame.midX, y: axFrame.midY)
             let axTabCount = axWindow.tabs.count
-
             var best: (idx: Int, score: Double)? = nil
             for (idx, candidate) in snapshot.enumerated() where !used.contains(idx) {
                 let b = candidate.boundsAX
@@ -461,9 +569,6 @@ final class TabMarkerOverlay {
                 let dy = b.midY - axCenter.y
                 let distance = sqrt(dx * dx + dy * dy)
                 guard distance <= 500 else { continue }
-                // Score: tab-count match is worth a lot (strong signal
-                // of the right window); frame distance tie-breaks.
-                // Lower score is better.
                 let tabCountPenalty = (candidate.tabs.count == axTabCount) ? 0.0 : 1_000.0
                 let score = tabCountPenalty + distance
                 if best == nil || score < best!.score {
@@ -475,6 +580,7 @@ final class TabMarkerOverlay {
                 result.append((axWindow, snapshot[b.idx]))
             }
         }
+
         return result
     }
 
@@ -707,22 +813,13 @@ final class TabMarkerOverlay {
         return b.window
     }
 
-    // MARK: - Rainbow pulse (scan-in-progress feedback)
+    // MARK: - Scan pulse (routes to pill's underside gradient strip)
 
-    /// Height in AX points of the title-bar + tab-strip region we draw
-    /// the pulse around. Chrome's title bar is ~28pt, tab strip adds
-    /// another ~34pt — 70pt covers both with a few pixels of air.
-    private static let pulseStripHeightAX: CGFloat = 70
+    private var pulseStartedAt: Date?
 
     private func startPulseAnimation() {
-        let framesCocoaByDisplay = computeChromePulseFramesCocoa()
         pulseStartedAt = Date()
-        for (displayID, view) in viewByDisplay {
-            view.pulseFrames = framesCocoaByDisplay[displayID] ?? []
-            view.pulsePhase = 0
-            view.pulseAlpha = 0.45
-            view.needsDisplay = true
-        }
+        pill.setScanning(true, phase: 0)
         pulseTimer?.invalidate()
         pulseTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.tickPulseAnimation() }
@@ -733,66 +830,16 @@ final class TabMarkerOverlay {
         pulseTimer?.invalidate()
         pulseTimer = nil
         pulseStartedAt = nil
-        for view in viewByDisplay.values {
-            view.pulseFrames = []
-            view.pulsePhase = 0
-            view.pulseAlpha = 0
-            view.needsDisplay = true
-        }
+        pill.setScanning(false)
     }
 
     private func tickPulseAnimation() {
         guard let started = pulseStartedAt else { return }
         let elapsed = Date().timeIntervalSince(started)
-        // Phase cycles 0→1 every 1.5s — drives the gradient's hue
-        // rotation around the outline.
+        // Phase cycles 0→1 every 1.5s — drives the hue shift along the
+        // pill's underside gradient strip.
         let phase = CGFloat(elapsed.truncatingRemainder(dividingBy: 1.5) / 1.5)
-        // Refresh pulse rects every ~250ms so a window dragged mid-scan
-        // keeps its outline anchored. Cheap: handful of AX frame reads.
-        let shouldRefreshFrames = Int(elapsed * 4) != Int((elapsed - 1.0 / 60.0) * 4)
-        var framesCocoaByDisplay: [CGDirectDisplayID: [CGRect]]? = nil
-        if shouldRefreshFrames {
-            framesCocoaByDisplay = computeChromePulseFramesCocoa()
-        }
-        for (displayID, view) in viewByDisplay {
-            if let frames = framesCocoaByDisplay?[displayID] {
-                view.pulseFrames = frames
-            }
-            view.pulsePhase = phase
-            view.pulseAlpha = 0.45
-            view.needsDisplay = true
-        }
-    }
-
-    private var pulseStartedAt: Date?
-
-    /// Enumerates Chrome's visible AX windows, computes a pulse rect
-    /// around the top ~70pt of each (title bar + tab strip), converts
-    /// to Cocoa coords, and buckets by display for per-panel rendering.
-    private func computeChromePulseFramesCocoa() -> [CGDirectDisplayID: [CGRect]] {
-        var out: [CGDirectDisplayID: [CGRect]] = [:]
-        for app in NSWorkspace.shared.runningApplications {
-            guard app.bundleIdentifier == "com.google.Chrome" else { continue }
-            let axApp = AXUIElementCreateApplication(app.processIdentifier)
-            var value: CFTypeRef?
-            guard AXUIElementCopyAttributeValue(
-                axApp, kAXWindowsAttribute as CFString, &value
-            ) == .success else { continue }
-            guard let windows = value as? [AXUIElement] else { continue }
-            for win in windows {
-                guard let windowFrameAX = frameOf(win), windowFrameAX.width > 100 else { continue }
-                let pulseAX = CGRect(
-                    x: windowFrameAX.origin.x,
-                    y: windowFrameAX.origin.y,
-                    width: windowFrameAX.width,
-                    height: min(Self.pulseStripHeightAX, windowFrameAX.height)
-                )
-                if let (cocoaRect, displayID) = convertAXToCocoa(pulseAX) {
-                    out[displayID, default: []].append(cocoaRect)
-                }
-            }
-        }
-        return out
+        pill.setScanning(true, phase: phase)
     }
 }
 
@@ -810,32 +857,17 @@ struct TabMarker {
 
 /// The actual drawing surface. One per NSScreen.
 ///
-/// Renders two kinds of content:
-///   1. `markers` — the thin colored bars above duplicate tabs.
-///   2. `pulseFrames` — rainbow spectrum outlines around each visible
-///      Chrome window's tab-strip region, shown ONLY while a scan is
-///      in progress. Hue phase shifts along the outline over time to
-///      give the "scanning" sensation.
+/// Renders the thin colored bars above duplicate tabs. The rainbow
+/// scanning indicator lives on the pill's underside, not here.
 private final class MarkerView: NSView {
     var markers: [TabMarker] = []
     /// This screen's origin in Cocoa coords — reserved for hit-testing
     /// / debug diagnostics.
     var screenOriginInCocoa: CGPoint = .zero
 
-    // Pulse state driven by TabMarkerOverlay.tickPulseAnimation.
-    var pulseFrames: [CGRect] = []
-    var pulsePhase: CGFloat = 0        // 0..1, loops
-    var pulseAlpha: CGFloat = 0        // 0..1, 0 = pulse hidden
-
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
-
-        // Draw pulses FIRST so markers paint on top of them.
-        if pulseAlpha > 0 && !pulseFrames.isEmpty {
-            drawPulses(ctx: ctx)
-        }
-
         for marker in markers {
             let r = marker.frameCocoa
             let radius: CGFloat = min(2, r.height / 2)
@@ -844,69 +876,6 @@ private final class MarkerView: NSView {
             ctx.setFillColor(marker.color.cgColor)
             ctx.fillPath()
         }
-    }
-
-    private func drawPulses(ctx: CGContext) {
-        let lineWidth: CGFloat = 4
-        let cornerRadius: CGFloat = 10
-        let inset: CGFloat = -lineWidth / 2
-        // Rainbow stop colors (traditional ROYGBIV) — distinct from the
-        // marker palette so a user scanning a page with real markers
-        // still sees the pulse as "that's the scanning indicator."
-        let stops: [NSColor] = [
-            NSColor(calibratedRed: 1.00, green: 0.00, blue: 0.00, alpha: 1),  // red
-            NSColor(calibratedRed: 1.00, green: 0.50, blue: 0.00, alpha: 1),  // orange
-            NSColor(calibratedRed: 1.00, green: 0.95, blue: 0.00, alpha: 1),  // yellow
-            NSColor(calibratedRed: 0.00, green: 0.85, blue: 0.20, alpha: 1),  // green
-            NSColor(calibratedRed: 0.00, green: 0.55, blue: 1.00, alpha: 1),  // blue
-            NSColor(calibratedRed: 0.40, green: 0.20, blue: 0.80, alpha: 1),  // indigo
-            NSColor(calibratedRed: 0.70, green: 0.30, blue: 0.90, alpha: 1),  // violet
-        ]
-
-        ctx.saveGState()
-        ctx.setLineWidth(lineWidth)
-        for frame in pulseFrames {
-            let rect = frame.insetBy(dx: inset, dy: inset)
-            let path = CGPath(
-                roundedRect: rect,
-                cornerWidth: cornerRadius,
-                cornerHeight: cornerRadius,
-                transform: nil
-            )
-            // Clip to the outline band so the gradient only paints
-            // around the border, not across the inside.
-            ctx.saveGState()
-            ctx.addPath(path)
-            ctx.replacePathWithStrokedPath()
-            ctx.clip()
-
-            // Linear gradient across the band, with hue phase shifted
-            // by pulsePhase so colors appear to flow around the window
-            // over time.
-            let shiftedStops: [NSColor] = Self.phaseShifted(stops, by: pulsePhase)
-            let cgColors = shiftedStops.map { $0.withAlphaComponent(pulseAlpha).cgColor } as CFArray
-            let locations: [CGFloat] = stops.enumerated().map { idx, _ in
-                CGFloat(idx) / CGFloat(stops.count - 1)
-            }
-            if let gradient = CGGradient(
-                colorsSpace: CGColorSpaceCreateDeviceRGB(),
-                colors: cgColors,
-                locations: locations
-            ) {
-                let start = CGPoint(x: rect.minX, y: rect.minY)
-                let end = CGPoint(x: rect.maxX, y: rect.maxY)
-                ctx.drawLinearGradient(gradient, start: start, end: end, options: [])
-            }
-            ctx.restoreGState()
-        }
-        ctx.restoreGState()
-    }
-
-    private static func phaseShifted(_ stops: [NSColor], by phase: CGFloat) -> [NSColor] {
-        guard !stops.isEmpty else { return stops }
-        let offset = Int((phase * CGFloat(stops.count)).truncatingRemainder(dividingBy: CGFloat(stops.count)))
-        if offset == 0 { return stops }
-        return Array(stops[offset...] + stops[..<offset])
     }
 
     override var isFlipped: Bool { false }  // Cocoa coords (bottom-left)

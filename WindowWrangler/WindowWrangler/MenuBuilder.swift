@@ -481,8 +481,8 @@ enum MenuBuilder {
         active: Bool
     ) {
         let title = active
-            ? "Exit Plow Mode (Mark Duplicate Tabs)"
-            : "Enter Plow Mode (Mark Duplicate Tabs)"
+            ? "Exit Declutter Mode (Mark Duplicate Tabs)"
+            : "Enter Declutter Mode (Mark Duplicate Tabs)"
         let item = NSMenuItem(
             title: title,
             action: #selector(WindowWranglerActions.toggleTabMarkers),
@@ -494,11 +494,11 @@ enum MenuBuilder {
         item.isEnabled = true
         menu.addItem(item)
 
-        // Refresh — only meaningful while Plow Mode is active. Grayed
+        // Refresh — only meaningful while Declutter Mode is active. Grayed
         // out otherwise so the user sees it exists but understands the
         // precondition.
         let refresh = NSMenuItem(
-            title: "Refresh Plow Mode Scan",
+            title: "Refresh Declutter Mode Scan",
             action: #selector(WindowWranglerActions.refreshTabMarkers),
             keyEquivalent: "d"
         )

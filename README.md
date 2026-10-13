@@ -1,6 +1,6 @@
 # Window Wrangler
 
-A macOS menu-bar utility for arranging windows across apps. Cascade every visible window in a title-bar-preserving fan layout, lasso windows across apps with click-and-drag, save named window groups ("Corrals") that restore later — including browser tabs — and precision-place any window into a drawn rectangle with **Plot Mode**.
+A macOS menu-bar utility for arranging windows across apps. Cascade every visible window in a title-bar-preserving fan layout, lasso windows across apps with click-and-drag, save named window groups ("Corrals") that restore later — including browser tabs — precision-place any window into a drawn rectangle with **Plot Mode**, and spot duplicate browser tabs across every Chrome window — even on other Desktops — with **Declutter Mode**.
 
 **Status:** MVP-1.0 + Plot / native-Chromium transport / two-phase z-order correction ownership + geometry-quiescence barrier. Distribution pipeline shipped: Developer ID–signed, Apple-notarized DMG + PKG in `dist/`, plus MDM PPPC profiles under `deployment/` — see [`docs/RELEASE_TESTING.md`](docs/RELEASE_TESTING.md).
 
@@ -46,6 +46,8 @@ All shortcuts use the `⌃⌥⌘` (Control-Option-Command) chord.
 | `⌃⌥⌘P` | Toggle Plot Mode (snap window to drawn area) |
 | `⌃⌥⌘S` | Corral: save current lasso selection as a named group |
 | `⌃⌥⌘R` | Release: open the saved-groups menu |
+| `⌃⌥⌘D` | Declutter Mode: show / hide duplicate-tab markers (Chrome) |
+| `⌃⌥⌘⇧D` | Declutter Mode: refresh scan now (while active) |
 
 The same actions are available from the menu-bar icon.
 
@@ -62,6 +64,8 @@ The same actions are available from the menu-bar icon.
 **Corral (release)** — hit `⌃⌥⌘R`. A menu opens listing your saved Corrals. Click one to restore, or click the × next to a corral to delete it. Or use the menu-bar dropdown's "Release ▸" submenu to restore directly without opening the pill.
 
 **Plot (Snap Window to Drawn Area)** — hit `⌃⌥⌘P` to enter Plot Mode (a "Press Esc to End Plot Mode" pill appears near the top). Click any window to select it, then click-and-drag to draw the destination rectangle. On release, the window snaps to that rectangle. Each edge of the Plot Area independently snaps to the display edge when it enters the outer 15% zone. Interior coordinates are preserved exactly as drawn — no grid, no presets. Chromium browsers (Chrome, Brave, Edge, Opera, Vivaldi, Chromium) commit via a reliable AppleScript-bounds path so the drawn size persists where AX size writes typically revert. Plot Mode is mutually exclusive with Lasso; press `Esc` or `⌃⌥⌘P` again to exit.
+
+**Declutter (Mark Duplicate Tabs)** — hit `⌃⌥⌘D` to enter Declutter Mode. A pill drops under the menu bar reading "Declutter Mode · scanning Chrome tabs…" while an initial scan runs; a blue outline pulses around the pill during the scan. When the scan completes (typically well under a second), thin colored bars appear above every duplicate browser tab across all your Chrome windows. Each duplicate-URL group gets a distinct color — same color means same page. Tabs on other Desktops / Spaces count too (the version you can see gets a bar even if the duplicate is on another Space). Close any duplicate using Chrome's own `×` and the markers update automatically within a second. The pill shows "scanned duplicate tabs Xs ago · ↻ · Esc to end" between scans; click ↻, press `⌃⌥⌘⇧D`, or close/open a tab to force an immediate rescan. Press `Esc` or `⌃⌥⌘D` again to exit. Chrome-only in this release; Chromium family and Safari planned.
 
 ## Things to know as a user
 

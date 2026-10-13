@@ -2,7 +2,7 @@
 //  TabMarkerPill.swift
 //  Window Wrangler
 //
-//  Floating status pill shown while Plow Mode (Mark Duplicate Tabs) is
+//  Floating status pill shown while Declutter Mode (Mark Duplicate Tabs) is
 //  active. Mirrors the LassoModeHint / PlotModeHint visual format —
 //  dark translucent capsule, centered under the menu bar on the screen
 //  the cursor is on — so Plow reads as a system-level "you're in a
@@ -14,10 +14,14 @@
 //  interaction with Chrome underneath.
 //
 //  Content:
-//    - Scanning:  "Plow Mode  ·  scanning Chrome tabs…  ·  Esc to end"
-//    - Idle:      "Plow Mode  ·  scanned 7s ago  ·  ↻  ·  Esc to end"
+//    - Scanning:  "Declutter Mode  ·  scanning Chrome tabs…  ·  Esc to end"
+//    - Idle:      "Declutter Mode  ·  scanned 7s ago  ·  ↻  ·  Esc to end"
 //
 //  The ↻ is the clickable refresh button (sends onRefreshTapped).
+//
+//  Scan feedback: a continuous (NOT dashed) blue outline — same
+//  accent color as the Lasso selection — pulses in intensity around
+//  the pill while a scan is in progress. Driven by `setScanning`.
 //
 
 import AppKit
@@ -57,6 +61,7 @@ final class TabMarkerPill {
             p.orderOut(nil)
             self?.panel = nil
             self?.contentView = nil
+            self?.rainbowView = nil
         })
     }
 
@@ -69,31 +74,80 @@ final class TabMarkerPill {
         }
     }
 
+    /// Drives the pulsing blue outline around the pill. Call every
+    /// frame while a scan is in progress with the animation phase
+    /// (0..1 loop); call once with `scanning: false` when the scan
+    /// completes to hide the outline.
+    func setScanning(_ scanning: Bool, phase: CGFloat = 0) {
+        guard let outline = rainbowView else { return }
+        outline.isActive = scanning
+        outline.phase = phase
+        outline.needsDisplay = true
+    }
+
     // MARK: - Internals
 
     private var panel: NSPanel?
     private var contentView: PillContentView?
+    private var rainbowView: PulseOutlineView?
+    private var capsuleBg: NSView?
+
+    /// Margin reserved around the capsule for the pulsing outline, in
+    /// points. Panel grows by 2 × outlineMargin in both dimensions to
+    /// make room for the stroke to sit outside the capsule edge.
+    private static let outlineMargin: CGFloat = 4
 
     private func createPanel() {
         let v = PillContentView()
         v.onRefreshTapped = { [weak self] in self?.onRefreshTapped?() }
         contentView = v
 
+        let capsuleWidth = v.frame.width
+        let capsuleHeight = v.frame.height
+        let margin = Self.outlineMargin
+        let totalWidth = capsuleWidth + 2 * margin
+        let totalHeight = capsuleHeight + 2 * margin
+
         // Dark translucent capsule — identical shape to LassoModeHint /
-        // PlotModeHint so Plow reads as a sibling mode in the same
-        // visual language.
-        let bg = NSView(frame: v.frame)
+        // PlotModeHint so Declutter reads as a sibling mode in the same
+        // visual language. Inset by `margin` on all sides from the root
+        // so the pulsing outline can sit just outside its edge without
+        // being clipped.
+        let bg = NSView(frame: NSRect(
+            x: margin, y: margin, width: capsuleWidth, height: capsuleHeight
+        ))
         bg.wantsLayer = true
         if let layer = bg.layer {
             layer.backgroundColor = NSColor.black.withAlphaComponent(0.78).cgColor
-            layer.cornerRadius = v.frame.height / 2
+            layer.cornerRadius = capsuleHeight / 2
             layer.masksToBounds = true
         }
         bg.addSubview(v)
         v.frame = bg.bounds
 
+        // Pulsing outline — continuous (NOT dashed) blue stroke that
+        // traces a rounded rect just outside the capsule edge. Alpha
+        // pulses with phase while a scan is in progress; invisible
+        // otherwise. Occupies the full root bounds so the stroke lands
+        // in the margin area, outside the capsule but inside the panel.
+        let outline = PulseOutlineView(frame: NSRect(
+            x: 0, y: 0, width: totalWidth, height: totalHeight
+        ))
+        outline.capsuleInset = margin
+        outline.capsuleCornerRadius = capsuleHeight / 2
+        rainbowView = outline
+
+        // Root container — outline underneath, capsule on top so clicks
+        // continue to pass through everywhere except the refresh button.
+        let root = NSView(frame: NSRect(
+            x: 0, y: 0, width: totalWidth, height: totalHeight
+        ))
+        root.addSubview(outline)
+        root.addSubview(bg)
+        capsuleBg = bg
+
         let p = NSPanel(
-            contentRect: bg.frame,
+            contentRect: root.frame,
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -115,7 +169,7 @@ final class TabMarkerPill {
             .canJoinAllSpaces,
         ]
         p.sharingType = .readOnly
-        p.contentView = bg
+        p.contentView = root
 
         panel = p
     }
@@ -125,12 +179,32 @@ final class TabMarkerPill {
         let newSize = view.intrinsicSize()
         if abs(view.frame.width - newSize.width) < 0.5 { return }
         view.frame.size = newSize
-        if let bg = panel.contentView {
-            bg.frame.size = newSize
+
+        let margin = Self.outlineMargin
+        let totalWidth = newSize.width + 2 * margin
+        let totalHeight = newSize.height + 2 * margin
+
+        if let bg = capsuleBg {
+            bg.frame = NSRect(
+                x: margin, y: margin,
+                width: newSize.width, height: newSize.height
+            )
             bg.layer?.cornerRadius = newSize.height / 2
         }
+        if let outline = rainbowView {
+            outline.frame = NSRect(
+                x: 0, y: 0,
+                width: totalWidth, height: totalHeight
+            )
+            outline.capsuleInset = margin
+            outline.capsuleCornerRadius = newSize.height / 2
+            outline.needsDisplay = true
+        }
+        if let root = panel.contentView {
+            root.frame.size = NSSize(width: totalWidth, height: totalHeight)
+        }
         var frame = panel.frame
-        frame.size = newSize
+        frame.size = NSSize(width: totalWidth, height: totalHeight)
         panel.setFrame(frame, display: false)
     }
 
@@ -202,7 +276,7 @@ private final class PillContentView: NSView {
         refreshButton.title = ""
         refreshButton.image = NSImage(
             systemSymbolName: "arrow.clockwise",
-            accessibilityDescription: "Refresh Plow Mode (⌃⌥⌘⇧D)"
+            accessibilityDescription: "Refresh Declutter Mode (⌃⌥⌘⇧D)"
         )
         refreshButton.imagePosition = .imageOnly
         refreshButton.isBordered = false
@@ -228,15 +302,15 @@ private final class PillContentView: NSView {
     func set(state: TabMarkerPill.State) {
         switch state {
         case .scanning:
-            label.stringValue = "Plow Mode  ·  scanning Chrome tabs…  ·  Esc to end"
+            label.stringValue = "Declutter Mode  ·  scanning Chrome tabs…  ·  Esc to end"
             prefixUpToGlyph = ""   // no glyph in scanning state
             refreshTargetAlpha = 0
         case .idle(let secondsAgo):
             let ago: String
             if secondsAgo <= 1 { ago = "just now" }
             else { ago = "\(secondsAgo)s ago" }
-            label.stringValue = "Plow Mode  ·  scanned duplicate tabs \(ago)  ·        ·  Esc to end"
-            prefixUpToGlyph = "Plow Mode  ·  scanned duplicate tabs \(ago)  ·  "
+            label.stringValue = "Declutter Mode  ·  scanned duplicate tabs \(ago)  ·        ·  Esc to end"
+            prefixUpToGlyph = "Declutter Mode  ·  scanned duplicate tabs \(ago)  ·  "
             refreshTargetAlpha = 1
         }
         label.sizeToFit()
@@ -291,5 +365,62 @@ private final class PillContentView: NSView {
             }
         }
         return nil
+    }
+}
+
+// MARK: - Pulsing outline view
+
+/// Continuous (NOT dashed) blue stroke that traces the pill's capsule
+/// just outside its edge, pulsing in intensity while a scan is in
+/// progress. Same accent color (`NSColor.controlAccentColor`) as the
+/// Lasso selection outlines, but without the dash pattern so Declutter
+/// reads as a distinct scanning mode. Draws nothing when inactive.
+@MainActor
+private final class PulseOutlineView: NSView {
+    var isActive: Bool = false
+    var phase: CGFloat = 0
+    /// Inset from the view's edge to the capsule's edge, in points.
+    /// The stroke sits midway inside this margin.
+    var capsuleInset: CGFloat = 4
+    /// Corner radius of the capsule being outlined — matches the
+    /// pill's `cornerRadius` (height / 2).
+    var capsuleCornerRadius: CGFloat = 16
+
+    override var isFlipped: Bool { false }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        guard isActive, let ctx = NSGraphicsContext.current?.cgContext else { return }
+
+        // Pulse intensity — eases up and down over `phase` (0..1 loop).
+        // sin(π·phase) hits 0 at the loop boundaries and 1 at the
+        // midpoint, giving a smooth breathe rather than a sawtooth.
+        let intensity = 0.35 + 0.65 * sin(phase * .pi)
+        let clamped = max(0.0, min(1.0, intensity))
+
+        let strokeWidth: CGFloat = 2
+        // Trace a rounded rect just outside the capsule's edge. The
+        // path's radius expands by half the inset so the outline reads
+        // as parallel to the capsule's curve, not pinched at the ends.
+        let outset = (capsuleInset - strokeWidth) / 2
+        let traceRect = bounds.insetBy(
+            dx: capsuleInset - outset - strokeWidth / 2,
+            dy: capsuleInset - outset - strokeWidth / 2
+        )
+        let traceRadius = capsuleCornerRadius + outset + strokeWidth / 2
+        let path = CGPath(
+            roundedRect: traceRect,
+            cornerWidth: traceRadius,
+            cornerHeight: traceRadius,
+            transform: nil
+        )
+
+        ctx.saveGState()
+        ctx.addPath(path)
+        ctx.setLineWidth(strokeWidth)
+        ctx.setStrokeColor(NSColor.controlAccentColor.withAlphaComponent(clamped).cgColor)
+        ctx.setLineCap(.round)
+        ctx.strokePath()
+        ctx.restoreGState()
     }
 }

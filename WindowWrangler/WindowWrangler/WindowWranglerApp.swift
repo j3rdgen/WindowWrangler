@@ -385,16 +385,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
             modifiers: modifiers,
             keyCode: KeyCode.d,
             action: { [weak self] in self?.toggleTabMarkers() },
-            label: "Toggle Plow Mode"
+            label: "Toggle Declutter Mode"
         ))
         shortcuts.register(.init(
             modifiers: [.control, .option, .command, .shift],
             keyCode: KeyCode.d,
             action: { [weak self] in self?.refreshTabMarkers() },
-            label: "Refresh Plow Mode"
+            label: "Refresh Declutter Mode"
         ))
 
-        // Esc exits Plow Mode. Gated via enabledPredicate so bare Esc
+        // Esc exits Declutter Mode. Gated via enabledPredicate so bare Esc
         // only gets consumed when Plow is actually on screen — Esc
         // otherwise reaches the focused app untouched (critical: Esc
         // is a universal "cancel" key, we must not steal it globally).
@@ -405,7 +405,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
                 guard let self, self.tabMarkerOverlay.isActive else { return }
                 self.toggleTabMarkers()
             },
-            label: "End Plow Mode (Esc)",
+            label: "End Declutter Mode (Esc)",
             enabledPredicate: { [weak self] in
                 self?.tabMarkerOverlay.isActive == true
             }
