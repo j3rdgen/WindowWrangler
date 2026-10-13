@@ -30,6 +30,48 @@ enum WindowMutator {
         return result == .success && settable.boolValue
     }
 
+    /// Returns the window's advertised minimum size via
+    /// `kAXMinSizeAttribute`, when the app vends it. Nil otherwise.
+    ///
+    /// Context: a window can report `isSizeSettable == true` and still
+    /// clamp any AX size write below some minimum (iMovie, Xcode,
+    /// GarageBand, many content-authoring apps). The cascade needs
+    /// this value so slot clamping can account for the fact that the
+    /// window won't actually shrink to `standardTargetSize` — the
+    /// mutator writes that size, the app silently rounds up to its
+    /// min, and the window ends up wider than the slot reserved for
+    /// it. Without this signal, position was computed for the smaller
+    /// target and the window extends past the slot's right / bottom
+    /// edge, sometimes off-screen entirely.
+    nonisolated static func minSize(_ axWindow: AXUIElement) -> CGSize? {
+        var value: CFTypeRef?
+        let result = AXUIElementCopyAttributeValue(
+            axWindow, kAXMinValueAttribute as CFString, &value
+        )
+        // Some apps publish min size at kAXSizeAttribute's dual
+        // kAXMinValueAttribute; others don't. If the dual read fails,
+        // fall back to kAXMinSizeAttribute (undocumented but widely
+        // supported on AppKit-based apps including iMovie). We don't
+        // branch on which succeeded — either way we validate the shape.
+        if result != .success {
+            var mv: CFTypeRef?
+            let r2 = AXUIElementCopyAttributeValue(
+                axWindow, "AXMinSize" as CFString, &mv
+            )
+            guard r2 == .success, let v = mv,
+                  CFGetTypeID(v) == AXValueGetTypeID() else { return nil }
+            var size = CGSize.zero
+            AXValueGetValue(v as! AXValue, .cgSize, &size)
+            guard size.width > 0, size.height > 0 else { return nil }
+            return size
+        }
+        guard let v = value, CFGetTypeID(v) == AXValueGetTypeID() else { return nil }
+        var size = CGSize.zero
+        AXValueGetValue(v as! AXValue, .cgSize, &size)
+        guard size.width > 0, size.height > 0 else { return nil }
+        return size
+    }
+
     /// Moves the given window to the given Cocoa-coordinate frame.
     /// Both position and size are set when possible. Returns true on
     /// full success.

@@ -62,13 +62,30 @@ enum CascadePlanning {
     static func resolveCascadePlanningSize(
         currentFrame: CGRect,
         standardTargetSize: CGSize,
-        isSizeSettable: Bool
+        isSizeSettable: Bool,
+        minSize: CGSize? = nil
     ) -> CGSize {
         if isSizeSettable {
-            // Normally resizable window: the mutator will resize it
-            // to `standardTargetSize`, so slot geometry plans as
-            // though the window is already at that size. Determinism.
-            return standardTargetSize
+            // Normally resizable window: the mutator will attempt to
+            // resize it to `standardTargetSize`. BUT some apps that
+            // report settable=true still clamp below an advertised
+            // minimum (iMovie, Xcode, GarageBand, large pro apps).
+            // When kAXMinSizeAttribute is published AND it exceeds
+            // the standard target in either dimension, the actual
+            // post-write window will be `max(target, min)`. Planning
+            // uses that effective size so downstream slot clamping
+            // keeps the window on-screen even though the write won't
+            // shrink it to target.
+            //
+            // Pure determinism still holds: the plan depends only on
+            // standardTargetSize + minSize (both stable AX contracts
+            // for a given app), not on currentFrame. Two consecutive
+            // cascades of iMovie produce the same plan.
+            guard let min = minSize else { return standardTargetSize }
+            return CGSize(
+                width: Swift.max(standardTargetSize.width, min.width),
+                height: Swift.max(standardTargetSize.height, min.height)
+            )
         }
         // Position-only window (AX size attribute non-settable):
         // the mutator will only write position; the window keeps
