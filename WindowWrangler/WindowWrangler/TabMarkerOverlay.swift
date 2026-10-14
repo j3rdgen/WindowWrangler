@@ -124,6 +124,10 @@ final class TabMarkerOverlay {
         pillStateTimer = nil
 
         pill.hide()
+        // Reset the color-persistence map so the next activation starts
+        // with a clean assignment (freed palette slots don't carry over
+        // from a prior session).
+        persistedPaletteIndexByURL.removeAll(keepingCapacity: true)
 
         for panel in panelByDisplay.values {
             panel.orderOut(nil)
@@ -142,10 +146,15 @@ final class TabMarkerOverlay {
 
     // MARK: - Scan
 
-    /// Kicks off an asynchronous Chrome snapshot. During the scan the
-    /// pill reads "Scanning…" and the rainbow pulse animates around
-    /// every visible Chrome window. On completion, markers update and
-    /// the pulse fades out.
+    /// Kicks off asynchronous snapshots for every running supported
+    /// browser (Chromium family + Safari) in parallel. During the
+    /// scan the pill reads "scanning…" and the blue outline pulses
+    /// around it. On completion, markers update and the pulse fades.
+    ///
+    /// Parallelism matters: for a user running Chrome + Brave + Safari
+    /// simultaneously, a serial loop would multiply the ~500ms scan
+    /// cost; parallel execution keeps total wall-clock at roughly the
+    /// slowest single-browser fetch.
     private func scan() {
         currentScanGeneration &+= 1
         let generation = currentScanGeneration
@@ -153,10 +162,21 @@ final class TabMarkerOverlay {
         pill.update(state: .scanning)
         startPulseAnimation()
 
-        Log.tabXray.info("Scan gen=\(generation, privacy: .public) started")
+        let bundleIDs = runningSupportedBrowserBundleIDs()
+        Log.tabXray.info("Scan gen=\(generation, privacy: .public) started for \(bundleIDs.count, privacy: .public) browser(s)")
 
         Task { [weak self] in
-            let snapshot = await BrowserScripting.fetchChromeTabsFast(bundleID: "com.google.Chrome")
+            let totalWindowCount = await withTaskGroup(of: Int.self) { group -> Int in
+                for bundleID in bundleIDs {
+                    group.addTask {
+                        let result = await BrowserScripting.fetchBrowserTabsFast(bundleID: bundleID)
+                        return result?.count ?? 0
+                    }
+                }
+                var sum = 0
+                for await c in group { sum += c }
+                return sum
+            }
             await MainActor.run { [weak self] in
                 guard let self else { return }
                 guard self.isActive else { return }
@@ -164,29 +184,46 @@ final class TabMarkerOverlay {
                     Log.tabXray.info("Scan gen=\(generation, privacy: .public) superseded; dropping result")
                     return
                 }
-                self.applyScanResult(snapshot: snapshot, generation: generation)
+                self.applyScanResult(windowCount: totalWindowCount, generation: generation)
             }
         }
     }
 
     private func applyScanResult(
-        snapshot: [BrowserScripting.BrowserWindowSnapshot]?,
+        windowCount: Int,
         generation: UInt64
     ) {
         isScanning = false
         stopPulseAnimation()
         lastScanAt = Date()
 
-        if let snapshot {
-            Log.tabXray.info("Scan gen=\(generation, privacy: .public) returned \(snapshot.count, privacy: .public) window(s)")
-            rebuildMarkersFromSnapshot(snapshot)
+        if windowCount > 0 {
+            Log.tabXray.info("Scan gen=\(generation, privacy: .public) returned \(windowCount, privacy: .public) window(s) across supported browsers")
+            // The underlying BrowserScripting cache was updated per-
+            // bundle inside fetchBrowserTabsFast; the next movement
+            // tick picks up the fresh data automatically.
+            updateMarkerPositions()
         } else {
-            Log.tabXray.info("Scan gen=\(generation, privacy: .public) returned nil (timeout or empty)")
+            Log.tabXray.info("Scan gen=\(generation, privacy: .public) returned no windows (no supported browsers running, or all fetches timed out)")
             // Keep previous markers rendered rather than blanking the
             // overlay — matches the "momentary visual retention" the
             // user flagged as acceptable.
         }
         refreshPillLabel()
+    }
+
+    /// Lists bundle IDs for every running supported browser —
+    /// Chromium family (Chrome, Brave, Edge, Vivaldi, Opera, Chromium)
+    /// plus Safari. Order follows NSWorkspace's runningApplications,
+    /// which is roughly launch order; order doesn't affect correctness.
+    @MainActor
+    private func runningSupportedBrowserBundleIDs() -> [String] {
+        NSWorkspace.shared.runningApplications.compactMap { app in
+            guard let bundleID = app.bundleIdentifier,
+                  BrowserScripting.isSupportedBrowser(bundleID: bundleID)
+            else { return nil }
+            return bundleID
+        }
     }
 
     private func refreshPillLabel() {
@@ -382,7 +419,7 @@ final class TabMarkerOverlay {
     private func currentAXTabSignature() -> String {
         var parts: [String] = []
         for app in NSWorkspace.shared.runningApplications
-            where app.bundleIdentifier == "com.google.Chrome" {
+            where app.bundleIdentifier.map({ BrowserScripting.isSupportedBrowser(bundleID: $0) }) == true {
             let axApp = AXUIElementCreateApplication(app.processIdentifier)
             var value: CFTypeRef?
             guard AXUIElementCopyAttributeValue(
@@ -410,36 +447,49 @@ final class TabMarkerOverlay {
 
     /// Returns every marker (duplicate tab) that should be visible on
     /// screen right now. Pure computation — no AppKit side-effects.
+    ///
+    /// Iterates every running supported browser. Duplicate color groups
+    /// are computed across the UNION of all browsers' cached snapshots
+    /// — so a URL open in both Chrome and Brave is correctly flagged
+    /// as a duplicate and gets the same color in both browser's tab
+    /// strips.
     private func computeMarkers() -> [TabMarker] {
-        var allMarkers: [TabMarker] = []
-
-        for app in NSWorkspace.shared.runningApplications {
-            guard let bundleID = app.bundleIdentifier else { continue }
-            // MVP: Chrome only. Session 3 widens to all Chromium
-            // bundle IDs via BrowserScripting.chromiumBundleIDs.
-            guard bundleID == "com.google.Chrome" else { continue }
-
-            allMarkers.append(contentsOf: markersFor(app: app, bundleID: bundleID))
+        // Gather each running supported browser's cached snapshot.
+        let apps = NSWorkspace.shared.runningApplications
+        var browserEntries: [(app: NSRunningApplication, bundleID: String, snapshot: [BrowserScripting.BrowserWindowSnapshot])] = []
+        for app in apps {
+            guard let bundleID = app.bundleIdentifier,
+                  BrowserScripting.isSupportedBrowser(bundleID: bundleID) else { continue }
+            if let snapshot = BrowserScripting.cachedSnapshot(for: bundleID) {
+                browserEntries.append((app, bundleID, snapshot))
+            }
         }
+        if browserEntries.isEmpty { return [] }
 
+        // Cross-browser color map: a URL seen twice gets a color, even
+        // if the two instances live in different browsers.
+        let colorByURL = assignColorsAcrossBrowsers(browserEntries.map { $0.snapshot })
+        if colorByURL.isEmpty { return [] }
+
+        // Build markers per browser using the shared color map.
+        var allMarkers: [TabMarker] = []
+        for entry in browserEntries {
+            allMarkers.append(contentsOf: markersFor(
+                app: entry.app,
+                bundleID: entry.bundleID,
+                snapshot: entry.snapshot,
+                colorByURL: colorByURL
+            ))
+        }
         return allMarkers
     }
 
-    private func markersFor(app: NSRunningApplication, bundleID: String) -> [TabMarker] {
-        // Side A: AppleScript snapshot — READ FROM CACHE ONLY. The
-        // blocking fetch is NEVER triggered from here; the prefetch
-        // timer owns the fill-and-refresh cadence on a background
-        // thread. If cache is empty on activation, we render nothing
-        // for one or two 2s cycles until prefetch lands.
-        guard let snapshot = BrowserScripting.cachedSnapshot(for: bundleID) else {
-            return []
-        }
-
-        // Build the duplicate-URL → color map. Deterministic sort so
-        // the same URL always gets the same color across refreshes.
-        let colorByURL = assignColors(snapshot: snapshot)
-        if colorByURL.isEmpty { return [] }  // nothing duplicated
-
+    private func markersFor(
+        app: NSRunningApplication,
+        bundleID: String,
+        snapshot: [BrowserScripting.BrowserWindowSnapshot],
+        colorByURL: [String: NSColor]
+    ) -> [TabMarker] {
         // Side B: AX enumeration — per-window tab frames (top-left AX
         // coords, visible-Space windows only).
         let axWindows = axWindowsWithTabs(pid: app.processIdentifier)
@@ -586,8 +636,15 @@ final class TabMarkerOverlay {
 
     // MARK: - Color assignment
 
-    /// Palette tuned for color-blind safety (Okabe-Ito-adjacent).
-    /// Picked in order; groups 8+ wrap and repeat.
+    /// Palette for duplicate-group bars. First 7 are the Okabe-Ito
+    /// color-blind-safe set; the last 5 extend the range for heavy
+    /// sessions where 8+ duplicate groups coexist. The additions are
+    /// chosen to stay reasonably distinct in protanopia/deuteranopia
+    /// (teal and lime read as separate blues/yellows, magenta and
+    /// purple occupy different lightnesses, brown is uniquely low-
+    /// saturation warm). Order drives the "assign new groups first"
+    /// path — a user with a few duplicates sees the strongest
+    /// contrast; overflow (groups 13+) wraps and hash-collides.
     private static let palette: [NSColor] = [
         NSColor(calibratedRed: 0.00, green: 0.45, blue: 0.70, alpha: 1.0),  // blue
         NSColor(calibratedRed: 0.84, green: 0.37, blue: 0.00, alpha: 1.0),  // vermillion
@@ -596,23 +653,77 @@ final class TabMarkerOverlay {
         NSColor(calibratedRed: 0.80, green: 0.47, blue: 0.65, alpha: 1.0),  // reddish purple
         NSColor(calibratedRed: 0.34, green: 0.71, blue: 0.91, alpha: 1.0),  // sky blue
         NSColor(calibratedRed: 0.94, green: 0.89, blue: 0.26, alpha: 1.0),  // yellow
+        NSColor(calibratedRed: 0.00, green: 0.55, blue: 0.55, alpha: 1.0),  // teal
+        NSColor(calibratedRed: 0.71, green: 0.89, blue: 0.14, alpha: 1.0),  // lime
+        NSColor(calibratedRed: 0.55, green: 0.27, blue: 0.07, alpha: 1.0),  // brown
+        NSColor(calibratedRed: 0.91, green: 0.11, blue: 0.45, alpha: 1.0),  // magenta
+        NSColor(calibratedRed: 0.42, green: 0.24, blue: 0.60, alpha: 1.0),  // purple
     ]
 
     private func assignColors(snapshot: [BrowserScripting.BrowserWindowSnapshot]) -> [String: NSColor] {
-        // Count occurrences of each normalized URL across all windows.
+        return assignColorsAcrossBrowsers([snapshot])
+    }
+
+    /// Persistent URL → palette-index map, retained across scans so
+    /// a close that drops one URL from the duplicate set doesn't
+    /// recolor every remaining group. Reset in `deactivate()`.
+    private var persistedPaletteIndexByURL: [String: Int] = [:]
+
+    /// Cross-browser color assignment. Counts URL occurrences across
+    /// the UNION of every provided browser snapshot and gives every
+    /// URL that appears ≥2 times a stable palette color. Enables the
+    /// cross-browser duplicate detection scenario: open github.com in
+    /// Chrome AND in Brave → both instances get the same marker color.
+    ///
+    /// Colors are stable across scans — a URL that was blue stays blue
+    /// after another URL's duplicate pair collapses, so the user doesn't
+    /// see the whole marker set recolor every time they close a tab.
+    /// Palette slots are reclaimed when a URL leaves the duplicate set.
+    private func assignColorsAcrossBrowsers(
+        _ snapshots: [[BrowserScripting.BrowserWindowSnapshot]]
+    ) -> [String: NSColor] {
         var counts: [String: Int] = [:]
-        for window in snapshot {
-            for tab in window.tabs {
-                let key = BrowserScripting.normalizedURL(tab.url)
-                guard !key.isEmpty else { continue }
-                counts[key, default: 0] += 1
+        for snapshot in snapshots {
+            for window in snapshot {
+                for tab in window.tabs {
+                    let key = BrowserScripting.normalizedURL(tab.url)
+                    guard !key.isEmpty else { continue }
+                    counts[key, default: 0] += 1
+                }
             }
         }
-        // Keep only URLs that appear ≥2 times.
-        let duplicateURLs = counts.filter { $0.value >= 2 }.keys.sorted()
+        let duplicateURLs = Set(counts.filter { $0.value >= 2 }.keys)
+        // Release palette slots for URLs no longer duplicated.
+        persistedPaletteIndexByURL = persistedPaletteIndexByURL.filter {
+            duplicateURLs.contains($0.key)
+        }
+        // Collect slots currently in use so new URLs don't collide.
+        var usedSlots = Set(persistedPaletteIndexByURL.values)
+        // Assign slots to URLs that newly became duplicates. Deterministic
+        // sort means consistent slot assignment across a sequence of scans
+        // that happen to introduce the same new duplicate URLs.
+        let newURLs = duplicateURLs
+            .subtracting(persistedPaletteIndexByURL.keys)
+            .sorted()
+        for url in newURLs {
+            var slot = 0
+            while slot < Self.palette.count, usedSlots.contains(slot) {
+                slot += 1
+            }
+            // Palette full (more simultaneous duplicate groups than
+            // `palette.count` slots) — fall back to a deterministic
+            // hash-based wrap so the same URL always lands on the same
+            // color even in the overflow case.
+            let finalSlot = (slot < Self.palette.count)
+                ? slot
+                : abs(url.hashValue) % Self.palette.count
+            persistedPaletteIndexByURL[url] = finalSlot
+            usedSlots.insert(finalSlot)
+        }
+        // Materialize the URL → NSColor view the caller expects.
         var result: [String: NSColor] = [:]
-        for (idx, url) in duplicateURLs.enumerated() {
-            result[url] = Self.palette[idx % Self.palette.count]
+        for (url, slot) in persistedPaletteIndexByURL {
+            result[url] = Self.palette[slot % Self.palette.count]
         }
         return result
     }

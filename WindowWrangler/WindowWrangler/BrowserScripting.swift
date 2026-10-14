@@ -434,7 +434,7 @@ enum BrowserScripting {
                 return parsed.map { (index: $0.index, boundsAX: $0.bounds) }
             }
         }
-        // Fallback: bounds-only walk (capped at 8 per Chromium quirk).
+        // Fallback: bounds-only walk (capped at 100).
         let remainingB = deadline - CFAbsoluteTimeGetCurrent()
         if remainingB <= 0 { return nil }
         guard let text = await runScriptAsync(
@@ -590,7 +590,7 @@ enum BrowserScripting {
             }
         }
 
-        // Step 1b: bounds-only enumeration fallback (capped at 8).
+        // Step 1b: bounds-only enumeration fallback (capped at 100).
         let start = CFAbsoluteTimeGetCurrent()
         guard let boundsText = runScript(source: boundsOnlyScript(bundleID: bundleID)), !boundsText.isEmpty else {
             Log.corral.info(
@@ -806,12 +806,13 @@ enum BrowserScripting {
     /// save flow's frontend cache read (`snapshotBrowserWindows`) will
     /// then hit the fresh data instead of blocking on AppleScript.
     ///
-    /// Tab Markers (tab-duplicate-xray branch) — the fastest known
-    /// snapshot path for a single browser. Uses the collection-form
-    /// AppleScript (`URL of every tab of every window`) which collapses
-    /// 220+ Apple Events into ~4 for an 8-window / 68-tab Chrome
-    /// session. Expected wall-clock cost: 100–800ms depending on tab
-    /// count, down from ~3–4s with the per-tab iteration script.
+    /// Declutter Mode — the fastest known snapshot path for any
+    /// supported browser (Chromium family + Safari). Uses the
+    /// collection-form AppleScript (`URL of every tab of every
+    /// window`) which collapses 220+ Apple Events into ~4 for an
+    /// 8-window / 68-tab session. Expected wall-clock cost: 100–800ms
+    /// depending on tab count, down from ~3–4s with the per-tab
+    /// iteration script.
     ///
     /// Async + background-dispatched; never blocks the caller's thread.
     /// Returns nil on timeout or empty result; caller can fall back to
@@ -819,18 +820,35 @@ enum BrowserScripting {
     ///
     /// Writes to the main-actor snapshot cache on success, so cache
     /// consumers (TabMarkerOverlay, Corral) see a fresh value.
-    nonisolated static func fetchChromeTabsFast(bundleID: String) async -> [BrowserWindowSnapshot]? {
+    ///
+    /// Variant C quirk: some Chrome versions reject the bulk
+    /// `bounds of winRefs` expression with error -1728 ("Can't get
+    /// bounds of {window id ...}"). Once we see that failure for a
+    /// bundle we skip Variant C for the rest of the session and go
+    /// straight to Variant B — Variant B is already ~10× faster than
+    /// the baseline, so losing C's ~50ms theoretical edge doesn't
+    /// matter and we stop logging the error on every scan.
+    nonisolated static func fetchBrowserTabsFast(bundleID: String) async -> [BrowserWindowSnapshot]? {
         guard isSupportedBrowser(bundleID: bundleID) else { return nil }
 
         // Variant C first — single bulk expression, fewest round-trips.
-        let scriptC = diagnosticBulkEveryTabScript(bundleID: bundleID)
-        if let text = await runScriptAsync(source: scriptC, timeoutSeconds: 10),
-           !text.isEmpty {
-            let parsed = parseSnapshot(text)
-            if !parsed.isEmpty {
-                await commitSnapshotToCache(bundleID: bundleID, snapshot: parsed)
-                return parsed
+        // Skip if we've already learned it fails on this bundle.
+        if !isVariantCDisabled(bundleID: bundleID) {
+            let scriptC = diagnosticBulkEveryTabScript(bundleID: bundleID)
+            if let text = await runScriptAsync(source: scriptC, timeoutSeconds: 10),
+               !text.isEmpty {
+                let parsed = parseSnapshot(text)
+                if !parsed.isEmpty {
+                    await commitSnapshotToCache(bundleID: bundleID, snapshot: parsed)
+                    return parsed
+                }
             }
+            // Either runScriptAsync returned nil (script error / timeout)
+            // or the parsed result was empty. Both are indistinguishable
+            // from "Chrome rejects the bulk-bounds expression" at this
+            // layer, so disable Variant C for the session and let the
+            // Variant B fallback below carry the load.
+            disableVariantC(bundleID: bundleID)
         }
 
         // Fallback to Variant B — per-window loop with bulk per-tab
@@ -848,6 +866,29 @@ enum BrowserScripting {
         }
 
         return nil
+    }
+
+    /// Session-scoped set of bundle IDs for which Variant C has already
+    /// failed once. Accessed from nonisolated contexts, so guarded by
+    /// an NSLock rather than main-actor isolation.
+    nonisolated(unsafe) private static var variantCDisabled: Set<String> = []
+    private static let variantCDisabledLock = NSLock()
+
+    nonisolated private static func isVariantCDisabled(bundleID: String) -> Bool {
+        variantCDisabledLock.lock()
+        defer { variantCDisabledLock.unlock() }
+        return variantCDisabled.contains(bundleID)
+    }
+
+    nonisolated private static func disableVariantC(bundleID: String) {
+        variantCDisabledLock.lock()
+        let inserted = variantCDisabled.insert(bundleID).inserted
+        variantCDisabledLock.unlock()
+        if inserted {
+            Log.corral.info(
+                "Variant C bulk-bounds unsupported by \(bundleID, privacy: .public); using Variant B for remainder of session"
+            )
+        }
     }
 
     /// Writes a non-empty snapshot to the main-actor cache. Separate
@@ -1152,12 +1193,17 @@ enum BrowserScripting {
     // `tab` as a separator would coerce to the literal string "tab"
     // and break parsing — see CLAUDE.md's parking-lot entry.
     //
-    // The 8-window cap exists because Chromium's `windows` collection
-    // includes 25+ hidden helper windows (extensions popups, devtools,
-    // PWA hosts) that reliably hang the scripting handler when walked
-    // via bounds/tabs access. Chromium's `windows` is z-ordered
-    // (frontmost first), so top-8 always covers user-visible browser
-    // windows. The `whose bounds is {…}` shortcut has no such cap.
+    // The 100-window cap exists because Chromium's `windows` collection
+    // can include hidden helper windows (extension popups, DevTools,
+    // PWA hosts) that in some early-dev configurations hung the
+    // scripting handler when walked. Empirically a heavy-tabs machine
+    // with 44 real browser windows / 512 tabs walks in ~1s with no
+    // helper-window interference — the cap exists to bound worst-case
+    // scan time, not to dodge the helper issue (per-window `try`
+    // handles any individual-window failure). Chromium's `windows` is
+    // z-ordered (frontmost first), so top-N always covers the most
+    // recently-active browser windows if the cap is ever hit. The
+    // `whose bounds is {…}` shortcut has no cap at all.
 
     private static func tabTitleProperty(for bundleID: String) -> String {
         bundleID == safariBundleID ? "name" : "title"
@@ -1171,7 +1217,7 @@ enum BrowserScripting {
         tell application id "\(bundleID)"
             set out to ""
             set winCount to count of windows
-            if winCount > 8 then set winCount to 8
+            if winCount > 100 then set winCount to 100
             repeat with i from 1 to winCount
                 try
                     set w to window i
@@ -1214,7 +1260,7 @@ enum BrowserScripting {
         tell application id "\(bundleID)"
             set out to ""
             set winCount to count of windows
-            if winCount > 8 then set winCount to 8
+            if winCount > 100 then set winCount to 100
             repeat with i from 1 to winCount
                 try
                     set b to bounds of window i
@@ -1246,7 +1292,7 @@ enum BrowserScripting {
         set lf to (ASCII character 10)
         tell application id "\(bundleID)"
             set winCount to count of windows
-            if winCount > 8 then set winCount to 8
+            if winCount > 100 then set winCount to 100
             set winRefs to windows 1 thru winCount
             set allBounds to bounds of winRefs
             set allURLs to URL of every tab of winRefs
@@ -1301,7 +1347,7 @@ enum BrowserScripting {
         tell application id "\(bundleID)"
             set out to ""
             set winCount to count of windows
-            if winCount > 8 then set winCount to 8
+            if winCount > 100 then set winCount to 100
             repeat with i from 1 to winCount
                 try
                     set b to bounds of window i
@@ -1642,15 +1688,50 @@ enum BrowserScripting {
 
     // MARK: - URL normalization
 
+    /// Query parameter names (lowercased, exact match) that carry
+    /// per-click tracking tokens rather than page identity. Stripped
+    /// during normalization so two tabs to the same page with different
+    /// click-tracking tokens compare equal — the surfacing case was
+    /// Google Shopping's `srsltid`, which is unique per click. In
+    /// addition to this exact-match set, any parameter whose name starts
+    /// with `utm_` is stripped (covers utm_source / medium / campaign /
+    /// term / content / id).
+    private static let trackingQueryParams: Set<String> = [
+        "srsltid",     // Google Shopping result tracking
+        "fbclid",      // Facebook click ID
+        "gclid",       // Google Ads click ID
+        "dclid",       // Google Display click ID
+        "gclsrc",      // Google Ads click source
+        "gad_source",  // Google Ads source
+        "msclkid",     // Microsoft click ID
+        "yclid",       // Yandex click ID
+        "_ga",         // Google Analytics cross-domain
+        "_gl",         // Google Analytics linker
+        "mc_cid",      // Mailchimp campaign ID
+        "mc_eid",      // Mailchimp email ID
+        "igshid",      // Instagram share ID
+        "ref_src",     // Twitter / X share source
+    ]
+
+    private static func isTrackingQueryParam(_ name: String) -> Bool {
+        let lower = name.lowercased()
+        if lower.hasPrefix("utm_") { return true }
+        return trackingQueryParams.contains(lower)
+    }
+
     /// Canonical form of a URL used for tab-set comparisons in the
-    /// Corral browser restore matcher. Two URLs that render the same
-    /// page should normalize to the same string.
+    /// Corral browser restore matcher and the Declutter duplicate-tab
+    /// detector. Two URLs that render the same page should normalize
+    /// to the same string.
     ///
     /// Rules:
     /// - Lowercase the scheme + host (case-insensitive per RFC 3986).
     /// - Drop the URL fragment (`#anchor`) — client-side navigation
     ///   inside a tab, not part of the destination page identity.
-    /// - Preserve the path AND query — those DO change the page.
+    /// - Strip tracking-only query parameters (see
+    ///   `trackingQueryParams`). Everything else in the query is
+    ///   preserved — real sites use `?id=`, `?q=`, `?page=` etc. as
+    ///   page selectors.
     /// - Normalize a bare-domain trailing slash: `example.com` and
     ///   `example.com/` compare equal.
     /// - Leave weak-signal URLs (`about:blank`, `chrome://newtab/`)
@@ -1658,8 +1739,7 @@ enum BrowserScripting {
     ///   via a shared-empty check.
     ///
     /// Failure mode: if URLComponents can't parse the input, return
-    /// the original string lowercased — better than crashing or
-    /// returning nil.
+    /// the original string lowercased.
     static func normalizedURL(_ raw: String) -> String {
         // Fast path for the two common blank-page cases so the caller
         // can spot them without re-parsing.
@@ -1677,6 +1757,12 @@ enum BrowserScripting {
         }
         if let host = components.host {
             components.host = host.lowercased()
+        }
+        if let items = components.queryItems, !items.isEmpty {
+            let kept = items.filter { !isTrackingQueryParam($0.name) }
+            // Setting to nil (not []) drops the trailing `?` entirely
+            // when every param was a tracker.
+            components.queryItems = kept.isEmpty ? nil : kept
         }
         // Normalize a lone trailing slash on the path (empty path or
         // "/"). Deeper paths like "/foo/" are meaningful — leave alone.
