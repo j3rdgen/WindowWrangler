@@ -926,14 +926,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WindowWranglerActions 
     /// a mouse tap.
     private func forceQuitOtherInstances() {
         guard let myBundle = Bundle.main.bundleIdentifier else { return }
+        let myPID = NSRunningApplication.current.processIdentifier
         let siblings = NSRunningApplication.runningApplications(withBundleIdentifier: myBundle)
-            .filter { $0.processIdentifier != NSRunningApplication.current.processIdentifier }
+            .filter { $0.processIdentifier != myPID }
         guard !siblings.isEmpty else { return }
         Log.app.notice(
             "Found \(siblings.count, privacy: .public) other Window Wrangler instance(s) — force-quitting to prevent duplicate event taps"
         )
         for sibling in siblings {
             sibling.forceTerminate()
+        }
+
+        // SIGKILL returns immediately — the kernel then reclaims the
+        // sibling's resources (including its CGEventTap mach ports) in
+        // the background during process exit. If we proceed to install
+        // OUR tap during that cleanup window, two `.defaultTap`s briefly
+        // coexist on `.cgSessionEventTap`, which has been observed to
+        // deadlock the system-wide input pipeline (symptom: mouse
+        // clicks and keyboard input stop reaching every app, but
+        // Mission Control / Space-switch gestures still work because
+        // they're handled below the event-tap layer, and the only
+        // recovery is a hard reboot).
+        //
+        // Poll for sibling termination with a short bounded wait. A
+        // clean SIGKILL completes in <50ms on modern Macs; the 2s
+        // ceiling only matters if the sibling is deeply hung.
+        let deadline = Date().addingTimeInterval(2.0)
+        var remaining = siblings
+        while Date() < deadline {
+            remaining = NSRunningApplication.runningApplications(withBundleIdentifier: myBundle)
+                .filter { $0.processIdentifier != myPID }
+            if remaining.isEmpty { break }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        if !remaining.isEmpty {
+            Log.app.error(
+                "After 2s wait, \(remaining.count, privacy: .public) sibling instance(s) still alive — proceeding anyway, event-tap overlap risk present"
+            )
+        } else {
+            Log.app.notice("All sibling instances terminated — safe to install event taps")
         }
     }
 

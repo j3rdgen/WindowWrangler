@@ -56,6 +56,14 @@ enum BrowserScripting {
         let internalID: Int
         let boundsAX: CGRect
         let tabs: [TabInfo]
+        /// Window's current title — for Chromium / Safari this reflects
+        /// the active tab's page title. Carried so the Declutter matcher
+        /// can disambiguate same-position windows (Chrome frequently
+        /// has multiple windows at identical cascade bounds across
+        /// different Spaces); AX's `AXTitle` on the window reports the
+        /// same string and gives a reliable tiebreaker. Empty string if
+        /// the browser didn't return one.
+        let title: String
     }
 
     // MARK: - Snapshot cache (main-actor-guarded)
@@ -666,7 +674,8 @@ enum BrowserScripting {
         return BrowserWindowSnapshot(
             internalID: matchIndex,
             boundsAX: matchBounds,
-            tabs: tabs
+            tabs: tabs,
+            title: ""
         )
     }
 
@@ -675,7 +684,7 @@ enum BrowserScripting {
     private static func parseBoundsOnly(_ text: String) -> [(index: Int, bounds: CGRect)] {
         var results: [(Int, CGRect)] = []
         for rawLine in text.components(separatedBy: "\n") {
-            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            let line = rawLine.trimmingCharacters(in: .newlines)
             guard !line.isEmpty else { continue }
             let parts = line.components(separatedBy: "\t")
             guard parts.count >= 5,
@@ -700,7 +709,7 @@ enum BrowserScripting {
     private static func parseTabsForWindow(_ text: String) -> [TabInfo] {
         var results: [TabInfo] = []
         for rawLine in text.components(separatedBy: "\n") {
-            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            let line = rawLine.trimmingCharacters(in: .newlines)
             guard !line.isEmpty else { continue }
             let parts = line.components(separatedBy: "\t")
             guard parts.count >= 2 else { continue }
@@ -843,18 +852,19 @@ enum BrowserScripting {
                     return parsed
                 }
             }
-            // Either runScriptAsync returned nil (script error / timeout)
-            // or the parsed result was empty. Both are indistinguishable
-            // from "Chrome rejects the bulk-bounds expression" at this
-            // layer, so disable Variant C for the session and let the
-            // Variant B fallback below carry the load.
+            // nil / empty is indistinguishable from "Chrome rejects
+            // the bulk-bounds expression" at this layer, so disable
+            // Variant C for the session and let Variant B carry on.
             disableVariantC(bundleID: bundleID)
         }
 
-        // Fallback to Variant B — per-window loop with bulk per-tab
-        // property reads. Still ~5-10× faster than the per-tab iteration
-        // baseline, and more defensive against Chrome versions that
-        // don't like the top-level `every tab of winRefs` form.
+        // Variant B — per-window loop with bulk per-tab property reads.
+        // Runs on a background queue via `runScriptAsync` so the main
+        // thread stays responsive during the ~500ms snapshot. We
+        // briefly ran this on main actor while chasing a count mismatch,
+        // but the real bug was in `parseSnapshot`'s line trim (see
+        // comment there); background dispatch returns the full 110+KB
+        // response reliably.
         let scriptB = diagnosticBulkPerWindowScript(bundleID: bundleID)
         if let text = await runScriptAsync(source: scriptB, timeoutSeconds: 10),
            !text.isEmpty {
@@ -1211,31 +1221,47 @@ enum BrowserScripting {
 
     private static func fullSnapshotScript(bundleID: String) -> String {
         let tabTitle = tabTitleProperty(for: bundleID)
+        // IMPORTANT: build the output as a LIST of lines, not an
+        // incrementally-concatenated string. AppleScript's `&` on a
+        // large text in a repeat loop is O(n²) AND silently truncates
+        // once the growing string exceeds ~32–64 KB internally, which
+        // for a heavy-tabs session (44 windows × 500+ tabs ≈ 108 KB)
+        // means later windows arrive with only partial tab data (we
+        // saw a 31-tab window reported as 13). `set end of outList to
+        // …` + a single text-item-delimiters join at the end is O(1)
+        // per append and avoids the limit entirely.
         return """
         set tabCh to (ASCII character 9)
         set lf to (ASCII character 10)
+        set outList to {}
         tell application id "\(bundleID)"
-            set out to ""
             set winCount to count of windows
             if winCount > 100 then set winCount to 100
             repeat with i from 1 to winCount
                 try
                     set w to window i
                     set b to bounds of w
-                    set out to out & "W" & tabCh & (i as string) & tabCh & ((item 1 of b) as string) & tabCh & ((item 2 of b) as string) & tabCh & ((item 3 of b) as string) & tabCh & ((item 4 of b) as string) & lf
+                    set winTitle to ""
+                    try
+                        set winTitle to (name of w as string)
+                    end try
+                    set end of outList to "W" & tabCh & (i as string) & tabCh & ((item 1 of b) as string) & tabCh & ((item 2 of b) as string) & tabCh & ((item 3 of b) as string) & tabCh & ((item 4 of b) as string) & tabCh & winTitle
                     try
                         set tabCount to count of tabs of w
                         repeat with j from 1 to tabCount
                             try
                                 set aTab to tab j of w
-                                set out to out & "T" & tabCh & (URL of aTab as string) & tabCh & (\(tabTitle) of aTab as string) & lf
+                                set end of outList to "T" & tabCh & (URL of aTab as string) & tabCh & (\(tabTitle) of aTab as string)
                             end try
                         end repeat
                     end try
                 end try
             end repeat
-            return out
         end tell
+        set AppleScript's text item delimiters to lf
+        set out to outList as text
+        set AppleScript's text item delimiters to ""
+        return out
         """
     }
 
@@ -1254,29 +1280,39 @@ enum BrowserScripting {
     /// (bounds + URLs + titles) = ~24 total for 8 windows.
     static func diagnosticBulkPerWindowScript(bundleID: String) -> String {
         let tabTitle = tabTitleProperty(for: bundleID)
+        // Same list-based accumulation as `fullSnapshotScript` — avoids
+        // AppleScript's O(n²) string-concat truncation on heavy
+        // sessions (see rationale there).
         return """
         set tabCh to (ASCII character 9)
         set lf to (ASCII character 10)
+        set outList to {}
         tell application id "\(bundleID)"
-            set out to ""
             set winCount to count of windows
             if winCount > 100 then set winCount to 100
             repeat with i from 1 to winCount
                 try
                     set b to bounds of window i
-                    set out to out & "W" & tabCh & (i as string) & tabCh & ((item 1 of b) as string) & tabCh & ((item 2 of b) as string) & tabCh & ((item 3 of b) as string) & tabCh & ((item 4 of b) as string) & lf
+                    set winTitle to ""
+                    try
+                        set winTitle to (name of window i as string)
+                    end try
+                    set end of outList to "W" & tabCh & (i as string) & tabCh & ((item 1 of b) as string) & tabCh & ((item 2 of b) as string) & tabCh & ((item 3 of b) as string) & tabCh & ((item 4 of b) as string) & tabCh & winTitle
                     set theURLs to URL of every tab of window i
                     set theTitles to \(tabTitle) of every tab of window i
                     set tabCount to count of theURLs
                     repeat with j from 1 to tabCount
                         try
-                            set out to out & "T" & tabCh & (item j of theURLs as string) & tabCh & (item j of theTitles as string) & lf
+                            set end of outList to "T" & tabCh & (item j of theURLs as string) & tabCh & (item j of theTitles as string)
                         end try
                     end repeat
                 end try
             end repeat
-            return out
         end tell
+        set AppleScript's text item delimiters to lf
+        set out to outList as text
+        set AppleScript's text item delimiters to ""
+        return out
         """
     }
 
@@ -1607,6 +1643,7 @@ enum BrowserScripting {
         var results: [BrowserWindowSnapshot] = []
         var currentID: Int?
         var currentBounds: CGRect?
+        var currentTitle: String = ""
         var currentTabs: [TabInfo] = []
 
         func flushCurrent() {
@@ -1614,13 +1651,21 @@ enum BrowserScripting {
                 results.append(BrowserWindowSnapshot(
                     internalID: id,
                     boundsAX: bounds,
-                    tabs: currentTabs
+                    tabs: currentTabs,
+                    title: currentTitle
                 ))
             }
         }
 
         for rawLine in text.components(separatedBy: "\n") {
-            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            // Trim only CR / LF, NOT general whitespace. Swift's
+            // `CharacterSet.whitespaces` includes tab (U+0009), which
+            // would strip a trailing \t from a T-line whose title is
+            // empty — producing a 2-part line that the ">= 3" guard
+            // dropped. Chrome returns tabs with empty titles for
+            // loading / discarded / new-tab-page tabs, so this
+            // dropped ~13 tabs on the user's 500+-tab Chrome.
+            let line = rawLine.trimmingCharacters(in: .newlines)
             guard !line.isEmpty else { continue }
             let parts = line.components(separatedBy: "\t")
             guard let kind = parts.first else { continue }
@@ -1631,7 +1676,10 @@ enum BrowserScripting {
                 currentTabs = []
                 currentBounds = nil
                 currentID = nil
-                // Expected: W \t id \t x1 \t y1 \t x2 \t y2 (6 fields).
+                currentTitle = ""
+                // Expected: W \t id \t x1 \t y1 \t x2 \t y2 \t title?
+                // (7+ fields when title is present; older format without
+                // title still parses with 6 fields and empty title.)
                 guard parts.count >= 6,
                       let id = Int(parts[1]),
                       let x1 = Double(parts[2]),
@@ -1647,6 +1695,11 @@ enum BrowserScripting {
                     width: x2 - x1,
                     height: y2 - y1
                 )
+                // Title may itself contain tabs if the page title did;
+                // rejoin everything past index 5.
+                if parts.count >= 7 {
+                    currentTitle = parts.dropFirst(6).joined(separator: "\t")
+                }
             case "T":
                 // parts is [T, url, title, ...maybe more tokens if the
                 // title itself contained a tab character]. Rejoin

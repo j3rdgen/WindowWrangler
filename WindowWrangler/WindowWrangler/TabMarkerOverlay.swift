@@ -203,6 +203,7 @@ final class TabMarkerOverlay {
             // bundle inside fetchBrowserTabsFast; the next movement
             // tick picks up the fresh data automatically.
             updateMarkerPositions()
+            logAXDiagnostic(generation: generation)
         } else {
             Log.tabXray.info("Scan gen=\(generation, privacy: .public) returned no windows (no supported browsers running, or all fetches timed out)")
             // Keep previous markers rendered rather than blanking the
@@ -210,6 +211,27 @@ final class TabMarkerOverlay {
             // user flagged as acceptable.
         }
         refreshPillLabel()
+    }
+
+    /// One-shot summary after each scan: for each supported browser,
+    /// how many AX windows we see, how many snapshot windows arrived,
+    /// how many paired, and the total markers now rendered. Low-
+    /// frequency (fires on scan completion only, not every 30Hz tick)
+    /// and single line per browser — safe to leave on and useful for
+    /// future triage.
+    private func logAXDiagnostic(generation: UInt64) {
+        var totalMarkers = 0
+        for (_, view) in viewByDisplay {
+            totalMarkers += view.markers.count
+        }
+        for app in NSWorkspace.shared.runningApplications {
+            guard let bundleID = app.bundleIdentifier,
+                  BrowserScripting.isSupportedBrowser(bundleID: bundleID) else { continue }
+            let axWindows = axWindowsWithTabs(pid: app.processIdentifier)
+            let snapshot = BrowserScripting.cachedSnapshot(for: bundleID) ?? []
+            let mapping = pairAXToAppleScript(axWindows: axWindows, snapshot: snapshot)
+            Log.tabXray.info("Declutter gen=\(generation, privacy: .public) \(bundleID, privacy: .public): AX=\(axWindows.count, privacy: .public)w snapshot=\(snapshot.count, privacy: .public)w paired=\(mapping.count, privacy: .public) markers=\(totalMarkers, privacy: .public)")
+        }
     }
 
     /// Lists bundle IDs for every running supported browser —
@@ -527,29 +549,75 @@ final class TabMarkerOverlay {
 
     /// Pairs each AX window to the single best-matching AppleScript
     /// window from `snapshot`. Both sources report window frames in
-    /// AX coordinate space, so position identity is the strongest
-    /// available signal — much stronger than tab-count equality
-    /// (two Chrome windows frequently have identical tab counts).
+    /// AX coordinate space, so **position identity is the primary
+    /// signal** — a window at (x,y) is the same window regardless of
+    /// how AX and AppleScript happen to count its tabs.
     ///
-    /// Multi-pass strategy, each pass stricter than the next:
+    /// Why tab count is NOT a hard filter: Chrome Tab Groups collapse
+    /// into a single clickable chip in the tab strip. AX exposes every
+    /// AXTab element inside the group (even when the group is
+    /// collapsed), while Chrome's AppleScript dictionary excludes
+    /// tabs inside a collapsed group from `tabs of window`. A single
+    /// 20-tab window with one 7-tab group collapsed therefore reports
+    /// `axTabs=20 / scriptTabs=13`. The earlier matcher required
+    /// exact tab-count equality in Pass 1 and 2, which rejected the
+    /// correct pairing for every window with a collapsed tab group
+    /// and then let Pass 3 pair the window to a geographically-close
+    /// but wrong snapshot entry — silently dropping every duplicate
+    /// marker in that window.
     ///
-    ///   Pass 1 — exact-position match (origin within 10pt in both
-    ///            dimensions). Resolves the common case where AX and
-    ///            AppleScript bounds agree to the pixel.
-    ///   Pass 2 — close-position match (origin within 100pt). Catches
-    ///            windows that moved slightly between the AppleScript
-    ///            snapshot and the AX enumeration tick.
-    ///   Pass 3 — tab-count fallback for anything still unmatched,
-    ///            with frame-center distance as tie-breaker. Only
-    ///            fires for the rare case where positions disagree
-    ///            significantly (never seen in practice but keeps the
-    ///            matcher resilient).
+    /// Multi-pass strategy:
     ///
-    /// Each pass greedily assigns and marks AppleScript candidates
-    /// used so later passes don't double-assign. Passes always honor
-    /// tab-count equality where available — a match with differing
-    /// tab counts gets a severe score penalty and only wins when
-    /// nothing better exists.
+    ///   Pass 1 — exact-position match (origin within 10pt). When
+    ///            multiple candidates sit at the same cascaded origin
+    ///            (one per Space), prefer the one with the smallest
+    ///            `|tabs.count - axTabCount|` difference.
+    ///   Pass 2 — close-position match (origin within 100pt). Same
+    ///            tie-break.
+    ///   Pass 3 — center-distance last-ditch for windows whose
+    ///            positions genuinely don't line up (rare).
+    ///
+    /// Each pass greedily consumes snapshot candidates so later
+    /// passes don't double-assign.
+    /// Returns true when the AppleScript window `name` identifies the
+    /// same browser window as the AX `AXTitle`. Two Chrome quirks
+    /// make straight equality useless:
+    ///
+    ///   1. AX appends " - Google Chrome" (and optionally " - <profile>")
+    ///      to the active-tab title; AppleScript's `name of window`
+    ///      doesn't.
+    ///   2. AppleScript ELIDES long titles with a "…" (U+2026)
+    ///      ellipsis in the MIDDLE — e.g. the full title
+    ///      "WALES BONNER | Official Website Online Boutique – Wales Bonner"
+    ///      arrives from AppleScript as
+    ///      "WALES BONNER | Official Websit…nline Boutique – Wales Bonner".
+    ///      AX returns the full untruncated form.
+    ///
+    /// Match strategy:
+    ///   - Exact equality wins immediately.
+    ///   - If the script title contains "…", split on it and require
+    ///     the leading half to be a prefix of AX title AND the trailing
+    ///     half to appear anywhere in AX title.
+    ///   - Otherwise, require AX title to start with script title
+    ///     followed by " - " (the Chrome suffix separator) so
+    ///     "GitHub" does NOT falsely match AX "GitHubCopilot - …".
+    private static func browserWindowTitlesMatch(
+        axTitle: String,
+        scriptTitle: String
+    ) -> Bool {
+        guard !axTitle.isEmpty, !scriptTitle.isEmpty else { return false }
+        if axTitle == scriptTitle { return true }
+        if let elideRange = scriptTitle.range(of: "\u{2026}") {
+            let scPrefix = scriptTitle[..<elideRange.lowerBound]
+            let scSuffix = scriptTitle[elideRange.upperBound...]
+            guard !scPrefix.isEmpty, !scSuffix.isEmpty else { return false }
+            return axTitle.hasPrefix(scPrefix) && axTitle.contains(scSuffix)
+        }
+        guard axTitle.hasPrefix(scriptTitle) else { return false }
+        let after = axTitle.index(axTitle.startIndex, offsetBy: scriptTitle.count)
+        return axTitle[after...].hasPrefix(" - ")
+    }
+
     private func pairAXToAppleScript(
         axWindows: [AXWindowTabs],
         snapshot: [BrowserScripting.BrowserWindowSnapshot]
@@ -558,43 +626,64 @@ final class TabMarkerOverlay {
         var result: [(AXWindowTabs, BrowserScripting.BrowserWindowSnapshot)] = []
         var unmatched: [AXWindowTabs] = []
 
-        // Pass 1 — origin within 10pt + matching tab count (strict).
+        // Pass 1 — origin within 10pt. For Chromium browsers the same
+        // cascade position is often reused across Spaces, so position
+        // alone is NOT unique. The title (active-tab page title)
+        // disambiguates: a candidate whose `title` matches the AX
+        // window's `AXTitle` wins outright. Ties fall back to smallest
+        // tab-count delta.
         for axWindow in axWindows {
             guard let axFrame = axWindow.windowFrameAX else { continue }
             let axTabCount = axWindow.tabs.count
-            var pick: Int? = nil
+            let axTitle = axWindow.title
+            var best: (idx: Int, titleMatch: Bool, tabsDiff: Int)? = nil
             for (idx, candidate) in snapshot.enumerated() where !used.contains(idx) {
                 let b = candidate.boundsAX
                 guard abs(b.origin.x - axFrame.origin.x) <= 10,
-                      abs(b.origin.y - axFrame.origin.y) <= 10,
-                      candidate.tabs.count == axTabCount else { continue }
-                pick = idx
-                break
+                      abs(b.origin.y - axFrame.origin.y) <= 10 else { continue }
+                let titleMatch = Self.browserWindowTitlesMatch(
+                    axTitle: axTitle, scriptTitle: candidate.title
+                )
+                let diff = abs(candidate.tabs.count - axTabCount)
+                if best == nil
+                    || (titleMatch && !best!.titleMatch)
+                    || (titleMatch == best!.titleMatch && diff < best!.tabsDiff) {
+                    best = (idx, titleMatch, diff)
+                }
             }
-            if let p = pick {
-                used.insert(p)
-                result.append((axWindow, snapshot[p]))
+            if let b = best {
+                used.insert(b.idx)
+                result.append((axWindow, snapshot[b.idx]))
             } else {
                 unmatched.append(axWindow)
             }
         }
 
-        // Pass 2 — origin within 100pt + matching tab count (relaxed
-        // position tolerance for windows that moved slightly between
-        // the AppleScript snapshot and the AX enumeration tick).
+        // Pass 2 — origin within 100pt. Title match still dominates
+        // when present; otherwise prefer smallest tab-count delta,
+        // then closest origin.
         var stillUnmatched: [AXWindowTabs] = []
         for axWindow in unmatched {
             guard let axFrame = axWindow.windowFrameAX else { continue }
             let axTabCount = axWindow.tabs.count
-            var best: (idx: Int, distance: CGFloat)? = nil
+            let axTitle = axWindow.title
+            var best: (idx: Int, titleMatch: Bool, tabsDiff: Int, distance: CGFloat)? = nil
             for (idx, candidate) in snapshot.enumerated() where !used.contains(idx) {
                 let b = candidate.boundsAX
                 let dx = b.origin.x - axFrame.origin.x
                 let dy = b.origin.y - axFrame.origin.y
                 let distance = sqrt(dx * dx + dy * dy)
-                guard distance <= 100, candidate.tabs.count == axTabCount else { continue }
-                if best == nil || distance < best!.distance {
-                    best = (idx, distance)
+                guard distance <= 100 else { continue }
+                let titleMatch = Self.browserWindowTitlesMatch(
+                    axTitle: axTitle, scriptTitle: candidate.title
+                )
+                let diff = abs(candidate.tabs.count - axTabCount)
+                if best == nil
+                    || (titleMatch && !best!.titleMatch)
+                    || (titleMatch == best!.titleMatch
+                        && (diff < best!.tabsDiff
+                            || (diff == best!.tabsDiff && distance < best!.distance))) {
+                    best = (idx, titleMatch, diff, distance)
                 }
             }
             if let b = best {
@@ -605,24 +694,24 @@ final class TabMarkerOverlay {
             }
         }
 
-        // Pass 3 — tab-count equality anywhere + closest-center fallback.
-        // Last-ditch; only fires when positions have drifted enough that
-        // Pass 1/2 couldn't pin them. Still unique via `used`.
+        // Pass 3 — center-distance last-ditch. Position stays dominant;
+        // tab-count delta only breaks ties.
         for axWindow in stillUnmatched {
             guard let axFrame = axWindow.windowFrameAX else { continue }
             let axCenter = CGPoint(x: axFrame.midX, y: axFrame.midY)
             let axTabCount = axWindow.tabs.count
-            var best: (idx: Int, score: Double)? = nil
+            var best: (idx: Int, distance: CGFloat, tabsDiff: Int)? = nil
             for (idx, candidate) in snapshot.enumerated() where !used.contains(idx) {
                 let b = candidate.boundsAX
                 let dx = b.midX - axCenter.x
                 let dy = b.midY - axCenter.y
                 let distance = sqrt(dx * dx + dy * dy)
                 guard distance <= 500 else { continue }
-                let tabCountPenalty = (candidate.tabs.count == axTabCount) ? 0.0 : 1_000.0
-                let score = tabCountPenalty + distance
-                if best == nil || score < best!.score {
-                    best = (idx, score)
+                let diff = abs(candidate.tabs.count - axTabCount)
+                if best == nil
+                    || distance < best!.distance
+                    || (distance == best!.distance && diff < best!.tabsDiff) {
+                    best = (idx, distance, diff)
                 }
             }
             if let b = best {
@@ -814,6 +903,13 @@ final class TabMarkerOverlay {
     private struct AXWindowTabs {
         let axWindow: AXUIElement
         let windowFrameAX: CGRect?
+        /// Window title from `kAXTitleAttribute` — for Chrome / Safari
+        /// this is the active tab's page title. Used by the matcher to
+        /// disambiguate same-position windows (Chrome cascade reuses
+        /// identical bounds across Spaces so position alone can't
+        /// uniquely identify a window). Empty string if AX doesn't
+        /// expose one.
+        let title: String
         let tabs: [AXTabFrame]
     }
     private struct AXTabFrame {
@@ -829,6 +925,7 @@ final class TabMarkerOverlay {
             AXWindowTabs(
                 axWindow: win,
                 windowFrameAX: frameOf(win),
+                title: stringAttrOf(kAXTitleAttribute, win) ?? "",
                 tabs: findTabFrames(under: win, depth: 0)
             )
         }
@@ -852,6 +949,7 @@ final class TabMarkerOverlay {
         }
         return out
     }
+
 
     private func hasTabGroupAncestor(_ element: AXUIElement, depth: Int) -> Bool {
         guard depth < 3 else { return false }
